@@ -1157,6 +1157,89 @@ def _harness_env(tmp_path: Path, container: str = "stub-test-container") -> dict
     return env
 
 
+def _stub_stack(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
+    """Wire the real agentctl and the real harness to one local volume.
+
+    A fake ``docker`` routes the harness ``exec`` snippets at the local engine
+    state file (no daemon, no container), while agentctl serves the same
+    volume through ``CONTRACT_STATE_DIR``. Returns ``(agentctl_env,
+    harness_env)``.
+    """
+    agentctl_env = _durable_env(tmp_path)
+    volume = tmp_path / "volume"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "if len(sys.argv) < 2 or sys.argv[1] != 'exec':\n"
+        "    sys.exit(0)\n"
+        "state = os.environ['FAKE_ENGINE_STATE']\n"
+        "archives = os.environ['FAKE_ENGINE_ARCHIVES']\n"
+        "script = sys.stdin.read()\n"
+        "script = script.replace('/data/archives', archives)\n"
+        "script = script.replace('/data/agent-operator-contract.json', state)\n"
+        "exec(compile(script, '<engine>', 'exec'), {})\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    harness_state = tmp_path / "harness-state.json"
+    harness_state.write_text(
+        json.dumps({"container": "stub-test", "volume": "stub-test-data"}),
+        encoding="utf-8",
+    )
+    harness_env = dict(os.environ)
+    harness_env["DOCKER"] = str(fake_docker)
+    harness_env["STUB_HARNESS_STATE"] = str(harness_state)
+    harness_env["FAKE_ENGINE_STATE"] = str(volume / "agent-operator-contract.json")
+    harness_env["FAKE_ENGINE_ARCHIVES"] = str(volume / "archives")
+    return agentctl_env, harness_env
+
+
+def _harness_verb(
+    harness_env: dict[str, str], verb: str, params: dict[str, Any]
+) -> dict[str, Any]:
+    completed = _run_harness([verb, json.dumps({"verb": verb, "params": params})], harness_env)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    doc = json.loads(completed.stdout)
+    assert documents.validate_harness_reply(doc) == []
+    assert doc["ok"] is True, completed.stdout
+    assert isinstance(doc["result"], dict)
+    return doc["result"]
+
+
+def _export_stream(argv: list[str], env: dict[str, str]) -> tuple[int, bytes, str]:
+    completed = _run_agentctl_raw(argv, env)
+    return completed.returncode, completed.stdout, completed.stderr
+
+
+def _read_export_tar(data: bytes) -> tuple[dict[str, Any], dict[str, bytes], list[str]]:
+    members: dict[str, bytes] = {}
+    order: list[str] = []
+    with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+        for member in archive:
+            extracted = archive.extractfile(member)
+            order.append(member.name)
+            members[member.name] = extracted.read() if extracted is not None else b""
+    assert order and order[0] == "manifest.json"
+    manifest = json.loads(members["manifest.json"])
+    assert isinstance(manifest, dict)
+    return manifest, members, order
+
+
+def _mismatches(manifest: dict[str, Any], members: dict[str, bytes]) -> list[str]:
+    problems: list[str] = []
+    entries = manifest["files"]
+    assert isinstance(entries, list)
+    for entry in entries:
+        assert isinstance(entry, dict)
+        content = members.get(str(entry["path"]))
+        assert content is not None, f"tar lacks {entry['path']!r}"
+        if len(content) != entry["size"] or hashlib.sha256(content).hexdigest() != entry["sha256"]:
+            problems.append(str(entry["path"]))
+    return problems
+
+
 def test_harness_verbs_without_a_container_answer_failed(tmp_path: Path) -> None:
     env = dict(os.environ)
     env["STUB_HARNESS_STATE"] = str(tmp_path / "missing-state.json")
