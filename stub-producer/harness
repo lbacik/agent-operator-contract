@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 """Stub conformance harness: a minimal, test-only engine host executable.
 
-Implements ``setup`` and ``teardown`` from the Conformance Harness protocol
-(spec section 15.1) by steering a stub producer container over the Docker
-CLI. Every other known verb answers ``unsupported`` with
-``details.what: "verb"``, so the producer suite reports the dependent
-scenarios as not run. Language-neutral: standard library only, no import of
-this repository's code.
+Implements ``setup``, ``teardown`` and ``crash`` from the Conformance Harness
+protocol (spec section 15.1) by steering a stub producer container over the
+Docker CLI. ``crash`` with point ``between-commit-and-reply`` arms the stub's
+one-shot crash flag over ``docker exec``; any other crash point answers
+``unsupported`` with ``details.what: "crash-point"``. Every other known verb
+answers ``unsupported`` with ``details.what: "verb"``, so the producer suite
+reports the dependent scenarios as not run. Language-neutral: standard
+library only, no import of this repository's code.
 """
 
 from __future__ import annotations
@@ -51,6 +53,20 @@ KNOWN_CAPABILITIES = (
 REPOSITORY_PATTERN = re.compile(r"^[^/\s]+/[^/\s]+$")
 
 DOCKER_TIMEOUT = 120.0
+
+CRASH_POINTS = (
+    "between-commit-and-reply",
+    "before-claim",
+    "after-claim",
+    "during-finalization",
+    "now",
+)
+
+CRASH_FLAG = "crash-between-commit-and-reply"
+"""Flag file the stub producer watches for in its state directory."""
+
+STATE_MOUNT = "/data"
+"""Where the state volume is mounted inside the stub producer container."""
 
 
 def _docker() -> str:
@@ -226,6 +242,35 @@ def _do_teardown(verb: str, params: dict[str, Any]) -> tuple[str, int]:
     return _ok(verb, {"removed": True})
 
 
+def _do_crash(verb: str, params: dict[str, Any]) -> tuple[str, int]:
+    for key in params:
+        if key != "point":
+            return _error(verb, "usage", f"harness 'crash' has an unexpected parameter: {key!r}")
+    point = params.get("point")
+    if not isinstance(point, str) or point not in CRASH_POINTS:
+        return _error(verb, "usage", f"harness 'crash' point {point!r} is not a known crash point")
+    if point != "between-commit-and-reply":
+        return _error(
+            verb,
+            "unsupported",
+            f"stub harness cannot crash at {point!r}",
+            {"what": "crash-point", "name": point},
+        )
+    state = _read_state()
+    if not state or not state.get("container"):
+        return _error(verb, "failed", "no instance is set up; run setup first")
+    container = str(state["container"])
+    try:
+        touched = _run_docker(
+            ["exec", "--user", "agent", container, "touch", f"{STATE_MOUNT}/{CRASH_FLAG}"]
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _error(verb, "failed", f"docker is unavailable: {exc}")
+    if touched.returncode != 0:
+        return _error(verb, "failed", f"docker exec touch failed: {touched.stderr.strip()}")
+    return _ok(verb, {"point": point})
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         text, exit_code = _error(None, "usage", "expected: <harness> <verb> '<request-json>'")
@@ -257,6 +302,8 @@ def main(argv: list[str]) -> int:
         text, exit_code = _do_setup(verb, params)
     elif verb == "teardown":
         text, exit_code = _do_teardown(verb, params)
+    elif verb == "crash":
+        text, exit_code = _do_crash(verb, params)
     else:
         text, exit_code = _error(
             verb,

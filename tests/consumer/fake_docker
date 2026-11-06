@@ -20,7 +20,20 @@ Fixtures (`FAKE_DOCKER_FIXTURES`, default: the checkout's
 `src/agent_operator_contract/fixtures/agentctl/`): files shaped
 `{argv, exit_code, stdout, stderr}`; `argv` excludes the agentctl binary
 itself. An `exec` of `/usr/local/bin/agentctl --contract 1 <op>` replays the
-fixture whose `argv` equals the args after the binary, byte for byte.
+first fixture whose `argv` matches the args after the binary.
+
+Matching ignores the `--request-id` value by position (consumers generate
+request IDs, so a test cannot know them in advance): two argvs match when
+they are equal after masking the value following each `--request-id`. The
+replayed stdout and stderr have the fixture's request ID replaced with the
+one the consumer actually sent. When several fixtures match the same masked
+argv, successive `exec` calls serve them in filename order (first call the
+first file, second call the second, further calls repeat the last), so a
+test stages an ambiguous reply followed by a replayed success as two files
+with the same masked argv. A fixture may also carry `delay_seconds` (a
+number): the fake sleeps that long before replying, so a delay longer than
+the consumer timeout is staged the same way; `FAKE_DOCKER_DELAY` adds the
+same sleep to every `exec` reply.
 
 Recording (`FAKE_DOCKER_LOG`): every docker invocation appends one JSON line
 `{"argv": [...]}` (args after the `docker` name itself).
@@ -35,6 +48,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 CONTRACT_LABEL = "io.github.lbacik.agent-operator.contract"
@@ -157,6 +171,85 @@ def _load_fixtures() -> list[dict[str, object]]:
     return fixtures
 
 
+def _mask_request_id(argv: list[str]) -> tuple[str, ...]:
+    """Mask the value after each ``--request-id`` so generated IDs still match."""
+    masked = list(argv)
+    for index, arg in enumerate(argv):
+        if arg == "--request-id" and index + 1 < len(argv):
+            masked[index + 1] = ""
+    return tuple(masked)
+
+
+def _request_id_of(argv: list[str]) -> str | None:
+    """Return the ``--request-id`` value of an argv, if it carries one."""
+    for index, arg in enumerate(argv):
+        if arg == "--request-id" and index + 1 < len(argv):
+            return argv[index + 1]
+    return None
+
+
+def _agentctl_argv_of(docker_argv: list[str]) -> list[str] | None:
+    """Return the agentctl args of a recorded ``exec`` docker argv, if any."""
+    if not docker_argv or docker_argv[0] != "exec":
+        return None
+    try:
+        binary = docker_argv.index(AGENTCTL_PATH)
+    except ValueError:
+        return None
+    return docker_argv[binary + 1 :]
+
+
+def _prior_matches(key: tuple[str, ...]) -> int:
+    """Count earlier ``exec`` calls with the same masked agentctl argv.
+
+    The current invocation is already recorded when ``exec`` runs, so it is
+    subtracted: the result is the zero-based index of this call in its
+    sequence.
+    """
+    log = _log_path()
+    if log is None:
+        return 0
+    try:
+        lines = log.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return 0
+    count = 0
+    for line in lines:
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(entry, dict):
+            continue
+        argv = entry.get("argv")
+        if not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
+            continue
+        agentctl_argv = _agentctl_argv_of(argv)
+        if agentctl_argv is not None and _mask_request_id(agentctl_argv) == key:
+            count += 1
+    return max(0, count - 1)
+
+
+def _sleep_before_reply(fixture: dict[str, object]) -> None:
+    """Sleep the fixture's ``delay_seconds`` plus ``FAKE_DOCKER_DELAY``."""
+    wanted: list[float] = []
+    raw = fixture.get("delay_seconds")
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0:
+        wanted.append(float(raw))
+    env_raw = os.environ.get("FAKE_DOCKER_DELAY")
+    if env_raw is not None and env_raw.strip():
+        try:
+            env_delay = float(env_raw.strip())
+        except ValueError:
+            env_delay = 0.0
+        if env_delay > 0:
+            wanted.append(env_delay)
+    for delay in wanted:
+        time.sleep(delay)
+
+
 def _cmd_exec(
     fleet: dict[str, dict[str, object]], args: list[str]
 ) -> int:
@@ -183,12 +276,31 @@ def _cmd_exec(
             f"fake_docker: wrong exec user {exec_user!r} for {container_id}\n"
         )
         return 125
+    key = _mask_request_id(agentctl_argv)
+    matches: list[dict[str, object]] = []
     for fixture in _load_fixtures():
-        if fixture.get("argv") == agentctl_argv:
-            sys.stdout.write(str(fixture.get("stdout", "")))
-            sys.stderr.write(str(fixture.get("stderr", "")))
-            exit_code = fixture.get("exit_code", 0)
-            return int(exit_code) if isinstance(exit_code, int) else 1
+        raw_argv = fixture.get("argv")
+        if not isinstance(raw_argv, list):
+            continue
+        fixture_argv = [str(a) for a in raw_argv]
+        if _mask_request_id(fixture_argv) == key:
+            matches.append(fixture)
+    if matches:
+        fixture = matches[min(_prior_matches(key), len(matches) - 1)]
+        _sleep_before_reply(fixture)
+        stdout = str(fixture.get("stdout", ""))
+        stderr = str(fixture.get("stderr", ""))
+        raw_argv = fixture.get("argv")
+        assert isinstance(raw_argv, list)
+        fixture_id = _request_id_of([str(a) for a in raw_argv])
+        actual_id = _request_id_of(agentctl_argv)
+        if fixture_id is not None and actual_id is not None and fixture_id != actual_id:
+            stdout = stdout.replace(fixture_id, actual_id)
+            stderr = stderr.replace(fixture_id, actual_id)
+        sys.stdout.write(stdout)
+        sys.stderr.write(stderr)
+        exit_code = fixture.get("exit_code", 0)
+        return int(exit_code) if isinstance(exit_code, int) else 1
     sys.stderr.write(f"fake_docker: no fixture matches {agentctl_argv!r}\n")
     envelope = {
         "contract": "1.0",

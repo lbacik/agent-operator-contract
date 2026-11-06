@@ -373,6 +373,61 @@ def test_stub_intake_is_durable_offline(tmp_path: Path) -> None:
     assert state_files, "the stub keeps its Intake and command store on its volume"
 
 
+def test_stub_crash_between_commit_and_reply_replays_on_retry(tmp_path: Path) -> None:
+    import signal
+
+    env = _durable_env(tmp_path)
+    (tmp_path / "volume" / "crash-between-commit-and-reply").write_text("", encoding="utf-8")
+    crashed = _stop("example-owner/example-repo", "req-000000000020", env)
+
+    assert crashed.returncode == -signal.SIGKILL
+    assert crashed.stdout == ""
+
+    retry = _stop("example-owner/example-repo", "req-000000000020", env)
+
+    assert retry.returncode == 0
+    doc = json.loads(retry.stdout)
+    assert documents.validate_envelope(doc) == []
+    assert documents.validate_mutation_result(doc["result"]) == []
+    assert doc["result"]["replayed"] is True
+    stored = _command("req-000000000020", env)
+    assert json.loads(stored.stdout)["result"]["command"] == doc["result"]["command"]
+    status = _run_agentctl(["--contract", "1", "status"], env)
+    snapshot = json.loads(status.stdout)["result"]
+    assert snapshot["intake"]["state"] == "closed"
+    assert [command["request_id"] for command in snapshot["recent_commands"]] == [
+        "req-000000000020"
+    ]
+
+
+def test_stub_crash_flag_is_one_shot(tmp_path: Path) -> None:
+    import signal
+
+    env = _durable_env(tmp_path)
+    (tmp_path / "volume" / "crash-between-commit-and-reply").write_text("", encoding="utf-8")
+    crashed = _stop("example-owner/example-repo", "req-000000000021", env)
+
+    assert crashed.returncode == -signal.SIGKILL
+
+    # The crash commit closed the intake, so a resume commits normally: the
+    # flag was consumed and the process replies instead of dying again.
+    reopened = _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "resume",
+            "--request-id",
+            "req-000000000022",
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+
+    assert reopened.returncode == 0
+    assert json.loads(reopened.stdout)["result"]["replayed"] is False
+
+
 def _run_harness(
     argv: list[str], env: dict[str, str] | None = None
 ) -> subprocess.CompletedProcess[str]:
@@ -415,6 +470,76 @@ def test_harness_unimplemented_verb_answers_unsupported() -> None:
     assert documents.validate_harness_reply(doc) == []
     assert doc["error"]["code"] == "unsupported"
     assert doc["error"]["details"] == {"what": "verb", "name": "hold"}
+
+
+def test_harness_crash_points_match_library() -> None:
+    import runpy
+
+    namespace = runpy.run_path(str(HARNESS), run_name="stub_harness_consts")
+
+    assert tuple(namespace["CRASH_POINTS"]) == documents.CRASH_POINTS
+
+
+def test_harness_crash_unknown_point_answers_usage() -> None:
+    completed = _run_harness(
+        ["crash", json.dumps({"verb": "crash", "params": {"point": "mid-sentence"}})]
+    )
+
+    assert completed.returncode == 2
+    doc = json.loads(completed.stdout)
+    assert documents.validate_harness_reply(doc) == []
+    assert doc["error"]["code"] == "usage"
+
+
+def test_harness_crash_other_point_answers_unsupported() -> None:
+    completed = _run_harness(["crash", json.dumps({"verb": "crash", "params": {"point": "now"}})])
+
+    assert completed.returncode == 3
+    doc = json.loads(completed.stdout)
+    assert documents.validate_harness_reply(doc) == []
+    assert doc["error"]["code"] == "unsupported"
+    assert doc["error"]["details"] == {"what": "crash-point", "name": "now"}
+
+
+def test_harness_crash_without_setup_answers_failed(tmp_path: Path) -> None:
+    env = dict(os.environ)
+    env["STUB_HARNESS_STATE"] = str(tmp_path / "state.json")
+
+    completed = _run_harness(
+        ["crash", json.dumps({"verb": "crash", "params": {"point": "between-commit-and-reply"}})],
+        env,
+    )
+
+    assert completed.returncode == 1
+    doc = json.loads(completed.stdout)
+    assert documents.validate_harness_reply(doc) == []
+    assert doc["error"]["code"] == "failed"
+
+
+def test_harness_crash_arms_the_stub_flag(tmp_path: Path) -> None:
+    touched = tmp_path / "touched"
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        f'#!/bin/sh\nif [ "$1" = "exec" ]; then\n  : > "{touched}"\nfi\nexit 0\n',
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"container": "stub-1", "volume": "stub-1-data"}), encoding="utf-8")
+    env = dict(os.environ)
+    env["DOCKER"] = str(fake_docker)
+    env["STUB_HARNESS_STATE"] = str(state)
+
+    completed = _run_harness(
+        ["crash", json.dumps({"verb": "crash", "params": {"point": "between-commit-and-reply"}})],
+        env,
+    )
+
+    assert completed.returncode == 0
+    doc = json.loads(completed.stdout)
+    assert documents.validate_harness_reply(doc) == []
+    assert doc["result"] == {"point": "between-commit-and-reply"}
+    assert touched.exists()
 
 
 def test_harness_teardown_without_state_removes_nothing(tmp_path: Path) -> None:

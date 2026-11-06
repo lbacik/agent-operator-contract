@@ -328,9 +328,7 @@ def _print_producer_failure(
     return exit_code
 
 
-def _print_ambiguous(
-    error: client.AmbiguousMutationError, name: str, use_json: bool
-) -> int:
+def _print_ambiguous(error: client.AmbiguousMutationError, name: str, use_json: bool) -> int:
     """Report an ambiguous mutation that stayed ambiguous after the retries.
 
     The request ID is always printed so the operator can follow up with
@@ -427,9 +425,7 @@ def _run_mutation(
         if not use_json:
             sys.stdout.write(f"request_id: {sent_id}\n")
             sys.stdout.flush()
-        return _print_client_error(
-            exc, use_json, {"request_id": sent_id, "operation": operation}
-        )
+        return _print_client_error(exc, use_json, {"request_id": sent_id, "operation": operation})
     if use_json:
         sys.stdout.buffer.write(mutation.stdout)
         sys.stdout.buffer.flush()

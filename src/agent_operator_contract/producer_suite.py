@@ -706,6 +706,72 @@ def scenario_resume(ctx: SuiteContext) -> ScenarioOutcome:
     return ScenarioOutcome(scenario_id, "passed")
 
 
+def scenario_crash_between_commit_and_reply(
+    ctx: SuiteContext, harness_cmd: Sequence[str]
+) -> ScenarioOutcome:
+    """Mutation commits, the process dies before replying, the retry replays it.
+
+    The harness arms a one-shot crash between commit and reply; the first
+    mutation gets no reply, and the retry with the same request ID returns
+    the stored record with ``replayed: true`` while the command store shows
+    the single committed effect.
+    """
+    scenario_id = "crash-between-commit-and-reply"
+    steer = _ensure_intake(ctx, scenario_id, "open")
+    if steer is not None:
+        return steer
+    armed = _call_harness(harness_cmd, "crash", {"point": "between-commit-and-reply"}, ctx.timeout)
+    if armed.status == "unsupported":
+        return ScenarioOutcome(scenario_id, "not_run", f"harness cannot crash ({armed.detail})")
+    if armed.status != "ok" or armed.result is None:
+        return ScenarioOutcome(scenario_id, "failed", armed.detail)
+    request_id = _new_request_id()
+    argv = [
+        "--contract",
+        "1",
+        "stop",
+        "--request-id",
+        request_id,
+        "--expect-repo",
+        ctx.repository,
+    ]
+    first = _exec(scenario_id, argv, ctx)
+    if isinstance(first, ScenarioOutcome):
+        return first
+    try:
+        doc = json.loads(first.stdout)
+    except ValueError:
+        doc = None
+    if isinstance(doc, dict) and doc.get("ok") is True:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"expected no reply to the crash, got: {first.stdout.strip()}",
+        )
+    second = _exec(scenario_id, argv, ctx)
+    if isinstance(second, ScenarioOutcome):
+        return second
+    problems = _check_mutation(second.stdout, second.exit_code, replayed=True)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    committed = json.loads(second.stdout)["result"]["command"]
+    if committed.get("request_id") != request_id or committed.get("kind") != "stop":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"the replay is not this stop: {second.stdout.strip()}",
+        )
+    stored = _exec(scenario_id, ["--contract", "1", "command", request_id], ctx)
+    if isinstance(stored, ScenarioOutcome):
+        return stored
+    problems = _check_command(stored.stdout, stored.exit_code, request_id=request_id, kind="stop")
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    if json.loads(stored.stdout)["result"]["command"] != committed:
+        return ScenarioOutcome(scenario_id, "failed", "the crash committed more than one effect")
+    return ScenarioOutcome(scenario_id, "passed")
+
+
 def scenario_command_found(ctx: SuiteContext) -> ScenarioOutcome:
     """``command`` of a known request ID returns the stored record."""
     scenario_id = "command-found"
@@ -761,6 +827,10 @@ SCENARIOS: tuple[Scenario, ...] = (
     ),
     Scenario("resume", "resume reopens closed intake and a second resume is rejected"),
     Scenario("command-found", "command of a known request ID returns the stored record"),
+    Scenario(
+        "crash-between-commit-and-reply",
+        "a crash between commit and reply replays the stored record on retry",
+    ),
     Scenario("hold-lock", "the hold-lock harness verb answers with the time held"),
 )
 """Every scenario of this suite version, with stable identifiers."""
@@ -785,6 +855,7 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_payload_mismatch(ctx),
         scenario_resume(ctx),
         scenario_command_found(ctx),
+        scenario_crash_between_commit_and_reply(ctx, harness_cmd),
         scenario_hold_lock(ctx, harness_cmd),
     ]
 

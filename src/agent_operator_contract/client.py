@@ -126,9 +126,7 @@ def is_ambiguous_envelope(envelope: dict[str, object]) -> bool:
         return True
     if code == "internal":
         details = error.get("details")
-        if isinstance(details, dict) and details.get("stored") is False:
-            return False
-        return True
+        return not (isinstance(details, dict) and details.get("stored") is False)
     return False
 
 
@@ -181,13 +179,9 @@ def invoke_mutation_with_retry(
     attempts = max_attempts if max_attempts is not None else MAX_MUTATION_ATTEMPTS
     if attempts < 1:
         attempts = 1
-    last_envelope: dict[str, object] | None = None
-    last_exec: ExecResult | None = None
     for attempt in range(1, attempts + 1):
         try:
-            exec_result = invoke(
-                docker, instance, agentctl_argv, timeout=effective_timeout
-            )
+            exec_result = invoke(docker, instance, agentctl_argv, timeout=effective_timeout)
         except ExecFailedError as exc:
             if attempt < attempts:
                 sleep(backoff_base * (2.0 ** (attempt - 1)))
@@ -206,8 +200,6 @@ def invoke_mutation_with_retry(
             ) from exc
         if envelope.get("ok") is True or not is_ambiguous_envelope(envelope):
             return exec_result, envelope
-        last_envelope = envelope
-        last_exec = exec_result
         if attempt < attempts:
             sleep(backoff_base * (2.0 ** (attempt - 1)))
             continue

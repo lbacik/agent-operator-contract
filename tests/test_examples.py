@@ -74,7 +74,7 @@ def test_malformed_fixture_stdout_is_never_a_coherent_envelope(name: str) -> Non
     major = str(contract).split(".", 1)[0] if isinstance(contract, str) else ""
     assert major != "1", name
     if doc.get("ok") is True:
-        assert exit_code != 0 or True  # never parsed as success: interpret must reject
+        # Never parsed as success: interpret must reject the incoherent reply.
         from agent_operator_contract import client as _client
 
         with pytest.raises(_client.ClientError):
