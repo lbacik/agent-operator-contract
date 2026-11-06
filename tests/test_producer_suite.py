@@ -624,9 +624,7 @@ class _FakeProducer:
                     ),
                     "",
                 )
-            return self._mutate(
-                "recovery_retry", argv[6], argv[8], {"attempt_id": argv[4]}
-            )
+            return self._mutate("recovery_retry", argv[6], argv[8], {"attempt_id": argv[4]})
         if (
             len(argv) == 11
             and argv[:4] == ["--contract", "1", "recovery", "release"]
@@ -1206,9 +1204,7 @@ def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) ->
         if verb == "crash":
             if params.get("point") == "between-commit-and-reply":
                 producer.crash_armed = True
-                return producer_suite.HarnessResult(
-                    "ok", {"point": "between-commit-and-reply"}, ""
-                )
+                return producer_suite.HarnessResult("ok", {"point": "between-commit-and-reply"}, "")
             if params.get("point") == "during-finalization":
                 producer.crash_finalize = True
                 return producer_suite.HarnessResult("ok", {"point": "during-finalization"}, "")

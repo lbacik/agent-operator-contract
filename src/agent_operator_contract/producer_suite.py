@@ -3591,9 +3591,7 @@ def scenario_handoff_crash(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
     if not isinstance(current, dict) or not isinstance(current.get("attempt_id"), str):
         return ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim")
     attempt_id = str(current["attempt_id"])
-    _, outcome = _harness(
-        ctx, harness_cmd, scenario_id, "crash", {"point": "during-finalization"}
-    )
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "crash", {"point": "during-finalization"})
     if outcome is not None:
         return outcome
     request_id = _new_request_id()
@@ -3617,8 +3615,7 @@ def scenario_handoff_crash(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
         return ScenarioOutcome(
             scenario_id,
             "failed",
-            f"an interrupted handoff must be not_fulfilled, "
-            f"got {record.get('acknowledgement')!r}",
+            f"an interrupted handoff must be not_fulfilled, got {record.get('acknowledgement')!r}",
         )
     _, outcome = _harness(ctx, harness_cmd, scenario_id, "stop-container", {})
     if outcome is not None:
@@ -3682,8 +3679,7 @@ def scenario_handoff_crash(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
         return ScenarioOutcome(
             scenario_id,
             "failed",
-            f"recovery must not complete the handoff, "
-            f"got {stored.get('acknowledgement')!r}",
+            f"recovery must not complete the handoff, got {stored.get('acknowledgement')!r}",
         )
     return ScenarioOutcome(scenario_id, "passed")
 
@@ -3828,7 +3824,9 @@ def scenario_recovery_release(ctx: SuiteContext, harness_cmd: Sequence[str]) -> 
         ],
     )
     if outcome is not None or record is None:
-        return outcome or ScenarioOutcome(scenario_id, "failed", "recovery release committed nothing")
+        return outcome or ScenarioOutcome(
+            scenario_id, "failed", "recovery release committed nothing"
+        )
     if record.get("kind") != "recovery_release" or record.get("acknowledgement") != "completed":
         return ScenarioOutcome(
             scenario_id,
@@ -3866,6 +3864,11 @@ def scenario_recovery_release(ctx: SuiteContext, harness_cmd: Sequence[str]) -> 
     _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
     if outcome is not None:
         return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status for the next claim")
+    if snapshot.get("current_attempt") is None:
+        return ScenarioOutcome(scenario_id, "failed", "a second eligible issue must open a claim")
     _, outcome = _harness(
         ctx, harness_cmd, scenario_id, "finish-attempt", {"native_outcome": "complete"}
     )
@@ -3902,7 +3905,9 @@ def scenario_recovery_release(ctx: SuiteContext, harness_cmd: Sequence[str]) -> 
         ],
     )
     if outcome is not None or second is None:
-        return outcome or ScenarioOutcome(scenario_id, "failed", "recovery release committed nothing")
+        return outcome or ScenarioOutcome(
+            scenario_id, "failed", "recovery release committed nothing"
+        )
     if second.get("acknowledgement") != "completed":
         return ScenarioOutcome(
             scenario_id,

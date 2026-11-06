@@ -31,6 +31,22 @@
       "classification": "contract_mismatch",
       "note": "Exit 4, contract_mismatch: the consumer speaks major 2, the producer speaks major 1."
     },
+    "errors-reset-completed": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with replayed:false: the infrastructure-error guard reset."
+    },
+    "errors-reset-rejected": {
+      "classification": "rejection",
+      "note": "Exit 1, rejected: the infrastructure-error guard is already clear, nothing stored."
+    },
+    "handoff-completed": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with replayed:false: the handoff completed and sealed the attempt."
+    },
+    "handoff-rejected": {
+      "classification": "rejection",
+      "note": "Exit 1, rejected: no active attempt to hand off, nothing stored."
+    },
     "identity": {
       "classification": "success",
       "note": "Exit 0, ok:true with the Identity result."
@@ -66,6 +82,22 @@
     "payload-mismatch": {
       "classification": "rejection",
       "note": "Exit 1, payload_mismatch: the request ID is already used with a different payload."
+    },
+    "recovery-release-completed": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with replayed:false: the work location recorded, the issue released."
+    },
+    "recovery-release-not-found": {
+      "classification": "not_found",
+      "note": "Exit 5, not_found: unknown attempt ID for recovery release."
+    },
+    "recovery-retry-completed": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with replayed:false: safe finalization retried from retained evidence."
+    },
+    "recovery-retry-not-found": {
+      "classification": "not_found",
+      "note": "Exit 5, not_found: unknown attempt ID for recovery retry."
     },
     "rejected": {
       "classification": "rejection",
