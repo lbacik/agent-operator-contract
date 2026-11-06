@@ -562,7 +562,7 @@ ATTEMPTS_SHOW_VALIDATOR = Draft202012Validator(ATTEMPTS_SHOW_SCHEMA)
 CONTRACT_EVENT_VALIDATOR = Draft202012Validator(CONTRACT_EVENT_SCHEMA)
 
 
-def _attempts_results() -> list[tuple[str, Any]]:
+def _attempts_results() -> list[tuple[str, Any, Any]]:
     pairs = []
     for name in FIXTURE_NAMES:
         if _fixture_classification(name) == "malformed_stdout":
@@ -570,7 +570,7 @@ def _attempts_results() -> list[tuple[str, Any]]:
         fixture = documents.load_fixture(name)
         argv = fixture.get("argv", [])
         if not (
-            len(argv) >= 3 and argv[1:3] == ["1", "attempts"] or argv[:2] == ["--contract", "1"]
+            (len(argv) >= 3 and argv[1:3] == ["1", "attempts"]) or argv[:2] == ["--contract", "1"]
         ):
             continue
         doc = json.loads(fixture["stdout"])
@@ -628,7 +628,8 @@ def test_attempts_list_paging_cursor_shapes() -> None:
     paged = json.loads(documents.load_fixture("attempts-list")["stdout"])["result"]
     assert paged["next_cursor"] is None
     first = json.loads(documents.load_fixture("attempts-list-paged")["stdout"])["result"]
-    assert isinstance(first["next_cursor"], str) and first["next_cursor"]
+    assert isinstance(first["next_cursor"], str)
+    assert first["next_cursor"]
 
 
 def test_manifest_entry_kind_enum_matches_library() -> None:

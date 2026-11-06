@@ -903,6 +903,94 @@ def test_budget_attempts_fails_when_list_is_slow(
     assert "attempts list" in outcome.detail
 
 
+def _seed_finished_attempt(
+    producer: _FakeProducer, attempt_id: str, issue: int, started_at: str
+) -> None:
+    producer.finished_attempts.append(
+        producer._summary_doc(
+            {
+                "attempt_id": attempt_id,
+                "issue_number": issue,
+                "issue_title": f"Issue {issue}",
+                "started_at": started_at,
+            },
+            "2026-11-06T09:13:00Z",
+        )
+    )
+
+
+def test_attempts_list_paging_passes_with_finished_attempts(fakes: _FakeProducer) -> None:
+    _seed_finished_attempt(fakes, "fake-old", 109, "2026-11-06T08:50:00Z")
+    _seed_finished_attempt(fakes, "fake-new", 110, "2026-11-06T08:51:00Z")
+
+    outcome = producer_suite.scenario_attempts_list_paging(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
+
+
+def test_attempts_show_passes_with_a_finished_attempt(fakes: _FakeProducer) -> None:
+    _seed_finished_attempt(fakes, "fake-1", 110, "2026-11-06T08:51:00Z")
+
+    outcome = producer_suite.scenario_attempts_show(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
+
+
+def test_contract_events_passes_with_a_finished_attempt(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_finished_attempt(fakes, "fake-1", 111, "2026-11-06T08:51:00Z")
+    fakes.extra_events.append(
+        {
+            "at": "2026-11-06T08:51:00Z",
+            "level": "info",
+            "event": "claim_opened",
+            "text": "claimed issue #111",
+            "attempt_id": "fake-1",
+            "issue": 111,
+        }
+    )
+
+    def fake_export(
+        docker: str, container: str, exec_user: str, argv: list[str]
+    ) -> _FakeExportProc:
+        attempt_id = argv[-1]
+        line = (
+            json.dumps(
+                {
+                    "at": "2026-11-06T08:51:00Z",
+                    "level": "info",
+                    "event": "claim_opened",
+                    "text": "claimed issue #111",
+                    "attempt_id": attempt_id,
+                    "issue": 111,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w") as archive:
+            manifest = {"contract": "1.0", "attempt": {"attempt_id": attempt_id}, "files": []}
+            payload = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+            info = tarfile.TarInfo("events.jsonl")
+            info.size = len(line)
+            archive.addfile(info, io.BytesIO(line))
+        return _FakeExportProc(io.BytesIO(stream.getvalue()))
+
+    monkeypatch.setattr(producer_suite, "_popen_export", fake_export)
+
+    outcome = producer_suite.scenario_contract_events(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
+
+
 def _export_tar(attempt_id: str) -> bytes:
     manifest = {"contract": "1.0", "attempt": {"attempt_id": attempt_id}, "files": []}
     payload = (json.dumps(manifest, sort_keys=True) + "\n").encode()

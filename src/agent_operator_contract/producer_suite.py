@@ -961,7 +961,8 @@ def _check_attempts_list_result(stdout: str, exit_code: int) -> list[str]:
     started = [entry.get("started_at") for entry in attempts if isinstance(entry, dict)]
     if any(not isinstance(value, str) for value in started):
         return ["attempts list entries must carry started_at timestamps"]
-    if started != sorted(started, reverse=True):
+    ordered = cast("list[str]", started)
+    if ordered != sorted(ordered, reverse=True):
         # The active attempt is newest; allow it first even when its timestamp
         # ties the newest finished one.
         return ["attempts list must be newest first"]
@@ -986,9 +987,15 @@ def _check_attempts_show_result(stdout: str, exit_code: int, attempt_id: str) ->
         return [f"attempts show is for {attempt.get('attempt_id')!r}, not {attempt_id!r}"]
     manifest = result.get("manifest")
     assert isinstance(manifest, list)
-    kinds = [entry.get("path") for entry in manifest if isinstance(entry, dict)]
-    if "events.jsonl" not in kinds:
+    payloads = [
+        entry
+        for entry in manifest
+        if isinstance(entry, dict) and entry.get("path") == "events.jsonl"
+    ]
+    if not payloads:
         return ["attempts show manifest must include events.jsonl"]
+    if any(entry.get("kind") != "events" for entry in payloads):
+        return ["attempts show manifest events.jsonl must have kind events"]
     return []
 
 
@@ -1072,9 +1079,7 @@ def _paging_checks(ctx: SuiteContext, scenario_id: str) -> ScenarioOutcome:
     return ScenarioOutcome(scenario_id, "passed")
 
 
-def scenario_attempts_list_paging(
-    ctx: SuiteContext, harness_cmd: Sequence[str]
-) -> ScenarioOutcome:
+def scenario_attempts_list_paging(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """``attempts list`` pages newest first with a default of 20, max 100, opaque cursor."""
     scenario_id = "attempts-list-paging"
     issue = 109
@@ -1147,6 +1152,54 @@ def _export_events_payload(
     return data, None
 
 
+def _contract_events_checks(
+    ctx: SuiteContext, scenario_id: str, attempt_id: str
+) -> ScenarioOutcome:
+    """Check ``recent_events`` and the exported ``events.jsonl``; caller cleans up."""
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status snapshot")
+    events = snapshot.get("recent_events")
+    if not isinstance(events, list):
+        return ScenarioOutcome(scenario_id, "failed", "recent_events must be an array")
+    for index, entry in enumerate(events):
+        problems = documents.validate_contract_event(entry)
+        if problems:
+            return ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"recent_events[{index}] is not a Contract Event: {'; '.join(problems)}",
+            )
+    data, outcome = _export_events_payload(ctx, scenario_id, attempt_id)
+    if outcome is not None or data is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no export stream")
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            try:
+                member = archive.getmember("events.jsonl")
+            except KeyError:
+                return ScenarioOutcome(scenario_id, "failed", "the export lacks events.jsonl")
+            extracted = archive.extractfile(member)
+            payload = extracted.read() if extracted is not None else b""
+    except (tarfile.TarError, OSError) as exc:
+        return ScenarioOutcome(scenario_id, "failed", f"export is not a tar: {exc}")
+    for number, line in enumerate(payload.decode("utf-8").splitlines()):
+        if not line.strip():
+            continue
+        try:
+            entry = json.loads(line)
+        except ValueError:
+            return ScenarioOutcome(scenario_id, "failed", f"events.jsonl line {number} is not JSON")
+        problems = documents.validate_contract_event(entry)
+        if problems:
+            return ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"events.jsonl line {number} is not a Contract Event: {'; '.join(problems)}",
+            )
+    return ScenarioOutcome(scenario_id, "passed")
+
+
 def scenario_contract_events(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """Every ``recent_events`` entry and every ``events.jsonl`` line is a Contract Event."""
     scenario_id = "contract-events"
@@ -1154,57 +1207,11 @@ def scenario_contract_events(ctx: SuiteContext, harness_cmd: Sequence[str]) -> S
     attempt_id, outcome, created = _attempt_id_for_reads(ctx, harness_cmd, scenario_id, issue)
     if outcome is not None or attempt_id is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "no attempt to read")
-    result = ScenarioOutcome(scenario_id, "passed")
-    try:
-        snapshot, outcome = _snapshot(ctx, scenario_id)
-        if outcome is not None or snapshot is None:
-            return outcome or ScenarioOutcome(scenario_id, "failed", "no status snapshot")
-        events = snapshot.get("recent_events")
-        if not isinstance(events, list):
-            return ScenarioOutcome(scenario_id, "failed", "recent_events must be an array")
-        for index, entry in enumerate(events):
-            problems = documents.validate_contract_event(entry)
-            if problems:
-                return ScenarioOutcome(
-                    scenario_id,
-                    "failed",
-                    f"recent_events[{index}] is not a Contract Event: {'; '.join(problems)}",
-                )
-        data, outcome = _export_events_payload(ctx, scenario_id, attempt_id)
-        if outcome is not None or data is None:
-            return outcome or ScenarioOutcome(scenario_id, "failed", "no export stream")
-        try:
-            with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
-                try:
-                    member = archive.getmember("events.jsonl")
-                except KeyError:
-                    return ScenarioOutcome(scenario_id, "failed", "the export lacks events.jsonl")
-                extracted = archive.extractfile(member)
-                payload = extracted.read() if extracted is not None else b""
-        except (tarfile.TarError, OSError) as exc:
-            return ScenarioOutcome(scenario_id, "failed", f"export is not a tar: {exc}")
-        for number, line in enumerate(payload.decode("utf-8").splitlines()):
-            if not line.strip():
-                continue
-            try:
-                entry = json.loads(line)
-            except ValueError:
-                return ScenarioOutcome(
-                    scenario_id, "failed", f"events.jsonl line {number} is not JSON"
-                )
-            problems = documents.validate_contract_event(entry)
-            if problems:
-                return ScenarioOutcome(
-                    scenario_id,
-                    "failed",
-                    f"events.jsonl line {number} is not a Contract Event: {'; '.join(problems)}",
-                )
-        result = ScenarioOutcome(scenario_id, "passed")
-    finally:
-        if created:
-            cleanup = _drop_issue(ctx, harness_cmd, scenario_id, issue)
-            if result.status == "passed" and cleanup is not None:
-                return cleanup
+    result = _contract_events_checks(ctx, scenario_id, attempt_id)
+    if created:
+        cleanup = _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        if result.status == "passed" and cleanup is not None:
+            return cleanup
     return result
 
 
