@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "instances": [
+    {
+      "name": "Web-1",
+      "backend": "coding-agent",
+      "contract": "1",
+      "state": "running",
+      "duplicate": false
+    }
+  ]
+}

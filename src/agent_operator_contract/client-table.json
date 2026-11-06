@@ -1,0 +1,32 @@
+{
+  "client.unknown_instance": {
+    "exit_code": 5,
+    "retryable": false,
+    "meaning": "No Fleet member carries that instance name."
+  },
+  "client.duplicate_instance": {
+    "exit_code": 1,
+    "retryable": false,
+    "meaning": "More than one container carries that instance name; the consumer refuses to address it without touching any container."
+  },
+  "client.docker_unavailable": {
+    "exit_code": 6,
+    "retryable": true,
+    "meaning": "The docker CLI could not be run or the daemon did not answer."
+  },
+  "client.exec_failed": {
+    "exit_code": 6,
+    "retryable": true,
+    "meaning": "docker exec did not produce a producer envelope (daemon error, missing executable, missing container, or timeout)."
+  },
+  "client.malformed_stdout": {
+    "exit_code": 7,
+    "retryable": false,
+    "meaning": "The producer's stdout was not a valid envelope or contradicted its exit code."
+  },
+  "client.usage": {
+    "exit_code": 2,
+    "retryable": false,
+    "meaning": "Malformed agentfleet argv."
+  }
+}

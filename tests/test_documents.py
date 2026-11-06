@@ -330,6 +330,8 @@ def test_resource_loaders_expose_package_data() -> None:
         "instance-name",
         "harness-request",
         "harness-reply",
+        "client-envelope",
+        "ls",
     }
     for name in documents.SCHEMA_NAMES:
         schema = documents.load_schema(name)
@@ -343,3 +345,94 @@ def test_resource_loaders_expose_package_data() -> None:
     index = documents.load_fixture_index()
     assert index["version"] == 1
     assert isinstance(index["fixtures"], dict)
+
+
+def _client_error(code: str = "client.unknown_instance") -> dict[str, object]:
+    table = documents.client_table()
+    entry = table[code]
+    return {
+        "contract": "1.0",
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": "nope",
+            "retryable": entry["retryable"],
+        },
+    }
+
+
+def test_client_table_exit_classes_are_spec_section_4_classes() -> None:
+    producer_exits = {entry["exit_code"] for entry in documents.error_table().values()}
+    allowed = producer_exits | {2}
+
+    for code, entry in documents.client_table().items():
+        assert code.startswith("client.")
+        assert entry["exit_code"] in allowed, code
+        assert isinstance(entry["retryable"], bool), code
+
+
+def test_validate_client_envelope_accepts_known_codes() -> None:
+    for code in documents.client_table():
+        assert documents.validate_client_envelope(_client_error(code)) == [], code
+
+
+def test_validate_client_envelope_rejects_producer_codes_and_ok_true() -> None:
+    producer = {
+        "contract": "1.0",
+        "ok": False,
+        "error": {"code": "usage", "message": "x", "retryable": False},
+    }
+    assert documents.validate_client_envelope(producer) != []
+
+    ok_true = {"contract": "1.0", "ok": True, "result": {}}
+    assert documents.validate_client_envelope(ok_true) != []
+    assert documents.validate_client_envelope(None) != []
+    assert documents.validate_client_envelope({}) != []
+
+
+def _ls_doc() -> dict[str, object]:
+    return {
+        "version": 1,
+        "instances": [
+            {
+                "name": "web-1",
+                "backend": "coding-agent",
+                "contract": "1",
+                "state": "running",
+                "duplicate": False,
+            },
+            {
+                "name": "dup",
+                "backend": "coding-agent",
+                "contract": "1",
+                "state": "exited",
+                "duplicate": True,
+            },
+        ],
+    }
+
+
+def test_validate_ls_accepts_listing() -> None:
+    assert documents.validate_ls(_ls_doc()) == []
+    assert documents.validate_ls({"version": 1, "instances": []}) == []
+
+
+def test_validate_ls_rejects_bad_documents() -> None:
+    assert documents.validate_ls(None) != []
+    assert documents.validate_ls({}) != []
+
+    missing = _ls_doc()
+    del missing["instances"]
+    assert documents.validate_ls(missing) != []
+
+    bad_version = _ls_doc()
+    bad_version["version"] = 2
+    assert documents.validate_ls(bad_version) != []
+
+    bad_name = _ls_doc()
+    instances = bad_name["instances"]
+    assert isinstance(instances, list)
+    first = instances[0]
+    assert isinstance(first, dict)
+    first["name"] = "Web-1"
+    assert documents.validate_ls(bad_name) != []

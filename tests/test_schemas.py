@@ -63,6 +63,10 @@ def _negative_schema(name: str) -> Draft202012Validator:
         return HARNESS_REQUEST_VALIDATOR
     if name.startswith("harness-reply-"):
         return HARNESS_REPLY_VALIDATOR
+    if name.startswith("client-envelope-"):
+        return Draft202012Validator(documents.load_schema("client-envelope"))
+    if name.startswith("ls-"):
+        return Draft202012Validator(documents.load_schema("ls"))
     raise AssertionError(f"negative example without a schema: {name}")
 
 
@@ -77,6 +81,10 @@ def _negative_library_errors(name: str, doc: Any) -> list[str]:
         return documents.validate_harness_request(doc)
     if name.startswith("harness-reply-"):
         return documents.validate_harness_reply(doc)
+    if name.startswith("client-envelope-"):
+        return documents.validate_client_envelope(doc)
+    if name.startswith("ls-"):
+        return documents.validate_ls(doc)
     raise AssertionError(f"negative example without a schema: {name}")
 
 
@@ -304,3 +312,25 @@ def test_error_fixture_signals_match_error_table(name: str) -> None:
         code: str = doc["error"]["code"]
         assert fixture["exit_code"] == table[code]["exit_code"]
         assert doc["error"]["retryable"] is table[code]["retryable"]
+
+
+def test_client_envelope_error_code_enum_matches_client_table() -> None:
+    schema = documents.load_schema("client-envelope")
+    enum = schema["properties"]["error"]["properties"]["code"]["enum"]
+
+    assert set(enum) == set(documents.client_table())
+    assert len(enum) == len(set(enum))
+
+
+def test_client_envelope_schema_patterns_match_library() -> None:
+    schema = documents.load_schema("client-envelope")
+
+    assert schema["properties"]["contract"]["pattern"] == documents.CONTRACT_PATTERN
+
+
+def test_ls_schema_patterns_match_library() -> None:
+    schema = documents.load_schema("ls")
+    item = schema["properties"]["instances"]["items"]["properties"]
+
+    assert item["name"]["pattern"] == documents.INSTANCE_NAME_PATTERN
+    assert item["contract"]["pattern"] == documents.CONTRACT_MAJOR_PATTERN

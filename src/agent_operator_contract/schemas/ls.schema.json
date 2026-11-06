@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "agentfleet ls --json",
+  "description": "The Fleet listing agentfleet ls --json prints: one entry per labelled container (running and stopped), Compose one-off containers excluded, duplicate instance names flagged rather than hidden (spec section 2.1).",
+  "type": "object",
+  "required": [
+    "version",
+    "instances"
+  ],
+  "properties": {
+    "version": {
+      "const": 1,
+      "description": "The ls document version."
+    },
+    "instances": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "backend",
+          "contract",
+          "state",
+          "duplicate"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z0-9][a-z0-9-]{0,62}$",
+            "description": "The instance name from the discovery labels (spec section 2.1)."
+          },
+          "backend": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The engine implementation behind the instance; display only."
+          },
+          "contract": {
+            "type": "string",
+            "pattern": "^[0-9]+$",
+            "description": "The contract major from the discovery label."
+          },
+          "state": {
+            "type": "string",
+            "minLength": 1,
+            "description": "The container state from docker inspect (e.g. running, exited)."
+          },
+          "duplicate": {
+            "type": "boolean",
+            "description": "True when more than one container carries this instance name."
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

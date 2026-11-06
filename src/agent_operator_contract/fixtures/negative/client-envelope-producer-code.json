@@ -1,0 +1,9 @@
+{
+  "contract": "1.0",
+  "ok": false,
+  "error": {
+    "code": "usage",
+    "message": "producer code, not a client. code",
+    "retryable": false
+  }
+}
