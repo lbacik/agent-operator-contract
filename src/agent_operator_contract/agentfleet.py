@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from collections.abc import Sequence
 from typing import Any, NoReturn
@@ -28,6 +29,39 @@ from typing import Any, NoReturn
 from agent_operator_contract import CONTRACT_MAJOR, __version__, client, shared
 
 LS_VERSION = 1
+
+MUTATION_TIMEOUT_ENV_VAR = "AGENTFLEET_MUTATION_TIMEOUT"
+MAX_ATTEMPTS_ENV_VAR = "AGENTFLEET_MAX_ATTEMPTS"
+
+
+def _mutation_timeout(override: float | None) -> float | None:
+    """Resolve the mutation timeout: CLI flag, env var, then the §3.3 default."""
+    if override is not None:
+        return override
+    raw = os.environ.get(MUTATION_TIMEOUT_ENV_VAR)
+    if raw is not None and raw.strip():
+        try:
+            value = float(raw.strip())
+        except ValueError:
+            return None
+        if value > 0:
+            return value
+    return None
+
+
+def _mutation_max_attempts(override: int | None) -> int | None:
+    """Resolve the bounded retry count: CLI flag, env var, then the default."""
+    if override is not None:
+        return override
+    raw = os.environ.get(MAX_ATTEMPTS_ENV_VAR)
+    if raw is not None and raw.strip():
+        try:
+            value = int(raw.strip(), 10)
+        except ValueError:
+            return None
+        if value >= 1:
+            return value
+    return None
 
 
 def _client_error_document(error: client.ClientError) -> dict[str, object]:
@@ -294,6 +328,38 @@ def _print_producer_failure(
     return exit_code
 
 
+def _print_ambiguous(
+    error: client.AmbiguousMutationError, name: str, use_json: bool
+) -> int:
+    """Report an ambiguous mutation that stayed ambiguous after the retries.
+
+    The request ID is always printed so the operator can follow up with
+    ``agentfleet command <instance> <request-id>`` instead of resubmitting.
+    """
+    if use_json and error.envelope is not None:
+        sys.stdout.buffer.write(json.dumps(error.envelope, sort_keys=True).encode("utf-8"))
+        sys.stdout.buffer.write(b"\n")
+        sys.stdout.buffer.flush()
+        sys.stderr.write(
+            f"agentfleet: ambiguous outcome after {error.attempts} attempts; "
+            f"request_id {error.request_id}; follow up with "
+            f"'agentfleet command {name} {error.request_id}' instead of resubmitting\n"
+        )
+        return error.exit_code
+    doc = client.ExecFailedError(str(error)).document(
+        details={"request_id": error.request_id, "attempts": error.attempts}
+    )
+    sys.stdout.write(json.dumps(doc, sort_keys=True) + "\n")
+    sys.stdout.write(f"request_id: {error.request_id}\n")
+    sys.stdout.flush()
+    sys.stderr.write(
+        f"agentfleet: ambiguous outcome after {error.attempts} attempts; "
+        f"request_id {error.request_id}; follow up with "
+        f"'agentfleet command {name} {error.request_id}' instead of resubmitting\n"
+    )
+    return error.exit_code
+
+
 def _run_mutation(
     docker: str,
     name: str,
@@ -301,14 +367,18 @@ def _run_mutation(
     expect_repo: str,
     request_id: str | None,
     use_json: bool,
+    timeout: float | None = None,
+    max_attempts: int | None = None,
 ) -> int:
     """Submit ``stop`` or ``resume`` after the identity precheck (spec section 5).
 
     An ``identity`` read precedes every mutation: when it fails, or when the
     reported contract major or capabilities forbid the mutation, nothing is
     sent. ``--expect-repo`` always comes from the caller, never from the
-    instance's own identity. The request ID of every mutation is printed, so an
-    ambiguous outcome can be followed up with ``command <request-id>``.
+    instance's own identity. Ambiguous outcomes (§8.4) are retried inside this
+    call with the same request ID and payload; the request ID of every mutation
+    is printed, so an ambiguous outcome can be followed up with
+    ``command <request-id>``.
     """
     try:
         fleet = client.discover(docker)
@@ -339,19 +409,27 @@ def _run_mutation(
     except client.ClientError as exc:
         return _print_client_error(exc, use_json)
     sent_id = request_id if request_id is not None else client.new_request_id()
+    argv = [operation, "--request-id", sent_id, "--expect-repo", expect_repo]
+    effective_timeout = _mutation_timeout(timeout)
+    effective_attempts = _mutation_max_attempts(max_attempts)
     try:
-        mutation = client.invoke(
+        mutation, envelope = client.invoke_mutation_with_retry(
             docker,
             instance,
-            [operation, "--request-id", sent_id, "--expect-repo", expect_repo],
-            timeout=client.MUTATION_TIMEOUT,
+            argv,
+            sent_id,
+            timeout=effective_timeout,
+            max_attempts=effective_attempts,
         )
+    except client.AmbiguousMutationError as exc:
+        return _print_ambiguous(exc, name, use_json)
     except client.ClientError as exc:
-        return _print_client_error(exc, use_json)
-    try:
-        envelope = client.interpret(mutation)
-    except client.ClientError as exc:
-        return _print_client_error(exc, use_json)
+        if not use_json:
+            sys.stdout.write(f"request_id: {sent_id}\n")
+            sys.stdout.flush()
+        return _print_client_error(
+            exc, use_json, {"request_id": sent_id, "operation": operation}
+        )
     if use_json:
         sys.stdout.buffer.write(mutation.stdout)
         sys.stdout.buffer.flush()
@@ -482,6 +560,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     stop_parser.add_argument("--json", dest="json", action="store_true")
     stop_parser.add_argument("--docker", dest="docker", default=None)
+    stop_parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=float,
+        default=None,
+        help="consumer timeout in seconds (default: §3.3 class default, 15 s for mutations)",
+    )
+    stop_parser.add_argument(
+        "--max-attempts",
+        dest="max_attempts",
+        type=int,
+        default=None,
+        help="bounded retries for an ambiguous mutation (default: 3 attempts)",
+    )
     resume_parser = sub.add_parser("resume", help="reopen one instance's intake")
     resume_parser.add_argument("instance", help="instance name from the discovery labels")
     resume_parser.add_argument(
@@ -496,6 +588,20 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     resume_parser.add_argument("--json", dest="json", action="store_true")
     resume_parser.add_argument("--docker", dest="docker", default=None)
+    resume_parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=float,
+        default=None,
+        help="consumer timeout in seconds (default: §3.3 class default, 15 s for mutations)",
+    )
+    resume_parser.add_argument(
+        "--max-attempts",
+        dest="max_attempts",
+        type=int,
+        default=None,
+        help="bounded retries for an ambiguous mutation (default: 3 attempts)",
+    )
     command_parser = sub.add_parser(
         "command", help="read one committed Operator Command by request ID"
     )
@@ -519,6 +625,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.operation == "status":
         return _run_status(docker, str(args.instance), use_json)
     if args.operation in ("stop", "resume"):
+        timeout = getattr(args, "timeout", None)
+        max_attempts = getattr(args, "max_attempts", None)
         return _run_mutation(
             docker,
             str(args.instance),
@@ -526,6 +634,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             str(args.expect_repo),
             args.request_id if isinstance(args.request_id, str) else None,
             use_json,
+            timeout=float(timeout) if isinstance(timeout, (int, float)) else None,
+            max_attempts=int(max_attempts) if isinstance(max_attempts, int) else None,
         )
     if args.operation == "command":
         return _run_command(docker, str(args.instance), str(args.request_id), use_json)

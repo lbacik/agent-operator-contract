@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "stop",
+    "--request-id",
+    "req-unknown-major",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 0,
+  "stdout": "{\"contract\":\"9.9\",\"ok\":true,\"result\":{\"command\":{\"acknowledgement\":\"accepted\",\"arguments\":{},\"created_at\":\"2026-11-06T09:12:03Z\",\"detail\":\"finish the active attempt, then close intake\",\"kind\":\"stop\",\"repository\":\"example-owner/example-repo\",\"request_id\":\"req-unknown-major\",\"sequence\":7,\"updated_at\":\"2026-11-06T09:12:03Z\"},\"replayed\":false}}\n",
+  "stderr": ""
+}

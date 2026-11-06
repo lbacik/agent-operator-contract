@@ -1488,6 +1488,10 @@ def classify_fixture(fixture: object) -> Classification:
         return "malformed_stdout"
     if not isinstance(doc, dict) or validate_envelope(doc) != []:
         return "malformed_stdout"
+    contract = doc.get("contract")
+    major = str(contract).split(".", 1)[0] if isinstance(contract, str) else ""
+    if major != "1":
+        return "malformed_stdout"
     table = error_table()
     if doc["ok"] is True:
         if exit_code != 0:
