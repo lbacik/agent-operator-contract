@@ -998,3 +998,120 @@ def test_attempts_fixture_classifications_cover_list_show_and_not_found() -> Non
     assert index["attempts-show-sealed"]["classification"] == "success"
     assert index["attempts-show-unsealed"]["classification"] == "success"
     assert index["attempts-not-found"]["classification"] == "not_found"
+
+
+def test_stop_after_with_supplied_request_id_sends_after(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "req-7f2a9b4c1d3e"
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, ["identity", "stop-after-accepted"])
+    completed = _run_agentfleet(
+        [
+            "stop-after",
+            "web-1",
+            "2",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            request_id,
+        ],
+        env,
+    )
+
+    assert completed.returncode == 0
+    assert request_id in completed.stdout.decode("utf-8")
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "identity"],
+        [
+            "--contract",
+            "1",
+            "stop",
+            "--after",
+            "2",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+    ]
+
+
+def test_next_issue_with_supplied_request_id_sends_issue(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "req-8e3b0c5d2f4a"
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, ["identity", "next-issue-accepted"])
+    completed = _run_agentfleet(
+        [
+            "next-issue",
+            "web-1",
+            "122",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            request_id,
+        ],
+        env,
+    )
+
+    assert completed.returncode == 0
+    assert request_id in completed.stdout.decode("utf-8")
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "identity"],
+        [
+            "--contract",
+            "1",
+            "next",
+            "issue",
+            "122",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+    ]
+
+
+def test_next_issue_refused_when_capability_missing(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``next-issue`` against an instance not advertising it fails client-side.
+
+    The identity precheck refuses with ``client.unsupported_capability``
+    before anything is submitted, so the fake records the ``identity`` read
+    and no mutation.
+    """
+    identity_doc = dict(json.loads((FIXTURES_DIR / "identity.json").read_text(encoding="utf-8")))
+    narrowed_stdout = json.dumps(
+        {
+            **json.loads(identity_doc["stdout"]),
+            "result": {
+                **json.loads(identity_doc["stdout"])["result"],
+                "capabilities": ["stop-after"],
+            },
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    narrowed = {**identity_doc, "stdout": narrowed_stdout + "\n"}
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, [], {"identity": narrowed})
+    completed = _run_agentfleet(
+        [
+            "next-issue",
+            "web-1",
+            "122",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            "req-8e3b0c5d2f4a",
+            "--json",
+        ],
+        env,
+    )
+
+    table = documents.client_table()
+    assert completed.returncode == int(table["client.unsupported_capability"]["exit_code"])
+    doc = json.loads(completed.stdout.decode("utf-8"))
+    assert documents.validate_client_envelope(doc) == []
+    assert doc["error"]["code"] == "client.unsupported_capability"
+    assert _exec_argvs(_recorded(consumer_env)) == [["--contract", "1", "identity"]]

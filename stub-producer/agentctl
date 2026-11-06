@@ -3,8 +3,9 @@
 
 Serves ``identity``, ``status``, ``command`` and ``attempts list`` / ``attempts
 show`` / ``attempts export`` (a minimal tar stream) plus the core mutations
-``stop`` and ``resume`` (and a minimal ``stop --after`` plan) with durable
-Intake, Claims and Attempts on its state volume. Recovery runs at start, Halts
+``stop`` and ``resume`` (a ``stop --after`` plan and a one-shot ``next issue``
+priority) with durable Intake, Claims and Attempts on its state volume. Recovery
+runs at start, Halts
 are recorded durably, and the engine honors the harness holds (notably
 ``before-claim``) and one-shot crashes armed by the harness. Reads never wait
 on the engine lock: while a mutation or a harness ``hold-lock`` holds it,
@@ -102,6 +103,7 @@ def _fresh_state() -> dict[str, Any]:
         "intake": "open",
         "pending_stop": None,
         "stop_plan": None,
+        "priority": None,
         "next_sequence": 1,
         "commands": {},
         "recent_events": [],
@@ -142,6 +144,9 @@ def _load_state() -> tuple[dict[str, Any], str | None]:
     plan = doc.get("stop_plan")
     if isinstance(plan, dict) or plan is None:
         state["stop_plan"] = plan
+    priority = doc.get("priority")
+    if isinstance(priority, dict) or priority is None:
+        state["priority"] = priority
     if type(doc.get("next_sequence")) is int and doc["next_sequence"] >= 1:
         state["next_sequence"] = doc["next_sequence"]
     if isinstance(doc.get("commands"), dict):
@@ -527,7 +532,7 @@ def _status(offline: bool, state: dict[str, Any]) -> dict[str, object]:
         "intake": {
             "observed_at": now,
             "pending_stop": state.get("pending_stop"),
-            "priority": None,
+            "priority": _priority_status(state),
             "state": state.get("intake", "open"),
             "stop_plan": state.get("stop_plan"),
         },
@@ -536,6 +541,52 @@ def _status(offline: bool, state: dict[str, Any]) -> dict[str, object]:
         "recent_events": state.get("recent_events", []),
         "truncated": False,
     }
+
+
+def _priority_status(state: dict[str, Any]) -> dict[str, Any] | None:
+    """Render the durable one-shot issue priority for the status snapshot."""
+    priority = state.get("priority")
+    if not isinstance(priority, dict):
+        return None
+    request_id = priority.get("request_id")
+    issue = priority.get("issue")
+    if not isinstance(request_id, str) or type(issue) is not int or issue < 1:
+        return None
+    return {"request_id": request_id, "issue": issue}
+
+
+def _resolve_priority(
+    state: dict[str, Any], acknowledgement: str, detail: str
+) -> None:
+    """Move the pending priority to a final acknowledgement and clear it."""
+    priority = state.get("priority")
+    if not isinstance(priority, dict):
+        return
+    now = _utc_now()
+    commands = state.get("commands")
+    request_id = priority.get("request_id")
+    if isinstance(commands, dict) and isinstance(request_id, str):
+        entry = commands.get(request_id)
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("record"), dict)
+            and entry["record"].get("acknowledgement") == "accepted"
+        ):
+            entry["record"]["acknowledgement"] = acknowledgement
+            entry["record"]["updated_at"] = now
+            entry["record"]["detail"] = detail
+    state["priority"] = None
+    _append_event(
+        state,
+        {
+            "at": now,
+            "level": "info",
+            "event": "command_resolved",
+            "request_id": request_id,
+            "acknowledgement": acknowledgement,
+            "text": f"command {request_id} {acknowledgement}",
+        },
+    )
 
 
 def _eligible_issue(state: dict[str, Any]) -> tuple[int, str | None] | None:
@@ -658,10 +709,42 @@ def _maybe_open_claim(state: dict[str, Any]) -> str | None:
         return "crashed"
     if _held_before_claim(state):
         return None
+    priority = state.get("priority")
+    if isinstance(priority, dict) and type(priority.get("issue")) is int:
+        number = int(priority["issue"])
+        issues = state.get("issues")
+        entry = (
+            issues.get(str(number)) if isinstance(issues, dict) else None
+        )
+        if isinstance(entry, dict) and entry.get("eligible") is False:
+            _resolve_priority(
+                state,
+                "not_fulfilled",
+                f"issue {number} is not eligible at the claim boundary",
+            )
+        else:
+            title = None
+            if isinstance(entry, dict):
+                raw_title = entry.get("title")
+                title = raw_title if isinstance(raw_title, str) else None
+            _resolve_priority(
+                state, "completed", f"prioritized issue {number} claimed"
+            )
+            return _open_claim(state, number, title, armed)
     found = _eligible_issue(state)
     if found is None:
         return None
     number, title = found
+    return _open_claim(state, number, title, armed)
+
+
+def _open_claim(
+    state: dict[str, Any],
+    number: int,
+    title: str | None,
+    armed: Any,
+) -> str | None:
+    """Open a Claim for one issue number; ``"crashed"`` on a one-shot crash."""
     if isinstance(armed, dict) and armed.get("point") == "after-claim":
         state["crash_armed"] = None
         state["engine_alive"] = False
@@ -704,6 +787,8 @@ def _mutation_payload(operation: str, arguments: dict[str, Any]) -> tuple[str, d
     """Return the canonical (kind, arguments) payload an operation commits."""
     if operation == "stop" and "after" in arguments:
         return "stop_after", {"after": int(arguments["after"], 10)}
+    if operation == "next-issue":
+        return "next_issue", {"issue": int(arguments["issue"], 10)}
     return operation, {}
 
 
@@ -895,6 +980,43 @@ def _do_resume(state: dict[str, Any], path: str | None, request_id: str) -> int:
     return 0
 
 
+def _do_next_issue(
+    state: dict[str, Any], path: str | None, request_id: str, arguments: dict[str, Any]
+) -> int:
+    """Commit a one-shot issue priority for the next Claim (spec section 8.3)."""
+    issue = int(arguments["issue"], 10)
+    issues = state.get("issues")
+    entry = issues.get(str(issue)) if isinstance(issues, dict) else None
+    if isinstance(entry, dict) and entry.get("eligible") is False:
+        text, exit_code = shared.render_error(
+            "rejected",
+            f"issue {issue} is not eligible for selection",
+            request_id=request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    _supersede(state, state.get("priority"))
+    record = _commit(
+        state,
+        request_id,
+        "next_issue",
+        {"issue": issue},
+        "accepted",
+        f"issue {issue} prioritized for the next claim",
+    )
+    state["priority"] = {
+        "request_id": request_id,
+        "sequence": record["sequence"],
+        "issue": issue,
+    }
+    _save_state(state, path)
+    armed = state.get("crash_armed")
+    if isinstance(armed, dict) and armed.get("point") == "between-commit-and-reply":
+        return _fire_between_commit_and_reply(state, path, request_id)
+    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+    return 0
+
+
 def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedCall) -> int:
     assert parsed.request_id is not None and parsed.expect_repo is not None
     repository = _repository()
@@ -928,9 +1050,11 @@ def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedC
         return _do_stop(state, path, parsed.request_id, parsed.arguments)
     if parsed.operation == "resume":
         return _do_resume(state, path, parsed.request_id)
+    if parsed.operation == "next-issue":
+        return _do_next_issue(state, path, parsed.request_id, parsed.arguments)
     text, exit_code = shared.render_error(
         "internal",
-        f"stub producer implements stop and resume only (got {parsed.operation})",
+        f"stub producer implements stop, resume and next issue only (got {parsed.operation})",
         details={"stored": False},
         request_id=parsed.request_id,
     )
@@ -1284,13 +1408,13 @@ def main(argv: list[str]) -> int:
         return _do_attempts_show(state, attempt_id)
     if parsed.operation == "attempts-export":
         return _do_attempts_export(state, parsed.arguments)
-    if parsed.operation in ("stop", "resume"):
+    if parsed.operation in ("stop", "resume", "next-issue"):
         assert parsed.request_id is not None and parsed.expect_repo is not None
         return _run_locked_mutation(parsed)
     text, exit_code = shared.render_error(
         "internal",
         "stub producer implements identity, status, command, attempts list/show/export, "
-        f"stop and resume only (got {parsed.operation})",
+        f"stop, resume and next issue only (got {parsed.operation})",
         details={"stored": False},
         request_id=parsed.request_id,
     )

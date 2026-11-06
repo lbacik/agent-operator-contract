@@ -159,8 +159,8 @@ _FRESH_DOC = (
     '{"active_attempt":null,"attempt_counter":0,"attempt_order":[],"attempts":{},'
     '"commands":{},"crash_armed":null,"defer_armed":false,"engine_alive":true,'
     '"hold":null,"intake":"open","issues":{},"last_finished":null,"last_halt":null,'
-    '"next_sequence":1,"pending_stop":null,"recent_events":[],"recovery_pending":false,'
-    '"startup_hold":false,"stop_plan":null}'
+    '"next_sequence":1,"pending_stop":null,"priority":null,"recent_events":[],'
+    '"recovery_pending":false,"startup_hold":false,"stop_plan":null}'
 )
 
 
