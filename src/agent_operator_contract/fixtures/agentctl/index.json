@@ -43,9 +43,33 @@
       "classification": "rejection",
       "note": "Exit 1, repository_mismatch: wrong --expect-repo, nothing stored."
     },
+    "status-active": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with an active status snapshot and a coding-agent attempt."
+    },
     "status-draining": {
       "classification": "success",
       "note": "Exit 0, ok:true with a draining status snapshot."
+    },
+    "status-idle": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with an idle status snapshot and no active attempt."
+    },
+    "status-paused": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with a paused status snapshot and closed intake."
+    },
+    "status-recovering": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with a recovering status snapshot while finalization finishes."
+    },
+    "status-simple-coding-agent": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with a simple-coding-agent status snapshot and raw budget."
+    },
+    "status-starting": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with a starting status snapshot naming the startup check."
     },
     "stop-accepted": {
       "classification": "success",

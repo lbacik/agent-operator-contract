@@ -80,7 +80,75 @@ SCHEMA_NAMES: tuple[str, ...] = (
     "ls",
     "harness-request",
     "harness-reply",
+    "status",
+    "figure",
 )
+
+STATUS_STATES: tuple[str, ...] = (
+    "starting",
+    "recovering",
+    "idle",
+    "active",
+    "draining",
+    "paused",
+    "stopped",
+)
+"""Every ``instance.state`` of a Status Snapshot (spec section 7.2)."""
+
+FIGURE_UNITS: tuple[str, ...] = ("tokens", "usd", "seconds", "count", "ratio")
+"""Every Figure ``unit`` of spec section 7.3."""
+
+FIGURE_BASES: tuple[str, ...] = (
+    "measured",
+    "estimated",
+    "configured",
+    "assumed",
+    "unavailable",
+    "not_applicable",
+)
+"""Every Figure ``basis`` of spec section 7.3."""
+
+NULL_BASES: frozenset[str] = frozenset({"unavailable", "not_applicable"})
+"""Bases that require a null Figure value (spec section 7.3)."""
+
+ENFORCED_TOKENS: tuple[str, ...] = ("raw", "effective", "none")
+"""Every ``Budget.enforced_tokens`` value (spec section 7.2)."""
+
+LIMIT_NAMES: tuple[str, ...] = (
+    "raw_tokens",
+    "effective_tokens",
+    "cost_usd",
+    "wall_clock_seconds",
+    "tool_calls",
+    "turns",
+)
+"""Ceiling names that need no ``native.`` prefix (spec section 7.2)."""
+
+INTAKE_STATES: tuple[str, ...] = ("open", "closed")
+"""Every ``intake.state`` of a Status Snapshot (spec section 7.2)."""
+
+COMMAND_KINDS: tuple[str, ...] = (
+    "stop",
+    "stop_after",
+    "resume",
+    "next_issue",
+    "handoff",
+    "recovery_retry",
+    "recovery_release",
+    "errors_reset",
+)
+"""Every ``CommandRecord.kind`` of spec section 7.5."""
+
+ACKNOWLEDGEMENTS: tuple[str, ...] = (
+    "accepted",
+    "completed",
+    "superseded",
+    "not_fulfilled",
+)
+"""Every command acknowledgement of spec section 8.2."""
+
+EVENT_LEVELS: tuple[str, ...] = ("debug", "info", "warning", "error")
+"""Every Contract Event ``level`` of spec section 10."""
 
 HARNESS_VERSION = "1.0"
 """The harness protocol version the suite speaks (spec section 15.1)."""
@@ -354,6 +422,517 @@ def _validate_started_at(mode: object, value: object) -> list[str]:
     if value is not None and not _matches(TIMESTAMP_PATTERN, value):
         return ["identity.process_started_at must be an RFC 3339 UTC timestamp or null"]
     return []
+
+
+def validate_figure(doc: object, prefix: str = "figure") -> list[str]:
+    """Check a Figure document; the empty list means valid (spec section 7.3).
+
+    ``value`` is null exactly when ``basis`` is ``unavailable`` or
+    ``not_applicable``; with any other basis it must be a number.
+    Unknown fields are ignored so a minor can add them.
+    """
+    if not isinstance(doc, dict):
+        return [f"{prefix} must be an object"]
+    errors: list[str] = []
+    for key in ("value", "unit", "basis"):
+        if key not in doc:
+            errors.append(f"{prefix} is missing required property: {key!r}")
+    value = doc.get("value")
+    unit = doc.get("unit")
+    basis = doc.get("basis")
+    if "unit" in doc and unit not in FIGURE_UNITS:
+        errors.append(f"{prefix}.unit {unit!r} is not a known 1.0 unit")
+    if "basis" in doc and basis not in FIGURE_BASES:
+        errors.append(f"{prefix}.basis {basis!r} is not a known 1.0 basis")
+    if "reason" in doc and not isinstance(doc["reason"], str):
+        errors.append(f"{prefix}.reason must be a string")
+    if "value" in doc and "basis" in doc and basis in FIGURE_BASES:
+        if basis in NULL_BASES:
+            if value is not None:
+                errors.append(
+                    f"{prefix}.value must be null when basis is {basis!r}"
+                )
+        elif not isinstance(value, (int, float)) or isinstance(value, bool):
+            errors.append(f"{prefix}.value must be a number when basis is {basis!r}")
+    return errors
+
+
+def _validate_timestamp(value: object) -> bool:
+    return _matches(TIMESTAMP_PATTERN, value)
+
+
+def _validate_halt(doc: object, prefix: str) -> list[str]:
+    if doc is None:
+        return []
+    if not isinstance(doc, dict):
+        return [f"{prefix} must be an object or null"]
+    errors: list[str] = []
+    for key in ("reason", "detail", "at"):
+        if key not in doc:
+            errors.append(f"{prefix} is missing required property: {key!r}")
+    if "reason" in doc and (
+        not isinstance(doc["reason"], str) or not doc["reason"]
+    ):
+        errors.append(f"{prefix}.reason must be a non-empty string")
+    if "detail" in doc and not isinstance(doc["detail"], str):
+        errors.append(f"{prefix}.detail must be a string")
+    if "at" in doc and not _validate_timestamp(doc["at"]):
+        errors.append(f"{prefix}.at must be an RFC 3339 UTC timestamp")
+    return errors
+
+
+def _validate_budget(doc: object, prefix: str = "budget") -> list[str]:
+    if not isinstance(doc, dict):
+        return [f"{prefix} must be an object"]
+    errors: list[str] = []
+    for key in ("raw_tokens", "effective_tokens", "enforced_tokens", "limits"):
+        if key not in doc:
+            errors.append(f"{prefix} is missing required property: {key!r}")
+    if "raw_tokens" in doc:
+        errors.extend(validate_figure(doc["raw_tokens"], f"{prefix}.raw_tokens"))
+    if "effective_tokens" in doc:
+        errors.extend(
+            validate_figure(doc["effective_tokens"], f"{prefix}.effective_tokens")
+        )
+    if "enforced_tokens" in doc and doc["enforced_tokens"] not in ENFORCED_TOKENS:
+        errors.append(
+            f"{prefix}.enforced_tokens {doc['enforced_tokens']!r} is not known"
+        )
+    if "limits" in doc:
+        limits = doc["limits"]
+        if not isinstance(limits, list):
+            errors.append(f"{prefix}.limits must be an array")
+        else:
+            for index, entry in enumerate(limits):
+                item_prefix = f"{prefix}.limits[{index}]"
+                if not isinstance(entry, dict):
+                    errors.append(f"{item_prefix} must be an object")
+                    continue
+                for key in ("name", "used", "limit"):
+                    if key not in entry:
+                        errors.append(
+                            f"{item_prefix} is missing required property: {key!r}"
+                        )
+                name = entry.get("name")
+                if "name" in entry:
+                    if not isinstance(name, str) or not name:
+                        errors.append(f"{item_prefix}.name must be a non-empty string")
+                    elif name not in LIMIT_NAMES and not (
+                        name.startswith("native.") and len(name) > len("native.")
+                    ):
+                        errors.append(
+                            f"{item_prefix}.name {name!r} is not a known 1.0 limit"
+                        )
+                if "used" in entry:
+                    errors.extend(validate_figure(entry["used"], f"{item_prefix}.used"))
+                if "limit" in entry:
+                    errors.extend(
+                        validate_figure(entry["limit"], f"{item_prefix}.limit")
+                    )
+    return errors
+
+
+def _validate_current_attempt(doc: object) -> list[str]:
+    if doc is None:
+        return []
+    if not isinstance(doc, dict):
+        return ["current_attempt must be an object or null"]
+    errors: list[str] = []
+    for key in (
+        "attempt_id",
+        "issue",
+        "native_phase",
+        "started_at",
+        "last_activity_at",
+        "observed_at",
+        "budget",
+        "figures",
+    ):
+        if key not in doc:
+            errors.append(f"current_attempt is missing required property: {key!r}")
+    if "attempt_id" in doc and (
+        not isinstance(doc["attempt_id"], str) or not doc["attempt_id"]
+    ):
+        errors.append("current_attempt.attempt_id must be a non-empty string")
+    if "issue" in doc:
+        issue = doc["issue"]
+        if not isinstance(issue, dict):
+            errors.append("current_attempt.issue must be an object")
+        else:
+            if "number" not in issue:
+                errors.append("current_attempt.issue is missing required property: 'number'")
+            elif type(issue["number"]) is not int or issue["number"] < 1:
+                errors.append("current_attempt.issue.number must be an integer >= 1")
+            if "title" not in issue:
+                errors.append("current_attempt.issue is missing required property: 'title'")
+            elif issue["title"] is not None and not isinstance(issue["title"], str):
+                errors.append("current_attempt.issue.title must be a string or null")
+    if "native_phase" in doc and (
+        not isinstance(doc["native_phase"], str) or not doc["native_phase"]
+    ):
+        errors.append("current_attempt.native_phase must be a non-empty string")
+    if "started_at" in doc and not _validate_timestamp(doc["started_at"]):
+        errors.append("current_attempt.started_at must be an RFC 3339 UTC timestamp")
+    if "last_activity_at" in doc:
+        last_activity = doc["last_activity_at"]
+        if last_activity is not None and not _validate_timestamp(last_activity):
+            errors.append(
+                "current_attempt.last_activity_at must be an RFC 3339 UTC timestamp or null"
+            )
+    if "observed_at" in doc and not _validate_timestamp(doc["observed_at"]):
+        errors.append("current_attempt.observed_at must be an RFC 3339 UTC timestamp")
+    if "budget" in doc:
+        errors.extend(_validate_budget(doc["budget"]))
+    if "figures" in doc:
+        figures = doc["figures"]
+        if not isinstance(figures, dict):
+            errors.append("current_attempt.figures must be an object")
+        else:
+            for name, figure in figures.items():
+                errors.extend(
+                    validate_figure(figure, f"current_attempt.figures.{name}")
+                )
+    return errors
+
+
+def _validate_attempt_summary(doc: object, prefix: str) -> list[str]:
+    if doc is None:
+        return []
+    if not isinstance(doc, dict):
+        return [f"{prefix} must be an object or null"]
+    errors: list[str] = []
+    for key in (
+        "attempt_id",
+        "issue",
+        "started_at",
+        "finished_at",
+        "lifecycle_state",
+        "outcome",
+        "delivery",
+        "attention_required",
+        "sealed",
+        "sealed_at",
+    ):
+        if key not in doc:
+            errors.append(f"{prefix} is missing required property: {key!r}")
+    if "attempt_id" in doc and (
+        not isinstance(doc["attempt_id"], str) or not doc["attempt_id"]
+    ):
+        errors.append(f"{prefix}.attempt_id must be a non-empty string")
+    if "issue" in doc:
+        issue = doc["issue"]
+        if not isinstance(issue, dict):
+            errors.append(f"{prefix}.issue must be an object")
+        else:
+            if "number" not in issue:
+                errors.append(f"{prefix}.issue is missing required property: 'number'")
+            elif type(issue["number"]) is not int or issue["number"] < 1:
+                errors.append(f"{prefix}.issue.number must be an integer >= 1")
+            if "title" not in issue:
+                errors.append(f"{prefix}.issue is missing required property: 'title'")
+            elif issue["title"] is not None and not isinstance(issue["title"], str):
+                errors.append(f"{prefix}.issue.title must be a string or null")
+    if "started_at" in doc and not _validate_timestamp(doc["started_at"]):
+        errors.append(f"{prefix}.started_at must be an RFC 3339 UTC timestamp")
+    if "finished_at" in doc:
+        finished = doc["finished_at"]
+        if finished is not None and not _validate_timestamp(finished):
+            errors.append(
+                f"{prefix}.finished_at must be an RFC 3339 UTC timestamp or null"
+            )
+    if "lifecycle_state" in doc and (
+        not isinstance(doc["lifecycle_state"], str) or not doc["lifecycle_state"]
+    ):
+        errors.append(f"{prefix}.lifecycle_state must be a non-empty string")
+    if "outcome" in doc:
+        outcome = doc["outcome"]
+        if outcome is not None:
+            if not isinstance(outcome, dict):
+                errors.append(f"{prefix}.outcome must be an object or null")
+            else:
+                for key in ("native", "reason", "label"):
+                    if key not in outcome:
+                        errors.append(
+                            f"{prefix}.outcome is missing required property: {key!r}"
+                        )
+                if "native" in outcome and (
+                    not isinstance(outcome["native"], str) or not outcome["native"]
+                ):
+                    errors.append(f"{prefix}.outcome.native must be a non-empty string")
+                if "reason" in outcome and outcome["reason"] is not None:
+                    if not isinstance(outcome["reason"], str):
+                        errors.append(f"{prefix}.outcome.reason must be a string or null")
+                if "label" in outcome and (
+                    not isinstance(outcome["label"], str) or not outcome["label"]
+                ):
+                    errors.append(f"{prefix}.outcome.label must be a non-empty string")
+    if "delivery" in doc:
+        delivery = doc["delivery"]
+        if delivery is not None and not isinstance(delivery, dict):
+            errors.append(f"{prefix}.delivery must be an object or null")
+    if "attention_required" in doc and type(doc["attention_required"]) is not bool:
+        errors.append(f"{prefix}.attention_required must be a boolean")
+    if "sealed" in doc and type(doc["sealed"]) is not bool:
+        errors.append(f"{prefix}.sealed must be a boolean")
+    if "sealed_at" in doc:
+        sealed_at = doc["sealed_at"]
+        if sealed_at is not None and not _validate_timestamp(sealed_at):
+            errors.append(
+                f"{prefix}.sealed_at must be an RFC 3339 UTC timestamp or null"
+            )
+    return errors
+
+
+def _validate_command_record(doc: object, prefix: str) -> list[str]:
+    if not isinstance(doc, dict):
+        return [f"{prefix} must be an object"]
+    errors: list[str] = []
+    for key in (
+        "request_id",
+        "sequence",
+        "kind",
+        "arguments",
+        "repository",
+        "acknowledgement",
+        "detail",
+        "created_at",
+        "updated_at",
+    ):
+        if key not in doc:
+            errors.append(f"{prefix} is missing required property: {key!r}")
+    if "request_id" in doc and not _matches(REQUEST_ID_PATTERN, doc["request_id"]):
+        errors.append(f"{prefix}.request_id must match the request ID pattern")
+    if "sequence" in doc and (
+        type(doc["sequence"]) is not int or doc["sequence"] < 0
+    ):
+        errors.append(f"{prefix}.sequence must be an integer >= 0")
+    if "kind" in doc and doc["kind"] not in COMMAND_KINDS:
+        errors.append(f"{prefix}.kind {doc['kind']!r} is not a known 1.0 kind")
+    if "arguments" in doc and not isinstance(doc["arguments"], dict):
+        errors.append(f"{prefix}.arguments must be an object")
+    if "repository" in doc and not _matches(REPOSITORY_PATTERN, doc["repository"]):
+        errors.append(f"{prefix}.repository must be written owner/name")
+    if "acknowledgement" in doc and doc["acknowledgement"] not in ACKNOWLEDGEMENTS:
+        errors.append(
+            f"{prefix}.acknowledgement {doc['acknowledgement']!r} is not known"
+        )
+    if "detail" in doc and not isinstance(doc["detail"], str):
+        errors.append(f"{prefix}.detail must be a string")
+    if "created_at" in doc and not _validate_timestamp(doc["created_at"]):
+        errors.append(f"{prefix}.created_at must be an RFC 3339 UTC timestamp")
+    if "updated_at" in doc and not _validate_timestamp(doc["updated_at"]):
+        errors.append(f"{prefix}.updated_at must be an RFC 3339 UTC timestamp")
+    return errors
+
+
+def _validate_contract_event(doc: object, prefix: str) -> list[str]:
+    if not isinstance(doc, dict):
+        return [f"{prefix} must be an object"]
+    errors: list[str] = []
+    for key in ("at", "level", "event", "text"):
+        if key not in doc:
+            errors.append(f"{prefix} is missing required property: {key!r}")
+    if "at" in doc and not _validate_timestamp(doc["at"]):
+        errors.append(f"{prefix}.at must be an RFC 3339 UTC timestamp")
+    if "level" in doc and doc["level"] not in EVENT_LEVELS:
+        errors.append(f"{prefix}.level {doc['level']!r} is not a known 1.0 level")
+    if "event" in doc and (
+        not isinstance(doc["event"], str) or not doc["event"]
+    ):
+        errors.append(f"{prefix}.event must be a non-empty string")
+    if "text" in doc:
+        text = doc["text"]
+        if not isinstance(text, str):
+            errors.append(f"{prefix}.text must be a string")
+        elif len(text) > 300:
+            errors.append(f"{prefix}.text must be at most 300 characters")
+    return errors
+
+
+def validate_status(doc: object) -> list[str]:
+    """Check a Status Snapshot; the empty list means valid (spec section 7.2).
+
+    Unknown fields are ignored so a minor can add them. Enum values,
+    the Figure value/basis rule and ``process_started_at`` nullability are
+    enforced exactly as in ``status.schema.json``.
+    """
+    if not isinstance(doc, dict):
+        return ["status must be an object"]
+    errors: list[str] = []
+    for key in (
+        "generated_at",
+        "identity",
+        "instance",
+        "intake",
+        "current_attempt",
+        "last_finished",
+        "recent_commands",
+        "recent_events",
+        "truncated",
+    ):
+        if key not in doc:
+            errors.append(f"status is missing required property: {key!r}")
+    if "generated_at" in doc and not _validate_timestamp(doc["generated_at"]):
+        errors.append("status.generated_at must be an RFC 3339 UTC timestamp")
+    if "identity" in doc:
+        identity_errors = validate_identity(doc["identity"])
+        errors.extend(identity_errors)
+    if "instance" in doc:
+        instance = doc["instance"]
+        if not isinstance(instance, dict):
+            errors.append("status.instance must be an object")
+        else:
+            for key in ("state", "startup_check", "last_halt", "observed_at"):
+                if key not in instance:
+                    errors.append(
+                        f"status.instance is missing required property: {key!r}"
+                    )
+            state = instance.get("state")
+            if "state" in instance and state not in STATUS_STATES:
+                errors.append(f"status.instance.state {state!r} is not known")
+            if "startup_check" in instance:
+                check = instance["startup_check"]
+                if state == "starting":
+                    if not isinstance(check, str) or not check:
+                        errors.append(
+                            "status.instance.startup_check must be a non-empty "
+                            "string while starting"
+                        )
+                elif check is not None and not isinstance(check, str):
+                    errors.append(
+                        "status.instance.startup_check must be a string or null"
+                    )
+            if "last_halt" in instance:
+                errors.extend(_validate_halt(instance["last_halt"], "status.instance.last_halt"))
+            if "observed_at" in instance and not _validate_timestamp(
+                instance["observed_at"]
+            ):
+                errors.append(
+                    "status.instance.observed_at must be an RFC 3339 UTC timestamp"
+                )
+    if "intake" in doc:
+        intake = doc["intake"]
+        if not isinstance(intake, dict):
+            errors.append("status.intake must be an object")
+        else:
+            for key in ("state", "pending_stop", "stop_plan", "priority", "observed_at"):
+                if key not in intake:
+                    errors.append(
+                        f"status.intake is missing required property: {key!r}"
+                    )
+            if "state" in intake and intake["state"] not in INTAKE_STATES:
+                errors.append(f"status.intake.state {intake['state']!r} is not known")
+            if "pending_stop" in intake:
+                pending = intake["pending_stop"]
+                if pending is not None:
+                    if not isinstance(pending, dict):
+                        errors.append("status.intake.pending_stop must be an object or null")
+                    else:
+                        for key in ("request_id", "sequence"):
+                            if key not in pending:
+                                errors.append(
+                                    "status.intake.pending_stop is missing required "
+                                    f"property: {key!r}"
+                                )
+                        if "request_id" in pending and not _matches(
+                            REQUEST_ID_PATTERN, pending["request_id"]
+                        ):
+                            errors.append(
+                                "status.intake.pending_stop.request_id must match "
+                                "the request ID pattern"
+                            )
+                        if "sequence" in pending and (
+                            type(pending["sequence"]) is not int
+                            or pending["sequence"] < 0
+                        ):
+                            errors.append(
+                                "status.intake.pending_stop.sequence must be "
+                                "an integer >= 0"
+                            )
+            if "stop_plan" in intake:
+                plan = intake["stop_plan"]
+                if plan is not None:
+                    if not isinstance(plan, dict):
+                        errors.append("status.intake.stop_plan must be an object or null")
+                    else:
+                        for key in ("request_id", "remaining", "counted"):
+                            if key not in plan:
+                                errors.append(
+                                    "status.intake.stop_plan is missing required "
+                                    f"property: {key!r}"
+                                )
+                        if "request_id" in plan and not _matches(
+                            REQUEST_ID_PATTERN, plan["request_id"]
+                        ):
+                            errors.append(
+                                "status.intake.stop_plan.request_id must match "
+                                "the request ID pattern"
+                            )
+                        for key in ("remaining", "counted"):
+                            if key in plan and (
+                                type(plan[key]) is not int or plan[key] < 0
+                            ):
+                                errors.append(
+                                    f"status.intake.stop_plan.{key} must be an integer >= 0"
+                                )
+            if "priority" in intake:
+                priority = intake["priority"]
+                if priority is not None:
+                    if not isinstance(priority, dict):
+                        errors.append("status.intake.priority must be an object or null")
+                    else:
+                        for key in ("request_id", "issue"):
+                            if key not in priority:
+                                errors.append(
+                                    "status.intake.priority is missing required "
+                                    f"property: {key!r}"
+                                )
+                        if "request_id" in priority and not _matches(
+                            REQUEST_ID_PATTERN, priority["request_id"]
+                        ):
+                            errors.append(
+                                "status.intake.priority.request_id must match "
+                                "the request ID pattern"
+                            )
+                        if "issue" in priority and (
+                            type(priority["issue"]) is not int or priority["issue"] < 1
+                        ):
+                            errors.append(
+                                "status.intake.priority.issue must be an integer >= 1"
+                            )
+            if "observed_at" in intake and not _validate_timestamp(intake["observed_at"]):
+                errors.append(
+                    "status.intake.observed_at must be an RFC 3339 UTC timestamp"
+                )
+    if "current_attempt" in doc:
+        errors.extend(_validate_current_attempt(doc["current_attempt"]))
+    if "last_finished" in doc:
+        errors.extend(_validate_attempt_summary(doc["last_finished"], "status.last_finished"))
+    if "recent_commands" in doc:
+        commands = doc["recent_commands"]
+        if not isinstance(commands, list):
+            errors.append("status.recent_commands must be an array")
+        elif len(commands) > 20:
+            errors.append("status.recent_commands must contain at most 20 entries")
+        else:
+            for index, entry in enumerate(commands):
+                errors.extend(
+                    _validate_command_record(entry, f"status.recent_commands[{index}]")
+                )
+    if "recent_events" in doc:
+        events = doc["recent_events"]
+        if not isinstance(events, list):
+            errors.append("status.recent_events must be an array")
+        elif len(events) > 50:
+            errors.append("status.recent_events must contain at most 50 entries")
+        else:
+            for index, entry in enumerate(events):
+                errors.extend(
+                    _validate_contract_event(entry, f"status.recent_events[{index}]")
+                )
+    if "truncated" in doc and type(doc["truncated"]) is not bool:
+        errors.append("status.truncated must be a boolean")
+    return errors
 
 
 def validate_fixture(doc: object) -> list[str]:

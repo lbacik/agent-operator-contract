@@ -332,6 +332,8 @@ def test_resource_loaders_expose_package_data() -> None:
         "harness-reply",
         "client-envelope",
         "ls",
+        "status",
+        "figure",
     }
     for name in documents.SCHEMA_NAMES:
         schema = documents.load_schema(name)
