@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "--offline",
+    "status"
+  ],
+  "exit_code": 0,
+  "stdout": "{\"contract\":\"1.0\",\"ok\":true,\"result\":{\"current_attempt\":null,\"generated_at\":\"2026-11-06T10:00:00Z\",\"identity\":{\"agent_version\":\"0.9.0\",\"backend\":\"coding-agent\",\"capabilities\":[\"next-issue\",\"stop-after\"],\"contract\":{\"major\":1,\"minor\":0},\"mode\":\"offline\",\"process_started_at\":null,\"repository\":\"example-owner/example-repo\"},\"instance\":{\"last_halt\":{\"at\":\"2026-11-06T09:58:12Z\",\"detail\":\"GitHub token rejected (401)\",\"reason\":\"credential-failure\"},\"observed_at\":\"2026-11-06T10:00:00Z\",\"startup_check\":null,\"state\":\"stopped\"},\"intake\":{\"observed_at\":\"2026-11-06T10:00:00Z\",\"pending_stop\":null,\"priority\":null,\"state\":\"open\",\"stop_plan\":null},\"last_finished\":{\"attempt_id\":\"#41/1\",\"attention_required\":false,\"delivery\":{\"pull_request\":{\"number\":77,\"url\":\"https://github.com/example-owner/example-repo/pull/77\"}},\"finished_at\":\"2026-11-06T08:44:52Z\",\"issue\":{\"number\":41,\"title\":\"Fix pagination\"},\"lifecycle_state\":\"finished\",\"outcome\":{\"label\":\"Delivered\",\"native\":\"delivered\",\"reason\":null},\"sealed\":true,\"sealed_at\":\"2026-11-06T08:45:01Z\",\"started_at\":\"2026-11-06T08:01:10Z\"},\"recent_commands\":[],\"recent_events\":[],\"truncated\":false}}\n",
+  "stderr": ""
+}

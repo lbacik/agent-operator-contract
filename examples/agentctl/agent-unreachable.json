@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "stop",
+    "--request-id",
+    "req-1a2b3c4d5e6f",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 6,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"agent_unreachable\",\"message\":\"cannot reach the agent process; the outcome is unknown, retry with the same request ID\",\"request_id\":\"req-1a2b3c4d5e6f\",\"retryable\":true},\"ok\":false}\n",
+  "stderr": ""
+}

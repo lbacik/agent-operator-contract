@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "stop",
+    "--after"
+  ],
+  "exit_code": 2,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"usage\",\"message\":\"argument --after: expected one argument\",\"retryable\":false},\"ok\":false}\n",
+  "stderr": ""
+}

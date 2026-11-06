@@ -1,0 +1,10 @@
+{
+  "argv": [
+    "--contract",
+    "2",
+    "status"
+  ],
+  "exit_code": 4,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"contract_mismatch\",\"details\":{\"supported\":[1]},\"message\":\"this instance speaks contract major 1\",\"retryable\":false},\"ok\":false}\n",
+  "stderr": ""
+}
