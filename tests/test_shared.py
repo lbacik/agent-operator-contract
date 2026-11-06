@@ -78,6 +78,19 @@ def test_error_document_marks_retryable_from_the_table() -> None:
     assert shared.error_document("agent_unreachable", "lost")["error"]["retryable"] is True
 
 
+def test_required_capability_maps_operations_to_the_spec_table() -> None:
+    assert shared.required_capability("stop", {}) is None
+    assert shared.required_capability("stop", {"after": "3"}) == "stop-after"
+    assert shared.required_capability("resume", {}) is None
+    assert shared.required_capability("next-issue", {}) == "next-issue"
+    assert shared.required_capability("handoff", {}) == "operator-handoff"
+    assert shared.required_capability("recovery-retry", {}) == "recovery-retry"
+    assert shared.required_capability("recovery-release", {}) == "recovery-release"
+    assert shared.required_capability("errors-reset", {}) == "errors-reset"
+    assert shared.required_capability("identity", {}) is None
+    assert shared.required_capability("command", {}) is None
+
+
 @pytest.mark.parametrize(
     ("expected", "actual", "matches"),
     [

@@ -24,6 +24,16 @@
     "retryable": false,
     "meaning": "The producer's stdout was not a valid envelope or contradicted its exit code."
   },
+  "client.contract_mismatch": {
+    "exit_code": 4,
+    "retryable": false,
+    "meaning": "The instance's identity reports a contract major the client does not speak; the mutation was not sent."
+  },
+  "client.unsupported_capability": {
+    "exit_code": 3,
+    "retryable": false,
+    "meaning": "The instance's identity does not advertise the capability the mutation needs; the mutation was not sent."
+  },
   "client.usage": {
     "exit_code": 2,
     "retryable": false,

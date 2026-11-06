@@ -189,7 +189,7 @@ def parse_argv(
         operation, arguments, request_id, expect_repo = _parse_tokens(tokens)
     except _Usage as exc:
         return ArgvFailure("usage", str(exc), {}, _echo_request_id(tokens))
-    capability = _required_capability(operation, arguments)
+    capability = required_capability(operation, arguments)
     if offline and operation in MUTATIONS:
         return ArgvFailure(
             "unsupported",
@@ -414,7 +414,12 @@ def _parse_errors(tokens: list[str]) -> tuple[str, dict[str, Any], str | None, s
     )
 
 
-def _required_capability(operation: str, arguments: Mapping[str, Any]) -> str | None:
+def required_capability(operation: str, arguments: Mapping[str, Any]) -> str | None:
+    """Return the optional capability an operation needs, or None for the core.
+
+    ``stop`` needs ``stop-after`` only with ``--after``; every other operation
+    maps to its fixed capability or to None when it is mandatory core.
+    """
     if operation == "stop" and "after" in arguments:
         return "stop-after"
     return {

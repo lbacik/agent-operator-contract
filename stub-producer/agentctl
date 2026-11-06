@@ -1,19 +1,29 @@
 #!/usr/bin/env python3
 """Stub producer ``agentctl``: a minimal, test-only engine (never published).
 
-Serves ``identity`` and ``status`` (an idle instance) and the grammar failures
-through the shared part of the library. Any other well-formed call answers
-``internal`` with ``details.stored: false``: the stub implements the read-only
-core only, and later issues replace this with mutations and attempts.
+Serves ``identity``, ``status`` and ``command`` plus the core mutations
+``stop`` and ``resume`` (and a minimal ``stop --after`` plan) with durable
+Intake and a request ID store on its state volume. Grammar, capability and
+value failures come from the shared part of the library; the stub then applies
+the rest of the section 4.1 order itself: ``--expect-repo``,
+``payload_mismatch`` or replay, then state (``rejected``) and commit.
 """
 
 from __future__ import annotations
 
 import datetime
+import json
 import os
 import sys
+from typing import Any
 
 from agent_operator_contract import shared
+
+STATE_FILENAME = "agent-operator-contract.json"
+"""State file name inside the state directory (durable Intake, command store)."""
+
+MAX_RECENT_COMMANDS = 20
+MAX_RECENT_EVENTS = 50
 
 
 def _utc_now() -> str:
@@ -32,13 +42,92 @@ def _advertised_capabilities() -> set[str]:
     return {piece.strip() for piece in raw.split(",") if piece.strip()}
 
 
+def _repository() -> str:
+    return os.environ.get("CONTRACT_REPOSITORY", "example-owner/example-repo")
+
+
+def _state_path() -> str | None:
+    """Return the state file path, or None when there is no state directory.
+
+    Without a directory (for example a direct unit-test invocation with no
+    volume) the stub still answers every call, but each call starts from a
+    fresh volume: Intake open, no commands.
+    """
+    directory = os.environ.get("CONTRACT_STATE_DIR", "/data")
+    if not os.path.isdir(directory):
+        return None
+    return os.path.join(directory, STATE_FILENAME)
+
+
+def _fresh_state() -> dict[str, Any]:
+    return {
+        "intake": "open",
+        "pending_stop": None,
+        "stop_plan": None,
+        "next_sequence": 1,
+        "commands": {},
+        "recent_events": [],
+    }
+
+
+def _load_state() -> tuple[dict[str, Any], str | None]:
+    path = _state_path()
+    if path is None:
+        return _fresh_state(), None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (FileNotFoundError, OSError, ValueError):
+        return _fresh_state(), path
+    if not isinstance(doc, dict):
+        return _fresh_state(), path
+    state = _fresh_state()
+    if doc.get("intake") in ("open", "closed"):
+        state["intake"] = doc["intake"]
+    pending = doc.get("pending_stop")
+    if isinstance(pending, dict) or pending is None:
+        state["pending_stop"] = pending
+    plan = doc.get("stop_plan")
+    if isinstance(plan, dict) or plan is None:
+        state["stop_plan"] = plan
+    if type(doc.get("next_sequence")) is int and doc["next_sequence"] >= 1:
+        state["next_sequence"] = doc["next_sequence"]
+    if isinstance(doc.get("commands"), dict):
+        state["commands"] = doc["commands"]
+    if isinstance(doc.get("recent_events"), list):
+        state["recent_events"] = doc["recent_events"][-MAX_RECENT_EVENTS:]
+    return state, path
+
+
+def _save_state(state: dict[str, Any], path: str | None) -> None:
+    if path is None:
+        return
+    tmp_path = path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(state, handle, sort_keys=True)
+        os.replace(tmp_path, path)
+    except OSError:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _append_event(state: dict[str, Any], event: dict[str, Any]) -> None:
+    events = state.setdefault("recent_events", [])
+    assert isinstance(events, list)
+    events.append(event)
+    del events[: max(0, len(events) - MAX_RECENT_EVENTS)]
+
+
 def _identity(offline: bool) -> dict[str, object]:
     capabilities = sorted(_advertised_capabilities())
     return {
         "backend": os.environ.get("CONTRACT_BACKEND", "stub"),
         "agent_version": os.environ.get("CONTRACT_AGENT_VERSION", "0.0.0"),
         "contract": {"major": 1, "minor": 0},
-        "repository": os.environ.get("CONTRACT_REPOSITORY", "example-owner/example-repo"),
+        "repository": _repository(),
         "mode": "offline" if offline else "online",
         "process_started_at": None
         if offline
@@ -47,7 +136,20 @@ def _identity(offline: bool) -> dict[str, object]:
     }
 
 
-def _status(offline: bool) -> dict[str, object]:
+def _recent_commands(state: dict[str, Any]) -> list[dict[str, Any]]:
+    commands = state.get("commands")
+    if not isinstance(commands, dict):
+        return []
+    records = [
+        entry["record"]
+        for entry in commands.values()
+        if isinstance(entry, dict) and isinstance(entry.get("record"), dict)
+    ]
+    records.sort(key=lambda record: record.get("sequence", 0))
+    return records[-MAX_RECENT_COMMANDS:]
+
+
+def _status(offline: bool, state: dict[str, Any]) -> dict[str, object]:
     now = _utc_now()
     identity = _identity(offline)
     if offline:
@@ -62,7 +164,7 @@ def _status(offline: bool) -> dict[str, object]:
             "last_halt": None,
             "observed_at": now,
             "startup_check": None,
-            "state": "idle",
+            "state": "idle" if state.get("intake") == "open" else "paused",
         }
     return {
         "current_attempt": None,
@@ -71,16 +173,232 @@ def _status(offline: bool) -> dict[str, object]:
         "instance": instance,
         "intake": {
             "observed_at": now,
-            "pending_stop": None,
+            "pending_stop": state.get("pending_stop"),
             "priority": None,
-            "state": "open",
-            "stop_plan": None,
+            "state": state.get("intake", "open"),
+            "stop_plan": state.get("stop_plan"),
         },
         "last_finished": None,
-        "recent_commands": [],
-        "recent_events": [],
+        "recent_commands": _recent_commands(state),
+        "recent_events": state.get("recent_events", []),
         "truncated": False,
     }
+
+
+def _mutation_payload(operation: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+    """Return the canonical (kind, arguments) payload an operation commits."""
+    if operation == "stop" and "after" in arguments:
+        return "stop_after", {"after": int(arguments["after"], 10)}
+    return operation, {}
+
+
+def _commit(
+    state: dict[str, Any],
+    request_id: str,
+    kind: str,
+    arguments: dict[str, Any],
+    acknowledgement: str,
+    detail: str,
+) -> dict[str, Any]:
+    sequence = state.get("next_sequence", 1)
+    now = _utc_now()
+    record = {
+        "request_id": request_id,
+        "sequence": sequence,
+        "kind": kind,
+        "arguments": arguments,
+        "repository": _repository(),
+        "acknowledgement": acknowledgement,
+        "detail": detail,
+        "created_at": now,
+        "updated_at": now,
+    }
+    commands = state.setdefault("commands", {})
+    assert isinstance(commands, dict)
+    commands[request_id] = {"kind": kind, "arguments": arguments, "record": record}
+    state["next_sequence"] = sequence + 1
+    _append_event(
+        state,
+        {
+            "at": now,
+            "level": "info",
+            "event": "command_accepted",
+            "request_id": request_id,
+            "kind": kind,
+            "acknowledgement": acknowledgement,
+            "text": f"command {request_id} {acknowledgement}",
+        },
+    )
+    if acknowledgement != "accepted":
+        _append_event(
+            state,
+            {
+                "at": now,
+                "level": "info",
+                "event": "command_resolved",
+                "request_id": request_id,
+                "acknowledgement": acknowledgement,
+                "text": f"command {request_id} {acknowledgement}",
+            },
+        )
+    return record
+
+
+def _supersede(state: dict[str, Any], ref: dict[str, Any] | None) -> None:
+    """Mark the pending command or plan ``ref`` superseded (spec section 8.2)."""
+    if not isinstance(ref, dict):
+        return
+    now = _utc_now()
+    commands = state.get("commands")
+    request_id = ref.get("request_id")
+    if isinstance(commands, dict) and isinstance(request_id, str):
+        entry = commands.get(request_id)
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("record"), dict)
+            and entry["record"].get("acknowledgement") == "accepted"
+        ):
+            entry["record"]["acknowledgement"] = "superseded"
+            entry["record"]["updated_at"] = now
+    _append_event(
+        state,
+        {
+            "at": now,
+            "level": "info",
+            "event": "command_resolved",
+            "request_id": request_id,
+            "acknowledgement": "superseded",
+            "text": f"command {request_id} superseded",
+        },
+    )
+
+
+def _do_stop(state: dict[str, Any], request_id: str, arguments: dict[str, Any]) -> int:
+    kind, payload = _mutation_payload("stop", arguments)
+    if state.get("intake") == "closed":
+        text, exit_code = shared.render_error(
+            "rejected",
+            "intake is already closed",
+            request_id=request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    if kind == "stop_after":
+        _supersede(state, state.get("pending_stop"))
+        _supersede(state, state.get("stop_plan"))
+        state["pending_stop"] = None
+        remaining = payload["after"]
+        record = _commit(
+            state,
+            request_id,
+            kind,
+            payload,
+            "accepted",
+            f"close intake after {remaining} more finalized attempts",
+        )
+        state["stop_plan"] = {
+            "request_id": request_id,
+            "remaining": remaining,
+            "counted": 0,
+        }
+    else:
+        _supersede(state, state.get("pending_stop"))
+        _supersede(state, state.get("stop_plan"))
+        state["pending_stop"] = None
+        state["stop_plan"] = None
+        state["intake"] = "closed"
+        record = _commit(state, request_id, kind, payload, "completed", "intake closed by operator")
+    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+    return 0
+
+
+def _do_resume(state: dict[str, Any], request_id: str) -> int:
+    if (
+        state.get("intake") == "open"
+        and state.get("pending_stop") is None
+        and state.get("stop_plan") is None
+    ):
+        text, exit_code = shared.render_error(
+            "rejected",
+            "intake is already open",
+            request_id=request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    _supersede(state, state.get("pending_stop"))
+    _supersede(state, state.get("stop_plan"))
+    state["pending_stop"] = None
+    state["stop_plan"] = None
+    state["intake"] = "open"
+    record = _commit(state, request_id, "resume", {}, "completed", "intake reopened by operator")
+    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+    return 0
+
+
+def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedCall) -> int:
+    assert parsed.request_id is not None and parsed.expect_repo is not None
+    repository = _repository()
+    if not shared.repositories_match(parsed.expect_repo, repository):
+        text, exit_code = shared.render_error(
+            "repository_mismatch",
+            f"expected {parsed.expect_repo}, this instance targets {repository}",
+            details={"repository": repository},
+            request_id=parsed.request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    kind, payload = _mutation_payload(parsed.operation, parsed.arguments)
+    commands = state.get("commands")
+    assert isinstance(commands, dict)
+    stored = commands.get(parsed.request_id)
+    if isinstance(stored, dict):
+        if stored.get("kind") == kind and stored.get("arguments") == payload:
+            record = stored.get("record")
+            assert isinstance(record, dict)
+            sys.stdout.write(
+                shared.render_success({"command": record, "replayed": True})
+            )
+            return 0
+        text, exit_code = shared.render_error(
+            "payload_mismatch",
+            f"request {parsed.request_id} was already used for a different command",
+            request_id=parsed.request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    if parsed.operation == "stop":
+        exit_code = _do_stop(state, parsed.request_id, parsed.arguments)
+    elif parsed.operation == "resume":
+        exit_code = _do_resume(state, parsed.request_id)
+    else:  # pragma: no cover - guarded by the advertised capabilities in practice.
+        text, exit_code = shared.render_error(
+            "internal",
+            f"stub producer implements stop and resume only (got {parsed.operation})",
+            details={"stored": False},
+            request_id=parsed.request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    if exit_code == 0:
+        _save_state(state, path)
+    return exit_code
+
+
+def _do_command(state: dict[str, Any], request_id: str) -> int:
+    commands = state.get("commands")
+    record = None
+    if isinstance(commands, dict):
+        stored = commands.get(request_id)
+        if isinstance(stored, dict) and isinstance(stored.get("record"), dict):
+            record = stored["record"]
+    if record is None:
+        text, exit_code = shared.render_error(
+            "not_found", f"no command is recorded for {request_id}"
+        )
+        sys.stdout.write(text)
+        return exit_code
+    sys.stdout.write(shared.render_success({"command": record}))
+    return 0
 
 
 def main(argv: list[str]) -> int:
@@ -95,12 +413,21 @@ def main(argv: list[str]) -> int:
     if parsed.operation == "identity":
         sys.stdout.write(shared.render_success(_identity(parsed.offline)))
         return 0
+    state, path = _load_state()
     if parsed.operation == "status":
-        sys.stdout.write(shared.render_success(_status(parsed.offline)))
+        sys.stdout.write(shared.render_success(_status(parsed.offline, state)))
         return 0
+    if parsed.operation == "command":
+        request_id = parsed.arguments.get("request_id")
+        assert isinstance(request_id, str)
+        return _do_command(state, request_id)
+    if parsed.operation in ("stop", "resume"):
+        assert parsed.request_id is not None and parsed.expect_repo is not None
+        return _do_mutation(state, path, parsed)
     text, exit_code = shared.render_error(
         "internal",
-        f"stub producer implements identity and status only (got {parsed.operation})",
+        f"stub producer implements identity, status, command, stop and resume only "
+        f"(got {parsed.operation})",
         details={"stored": False},
         request_id=parsed.request_id,
     )

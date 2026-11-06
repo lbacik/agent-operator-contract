@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "resume",
+    "--request-id",
+    "req-7c8d9e0f1a2b",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 1,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"rejected\",\"message\":\"intake is already open\",\"request_id\":\"req-7c8d9e0f1a2b\",\"retryable\":false},\"ok\":false}\n",
+  "stderr": ""
+}

@@ -31,4 +31,4 @@ or through the helpers in `agent_operator_contract.documents`
 
 `documents.classify_fixture` implements this reading; tests require it to agree with `index.json` on every fixture.
 
-These examples illustrate [the specification](../../../../docs/spec.md); they are not yet the full consumer suite. Adoption step 1 extends them to every exit code and `error.code`.
+These examples illustrate [the specification](../../../../docs/spec.md) and seed the consumer suite, covering every exit code and `error.code` family the contract defines.

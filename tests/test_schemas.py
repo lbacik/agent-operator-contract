@@ -32,6 +32,11 @@ ENVELOPE_VALIDATOR = Draft202012Validator(ENVELOPE_SCHEMA)
 IDENTITY_VALIDATOR = Draft202012Validator(IDENTITY_SCHEMA)
 STATUS_VALIDATOR = Draft202012Validator(STATUS_SCHEMA)
 FIGURE_VALIDATOR = Draft202012Validator(FIGURE_SCHEMA)
+
+COMMAND_SCHEMA: dict[str, Any] = documents.load_schema("command")
+MUTATION_RESULT_SCHEMA: dict[str, Any] = documents.load_schema("mutation-result")
+COMMAND_VALIDATOR = Draft202012Validator(COMMAND_SCHEMA)
+MUTATION_RESULT_VALIDATOR = Draft202012Validator(MUTATION_RESULT_SCHEMA)
 INSTANCE_NAME_VALIDATOR = Draft202012Validator(INSTANCE_NAME_SCHEMA)
 HARNESS_REQUEST_VALIDATOR = Draft202012Validator(HARNESS_REQUEST_SCHEMA)
 HARNESS_REPLY_VALIDATOR = Draft202012Validator(HARNESS_REPLY_SCHEMA)
@@ -347,6 +352,91 @@ def test_ls_schema_patterns_match_library() -> None:
 
     assert item["name"]["pattern"] == documents.INSTANCE_NAME_PATTERN
     assert item["contract"]["pattern"] == documents.CONTRACT_MAJOR_PATTERN
+
+
+def _mutation_results() -> list[tuple[str, Any]]:
+    pairs = []
+    for name in FIXTURE_NAMES:
+        doc = json.loads(documents.load_fixture(name)["stdout"])
+        if doc.get("ok") is True and isinstance(doc.get("result"), dict):
+            result = doc["result"]
+            if "command" in result and "replayed" in result:
+                pairs.append((name, result))
+    return pairs
+
+
+def _command_results() -> list[tuple[str, Any]]:
+    pairs = []
+    for name in FIXTURE_NAMES:
+        doc = json.loads(documents.load_fixture(name)["stdout"])
+        if doc.get("ok") is True and isinstance(doc.get("result"), dict):
+            result = doc["result"]
+            if "command" in result and "replayed" not in result:
+                pairs.append((name, result))
+    return pairs
+
+
+def test_mutation_results_validate_against_mutation_result_schema() -> None:
+    assert _mutation_results()
+    for name, result in _mutation_results():
+        assert MUTATION_RESULT_VALIDATOR.is_valid(result), name
+
+
+def test_mutation_results_validate_against_library() -> None:
+    for name, result in _mutation_results():
+        assert documents.validate_mutation_result(result) == [], name
+
+
+def test_library_agrees_with_schema_on_mutation_results() -> None:
+    for name, result in _mutation_results():
+        assert (documents.validate_mutation_result(result) == []) == (
+            MUTATION_RESULT_VALIDATOR.is_valid(result)
+        ), name
+
+
+def test_command_reads_validate_against_command_schema() -> None:
+    assert _command_results()
+    for name, result in _command_results():
+        assert COMMAND_VALIDATOR.is_valid(result), name
+
+
+def test_command_reads_validate_against_library() -> None:
+    for name, result in _command_results():
+        assert documents.validate_command_result(result) == [], name
+
+
+def test_library_agrees_with_schema_on_command_reads() -> None:
+    for name, result in _command_results():
+        assert (documents.validate_command_result(result) == []) == (
+            COMMAND_VALIDATOR.is_valid(result)
+        ), name
+
+
+def test_command_schema_enums_and_patterns_match_library() -> None:
+    record = COMMAND_SCHEMA["$defs"]["command_record"]["properties"]
+    assert record["kind"]["enum"] == list(documents.COMMAND_KINDS)
+    assert record["acknowledgement"]["enum"] == list(documents.ACKNOWLEDGEMENTS)
+    assert record["request_id"]["pattern"] == documents.REQUEST_ID_PATTERN
+    assert record["repository"]["pattern"] == documents.REPOSITORY_PATTERN
+    ref = COMMAND_SCHEMA["$defs"]["command_ref"]["properties"]
+    assert ref["request_id"]["pattern"] == documents.REQUEST_ID_PATTERN
+
+    mutation_record = MUTATION_RESULT_SCHEMA["$defs"]["command_record"]["properties"]
+    assert mutation_record["kind"]["enum"] == list(documents.COMMAND_KINDS)
+    assert mutation_record["acknowledgement"]["enum"] == list(documents.ACKNOWLEDGEMENTS)
+    assert mutation_record["request_id"]["pattern"] == documents.REQUEST_ID_PATTERN
+
+    status_record = STATUS_SCHEMA["$defs"]["command_record"]["properties"]
+    assert status_record["kind"]["enum"] == list(documents.COMMAND_KINDS)
+    assert status_record["acknowledgement"]["enum"] == list(documents.ACKNOWLEDGEMENTS)
+    assert status_record["request_id"]["pattern"] == documents.REQUEST_ID_PATTERN
+
+
+def test_mutation_fixture_signals_match_mutation_schema() -> None:
+    replayed = [result["replayed"] for _, result in _mutation_results() if "replayed" in result]
+
+    assert False in replayed
+    assert True in replayed
 
 
 def _status_snapshots() -> list[tuple[str, Any]]:

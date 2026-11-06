@@ -19,6 +19,10 @@
       "classification": "success",
       "note": "Exit 0, ok:true with a sealed attempt and manifest."
     },
+    "command-found": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with the stored CommandRecord for a known request ID."
+    },
     "command-not-found": {
       "classification": "not_found",
       "note": "Exit 5, not_found: unknown request ID."
@@ -31,6 +35,18 @@
       "classification": "success",
       "note": "Exit 0, ok:true with the Identity result."
     },
+    "internal": {
+      "classification": "ambiguous_outcome",
+      "note": "Exit 7, internal without details.stored:false: the mutation outcome is unknown, retry with the same request ID."
+    },
+    "internal-not-stored": {
+      "classification": "rejection",
+      "note": "Exit 7, internal with details.stored:false: nothing was stored."
+    },
+    "invalid-argument": {
+      "classification": "rejection",
+      "note": "Exit 1, invalid_argument: malformed request ID, nothing stored."
+    },
     "offline-status-halted": {
       "classification": "success",
       "note": "Exit 0, ok:true with an offline status snapshot carrying last_halt."
@@ -39,9 +55,17 @@
       "classification": "rejection",
       "note": "Exit 1, payload_mismatch: the request ID is already used with a different payload."
     },
+    "rejected": {
+      "classification": "rejection",
+      "note": "Exit 1, rejected: resume while intake is already open, nothing stored."
+    },
     "repository-mismatch": {
       "classification": "rejection",
       "note": "Exit 1, repository_mismatch: wrong --expect-repo, nothing stored."
+    },
+    "resume-accepted": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with replayed:false: the resume committed."
     },
     "status-active": {
       "classification": "success",
