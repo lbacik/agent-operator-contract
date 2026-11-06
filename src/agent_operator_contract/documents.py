@@ -1,20 +1,24 @@
 """Validation and classification of the contract's documents.
 
 Covers the reply envelope and ``Identity`` (spec sections 4 and 7.1), the
-consumer fixture format (spec section 15) and the conformance harness protocol
-(spec section 15.1). Standard library only: this module mirrors the JSON
-Schemas in ``schemas/`` rule for rule, so engines and consumers without a JSON
-Schema engine reach the same verdicts. It is not a general JSON Schema engine;
-agreement with the schemas is tested on the whole fixture set (see
-``tests/test_schemas.py``).
+consumer fixture format (spec section 15), the ``agentfleet`` client error
+envelope (``client.`` codes), the ``agentfleet ls --json`` listing and the
+conformance harness protocol (spec section 15.1). Standard library only: this
+module mirrors the JSON Schemas in ``schemas/`` rule for rule, so engines and
+consumers without a JSON Schema engine reach the same verdicts. It is not a
+general JSON Schema engine; agreement with the schemas is tested on the whole
+fixture set (see ``tests/test_schemas.py``).
 
 The ``error.code`` table lives once, as data, in ``error-table.json``: each
 code with its fixed exit code and ``retryable`` flag (spec section 4). The
 envelope schema's ``error.code`` enum mirrors these keys (tests enforce
 equality); :func:`validate_envelope` and :func:`classify_fixture` read this
-file at runtime. Pattern matching uses ``re.search``, exactly like the JSON
-Schema ``pattern`` keyword, and every pattern constant below is pinned to the
-matching schema pattern by tests.
+file at runtime. The ``client.`` code table lives once, as data, in
+``client-table.json``: each client failure with the spec section 4 exit
+class it exits with and its ``retryable`` flag. The client-envelope schema's
+``error.code`` enum mirrors these keys. Pattern matching uses ``re.search``,
+exactly like the JSON Schema ``pattern`` keyword, and every pattern constant
+below is pinned to the matching schema pattern by tests.
 """
 
 from __future__ import annotations
@@ -62,11 +66,18 @@ TIMESTAMP_PATTERN = r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[
 REPOSITORY_PATTERN = r"^[^/\s]+/[^/\s]+$"
 """Target Repository written owner/name."""
 
+CONTRACT_MAJOR_PATTERN = r"^[0-9]+$"
+"""Contract major from the discovery label, e.g. 1 (spec section 2.1)."""
+
+CLIENT_CODE_PATTERN = r"^client\.[a-z_]+$"
+"""Shape of an agentfleet client error.code; the exact codes live in client-table.json."""
 SCHEMA_NAMES: tuple[str, ...] = (
     "envelope",
     "identity",
     "fixture",
     "instance-name",
+    "client-envelope",
+    "ls",
     "harness-request",
     "harness-reply",
 )
@@ -144,6 +155,18 @@ def error_table() -> dict[str, Any]:
     table = json.loads(_read_package_text("error-table.json"))
     if not isinstance(table, dict):
         raise ValueError("error-table.json must be an object")
+    return table
+
+
+def client_table() -> dict[str, Any]:
+    """Load the client. code table from the package data.
+
+    Each entry maps a ``client.`` error code to the spec section 4 exit
+    class ``agentfleet`` exits with for it and its ``retryable`` flag.
+    """
+    table = json.loads(_read_package_text("client-table.json"))
+    if not isinstance(table, dict):
+        raise ValueError("client-table.json must be an object")
     return table
 
 
@@ -774,6 +797,87 @@ def _validate_hold_result(result: dict[str, Any]) -> list[str]:
         errors.append("harness 'hold' result is missing required property: 'attempt_id'")
     elif result["attempt_id"] is not None and not _is_non_empty_string(result["attempt_id"]):
         errors.append("harness 'hold' result attempt_id must be a string or null")
+    return errors
+
+
+def validate_client_envelope(doc: object) -> list[str]:
+    """Check an agentfleet client error document; the empty list means valid.
+
+    A client failure is an envelope-shaped document with ``ok: false`` and an
+    ``error.code`` in the ``client.`` namespace from ``client-table.json``.
+    """
+    if not isinstance(doc, dict):
+        return ["client envelope must be an object"]
+    errors: list[str] = []
+    if "contract" not in doc:
+        errors.append("missing required property: 'contract'")
+    elif not _matches(CONTRACT_PATTERN, doc["contract"]):
+        errors.append("contract must be a '<major>.<minor>' string")
+    if "ok" not in doc:
+        errors.append("missing required property: 'ok'")
+    elif doc["ok"] is not False:
+        errors.append("client envelope ok must be false")
+    if "result" in doc:
+        errors.append("client envelope must not contain 'result'")
+    if "error" not in doc:
+        errors.append("client envelope requires 'error'")
+        return errors
+    error = doc["error"]
+    if not isinstance(error, dict):
+        return [*errors, "error must be an object"]
+    table = client_table()
+    code = error.get("code")
+    if "code" not in error:
+        errors.append("error is missing required property: 'code'")
+    elif not isinstance(code, str) or code not in table:
+        errors.append(f"error.code {code!r} is not a known client code")
+    if "message" not in error:
+        errors.append("error is missing required property: 'message'")
+    elif not isinstance(error["message"], str):
+        errors.append("error.message must be a string")
+    if "retryable" not in error:
+        errors.append("error is missing required property: 'retryable'")
+    elif type(error["retryable"]) is not bool:
+        errors.append("error.retryable must be a boolean")
+    if "details" in error and not isinstance(error["details"], dict):
+        errors.append("error.details must be an object")
+    return errors
+
+
+def validate_ls(doc: object) -> list[str]:
+    """Check an ``agentfleet ls --json`` document; the empty list means valid."""
+    if not isinstance(doc, dict):
+        return ["ls document must be an object"]
+    errors: list[str] = []
+    if doc.get("version") != 1:
+        errors.append("ls document version must be 1")
+    if "instances" not in doc:
+        errors.append("ls document is missing required property: 'instances'")
+        return errors
+    instances = doc["instances"]
+    if not isinstance(instances, list):
+        return [*errors, "ls instances must be an array"]
+    for index, entry in enumerate(instances):
+        prefix = f"instances[{index}]"
+        if not isinstance(entry, dict):
+            errors.append(f"{prefix} must be an object")
+            continue
+        for key in ("name", "backend", "contract", "state", "duplicate"):
+            if key not in entry:
+                errors.append(f"{prefix} is missing required property: {key!r}")
+        for key in entry:
+            if key not in ("name", "backend", "contract", "state", "duplicate"):
+                errors.append(f"{prefix} has an unexpected property: {key!r}")
+        if "name" in entry and not _matches(INSTANCE_NAME_PATTERN, entry["name"]):
+            errors.append(f"{prefix}.name must match the instance name pattern")
+        if "backend" in entry and (not isinstance(entry["backend"], str) or not entry["backend"]):
+            errors.append(f"{prefix}.backend must be a non-empty string")
+        if "contract" in entry and not _matches(CONTRACT_MAJOR_PATTERN, entry["contract"]):
+            errors.append(f"{prefix}.contract must be a contract major string")
+        if "state" in entry and (not isinstance(entry["state"], str) or not entry["state"]):
+            errors.append(f"{prefix}.state must be a non-empty string")
+        if "duplicate" in entry and type(entry["duplicate"]) is not bool:
+            errors.append(f"{prefix}.duplicate must be a boolean")
     return errors
 
 

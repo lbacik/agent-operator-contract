@@ -1,0 +1,45 @@
+{
+  "containers": [
+    {
+      "id": "aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa111aaa1",
+      "name": "web-1",
+      "backend": "coding-agent",
+      "contract": "1",
+      "exec_user": "agent",
+      "state": "running"
+    },
+    {
+      "id": "bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb222bbb2",
+      "name": "web-2",
+      "backend": "simple-coding-agent",
+      "contract": "1",
+      "exec_user": "agent",
+      "state": "exited"
+    },
+    {
+      "id": "ccc333ccc333ccc333ccc333ccc333ccc333ccc333ccc333ccc333ccc333ccc3",
+      "name": "dup",
+      "backend": "coding-agent",
+      "contract": "1",
+      "exec_user": "agent",
+      "state": "running"
+    },
+    {
+      "id": "ddd444ddd444ddd444ddd444ddd444ddd444ddd444ddd444ddd444ddd444ddd4",
+      "name": "dup",
+      "backend": "coding-agent",
+      "contract": "1",
+      "exec_user": "agent",
+      "state": "exited"
+    },
+    {
+      "id": "eee555eee555eee555eee555eee555eee555eee555eee555eee555eee555eee5",
+      "name": "worker-run-1",
+      "backend": "coding-agent",
+      "contract": "1",
+      "exec_user": "agent",
+      "state": "running",
+      "oneoff": true
+    }
+  ]
+}

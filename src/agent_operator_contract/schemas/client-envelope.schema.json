@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "The error.code enum is generated from client-table.json by scripts/generate_schemas.py; do not edit it by hand.",
+  "title": "Agentfleet client error envelope",
+  "description": "The envelope-shaped document agentfleet prints for its own failures (unknown instance, duplicate instance, Docker unavailable, malformed producer stdout, usage). Spec section 4 exit classes apply; error.code lives in the client. namespace (see client-table.json).",
+  "type": "object",
+  "required": [
+    "contract",
+    "ok"
+  ],
+  "properties": {
+    "contract": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "description": "The contract major.minor the client speaks, e.g. 1.0."
+    },
+    "ok": {
+      "const": false
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "client.unknown_instance",
+            "client.duplicate_instance",
+            "client.docker_unavailable",
+            "client.exec_failed",
+            "client.malformed_stdout",
+            "client.usage"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable cause; consumers must not parse it."
+        },
+        "retryable": {
+          "type": "boolean",
+          "description": "Whether retrying the same operation may help."
+        },
+        "details": {
+          "type": "object",
+          "description": "Code-specific fields; consumers must ignore unknown keys."
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "required": [
+        "error"
+      ],
+      "not": {
+        "required": [
+          "result"
+        ]
+      }
+    }
+  ]
+}

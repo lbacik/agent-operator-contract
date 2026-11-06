@@ -1,0 +1,225 @@
+#!/usr/bin/env python3
+"""Fake `docker` executable for the consumer suite (spec section 15).
+
+It stands in for the `docker` CLI: it serves a described Fleet for listing
+and inspection, answers `exec` of `agentctl` by replaying fixtures matched on
+argv, and records every invocation so a test can assert what the consumer
+sent. Standard library only; usable from a checkout of the tag without Python
+imports (see README.md in this directory).
+
+Fleet description (JSON file, `FAKE_DOCKER_FLEET`):
+
+    {"containers": [{"id": "...", "name": "...", "backend": "...",
+                     "contract": "1", "exec_user": "...",
+                     "state": "running", "oneoff": false}]}
+
+`oneoff: true` sets the Compose one-off label
+`com.docker.compose.oneoff=True`, which the consumer must ignore.
+
+Fixtures (`FAKE_DOCKER_FIXTURES`, default: the checkout's
+`src/agent_operator_contract/fixtures/agentctl/`): files shaped
+`{argv, exit_code, stdout, stderr}`; `argv` excludes the agentctl binary
+itself. An `exec` of `/usr/local/bin/agentctl --contract 1 <op>` replays the
+fixture whose `argv` equals the args after the binary, byte for byte.
+
+Recording (`FAKE_DOCKER_LOG`): every docker invocation appends one JSON line
+`{"argv": [...]}` (args after the `docker` name itself).
+
+Supported commands: `ps` (one container ID per line), `inspect <id>...`
+(docker-inspect-shaped JSON array), `exec --user <user> <id>
+/usr/local/bin/agentctl <agentctl-argv...>`. Anything else exits 125.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+CONTRACT_LABEL = "io.github.lbacik.agent-operator.contract"
+INSTANCE_LABEL = "io.github.lbacik.agent-operator.instance"
+EXEC_USER_LABEL = "io.github.lbacik.agent-operator.exec-user"
+BACKEND_LABEL = "io.github.lbacik.agent-operator.backend"
+ONEOFF_LABEL = "com.docker.compose.oneoff"
+
+AGENTCTL_PATH = "/usr/local/bin/agentctl"
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parent.parent.parent
+
+
+def _fleet_path() -> Path | None:
+    env = os.environ.get("FAKE_DOCKER_FLEET")
+    if env:
+        return Path(env)
+    return None
+
+
+def _fixtures_dir() -> Path:
+    env = os.environ.get("FAKE_DOCKER_FIXTURES")
+    if env:
+        return Path(env)
+    return _repo_root() / "src" / "agent_operator_contract" / "fixtures" / "agentctl"
+
+
+def _log_path() -> Path | None:
+    env = os.environ.get("FAKE_DOCKER_LOG")
+    if env:
+        return Path(env)
+    return None
+
+
+def _record(argv: list[str]) -> None:
+    log = _log_path()
+    if log is None:
+        return
+    log.parent.mkdir(parents=True, exist_ok=True)
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({"argv": argv}) + "\n")
+
+
+def _load_fleet() -> dict[str, dict[str, object]]:
+    path = _fleet_path()
+    if path is None:
+        sys.stderr.write("fake_docker: FAKE_DOCKER_FLEET is not set\n")
+        raise SystemExit(125)
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        sys.stderr.write(f"fake_docker: cannot read fleet file: {exc}\n")
+        raise SystemExit(125) from exc
+    except ValueError as exc:
+        sys.stderr.write(f"fake_docker: fleet file is not JSON: {exc}\n")
+        raise SystemExit(125) from exc
+    containers = doc.get("containers", [])
+    by_id: dict[str, dict[str, object]] = {}
+    for entry in containers:
+        if isinstance(entry, dict) and isinstance(entry.get("id"), str):
+            by_id[str(entry["id"])] = entry
+    return by_id
+
+
+def _inspect_entry(container_id: str, desc: dict[str, object]) -> dict[str, object]:
+    labels = {
+        CONTRACT_LABEL: str(desc.get("contract", "1")),
+        INSTANCE_LABEL: str(desc.get("name", "")),
+        BACKEND_LABEL: str(desc.get("backend", "")),
+        EXEC_USER_LABEL: str(desc.get("exec_user", "")),
+    }
+    if desc.get("oneoff") is True:
+        labels[ONEOFF_LABEL] = "True"
+    state = str(desc.get("state", "running"))
+    return {
+        "Id": container_id,
+        "Image": str(desc.get("image", "example-image")),
+        "Config": {"Labels": labels},
+        "State": {"Status": state, "Running": state == "running"},
+    }
+
+
+def _cmd_ps(fleet: dict[str, dict[str, object]]) -> int:
+    for container_id in fleet:
+        sys.stdout.write(container_id + "\n")
+    return 0
+
+
+def _cmd_inspect(fleet: dict[str, dict[str, object]], ids: list[str]) -> int:
+    if not ids:
+        sys.stderr.write("fake_docker: inspect requires a container id\n")
+        return 1
+    entries = []
+    for container_id in ids:
+        desc = fleet.get(container_id)
+        if desc is None:
+            sys.stderr.write(f"fake_docker: no such container: {container_id}\n")
+            return 1
+        entries.append(_inspect_entry(container_id, desc))
+    sys.stdout.write(json.dumps(entries) + "\n")
+    return 0
+
+
+def _load_fixtures() -> list[dict[str, object]]:
+    directory = _fixtures_dir()
+    fixtures: list[dict[str, object]] = []
+    if not directory.is_dir():
+        return fixtures
+    for path in sorted(directory.glob("*.json")):
+        if path.name == "index.json":
+            continue
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(doc, dict):
+            fixtures.append(doc)
+    return fixtures
+
+
+def _cmd_exec(
+    fleet: dict[str, dict[str, object]], args: list[str]
+) -> int:
+    try:
+        user_index = args.index("--user")
+        exec_user = args[user_index + 1]
+        container_id = args[user_index + 2]
+        rest = args[user_index + 3 :]
+    except (ValueError, IndexError):
+        sys.stderr.write("fake_docker: exec expects --user <user> <container> ...\n")
+        return 125
+    if not rest or rest[0] != AGENTCTL_PATH:
+        sys.stderr.write(
+            f"fake_docker: exec expects {AGENTCTL_PATH} after the container\n"
+        )
+        return 125
+    agentctl_argv = rest[1:]
+    desc = fleet.get(container_id)
+    if desc is None:
+        sys.stderr.write(f"fake_docker: no such container: {container_id}\n")
+        return 125
+    if exec_user != str(desc.get("exec_user", "")):
+        sys.stderr.write(
+            f"fake_docker: wrong exec user {exec_user!r} for {container_id}\n"
+        )
+        return 125
+    for fixture in _load_fixtures():
+        if fixture.get("argv") == agentctl_argv:
+            sys.stdout.write(str(fixture.get("stdout", "")))
+            sys.stderr.write(str(fixture.get("stderr", "")))
+            exit_code = fixture.get("exit_code", 0)
+            return int(exit_code) if isinstance(exit_code, int) else 1
+    sys.stderr.write(f"fake_docker: no fixture matches {agentctl_argv!r}\n")
+    envelope = {
+        "contract": "1.0",
+        "ok": False,
+        "error": {
+            "code": "usage",
+            "message": f"no recorded fixture for {agentctl_argv!r}",
+            "retryable": False,
+        },
+    }
+    sys.stdout.write(json.dumps(envelope) + "\n")
+    return 2
+
+
+def main(argv: list[str]) -> int:
+    _record(list(argv))
+    if not argv:
+        sys.stderr.write("fake_docker: no docker subcommand\n")
+        return 125
+    command, rest = argv[0], argv[1:]
+    fleet = _load_fleet()
+    if command == "ps":
+        return _cmd_ps(fleet)
+    if command == "inspect":
+        ids = [arg for arg in rest if not arg.startswith("-")]
+        return _cmd_inspect(fleet, ids)
+    if command == "exec":
+        return _cmd_exec(fleet, rest)
+    sys.stderr.write(f"fake_docker: unsupported docker command {command!r}\n")
+    return 125
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
