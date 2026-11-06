@@ -20,7 +20,10 @@ Fixtures (`FAKE_DOCKER_FIXTURES`, default: the checkout's
 `src/agent_operator_contract/fixtures/agentctl/`): files shaped
 `{argv, exit_code, stdout, stderr}`; `argv` excludes the agentctl binary
 itself. An `exec` of `/usr/local/bin/agentctl --contract 1 <op>` replays the
-first fixture whose `argv` matches the args after the binary.
+first fixture whose `argv` matches the args after the binary. A fixture may
+carry `stdout_base64` instead of `stdout` for byte streams that are not
+UTF-8 text (an `attempts export` tar): the base64 payload is decoded and
+written to stdout as bytes, so a binary export replays byte for byte.
 
 Matching ignores the `--request-id` value by position (consumers generate
 request IDs, so a test cannot know them in advance): two argvs match when
@@ -45,6 +48,7 @@ Supported commands: `ps` (one container ID per line), `inspect <id>...`
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import sys
@@ -288,16 +292,27 @@ def _cmd_exec(
     if matches:
         fixture = matches[min(_prior_matches(key), len(matches) - 1)]
         _sleep_before_reply(fixture)
-        stdout = str(fixture.get("stdout", ""))
-        stderr = str(fixture.get("stderr", ""))
         raw_argv = fixture.get("argv")
         assert isinstance(raw_argv, list)
         fixture_id = _request_id_of([str(a) for a in raw_argv])
         actual_id = _request_id_of(agentctl_argv)
+        encoded = fixture.get("stdout_base64")
+        if isinstance(encoded, str) and encoded:
+            try:
+                payload = base64.b64decode(encoded.encode("ascii"))
+            except ValueError:
+                sys.stderr.write("fake_docker: fixture stdout_base64 is not base64\n")
+                return 1
+            sys.stdout.buffer.write(payload)
+            sys.stdout.buffer.flush()
+        else:
+            stdout = str(fixture.get("stdout", ""))
+            if fixture_id is not None and actual_id is not None and fixture_id != actual_id:
+                stdout = stdout.replace(fixture_id, actual_id)
+            sys.stdout.write(stdout)
+        stderr = str(fixture.get("stderr", ""))
         if fixture_id is not None and actual_id is not None and fixture_id != actual_id:
-            stdout = stdout.replace(fixture_id, actual_id)
             stderr = stderr.replace(fixture_id, actual_id)
-        sys.stdout.write(stdout)
         sys.stderr.write(stderr)
         exit_code = fixture.get("exit_code", 0)
         return int(exit_code) if isinstance(exit_code, int) else 1

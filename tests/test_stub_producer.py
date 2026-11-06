@@ -1219,7 +1219,8 @@ def _read_export_tar(data: bytes) -> tuple[dict[str, Any], dict[str, bytes], lis
             extracted = archive.extractfile(member)
             order.append(member.name)
             members[member.name] = extracted.read() if extracted is not None else b""
-    assert order and order[0] == "manifest.json"
+    assert order
+    assert order[0] == "manifest.json"
     manifest = json.loads(members["manifest.json"])
     assert isinstance(manifest, dict)
     return manifest, members, order

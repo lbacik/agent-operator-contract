@@ -799,6 +799,14 @@ def _open_claim(
     )
     if isinstance(armed, dict) and armed.get("point") == "after-claim":
         return "crashed"
+    # Snapshot the archive manifest when the claim opens: an export serves
+    # the snapshot while streaming the live bytes, so a file that grows
+    # while the archive is unsealed no longer matches its manifest entry
+    # (the torn read of spec section 14). The snapshot is refreshed when
+    # the outcome is recorded and replaced by the sealed manifest.
+    active = state.get("active_attempt")
+    assert isinstance(active, dict)
+    active["manifest_snapshot"] = _fresh_manifest(state, {"attempt_id": attempt_id})
     return "opened"
 
 

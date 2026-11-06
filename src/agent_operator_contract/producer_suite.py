@@ -1568,7 +1568,12 @@ def scenario_export_torn_read(ctx: SuiteContext, harness_cmd: Sequence[str]) -> 
     if not problems:
         _drop_issue(ctx, harness_cmd, scenario_id, issue)
         return ScenarioOutcome(scenario_id, "failed", "expected a torn read after the archive grew")
-    if not any("sha256" in problem for problem in problems):
+    # A grown file tears the read either by size or by hash: both mean the
+    # streamed bytes no longer match the snapshot manifest entry.
+    torn = any(
+        "sha256" in problem or "bytes, not" in problem for problem in problems
+    )
+    if not torn:
         _drop_issue(ctx, harness_cmd, scenario_id, issue)
         return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
     cleanup = _drop_issue(ctx, harness_cmd, scenario_id, issue)
@@ -3071,8 +3076,6 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_budget_mutations(ctx),
         scenario_budget_attempts(ctx, harness_cmd),
         scenario_budget_export(ctx, harness_cmd),
-        scenario_sealed_after_outcome(ctx, harness_cmd),
-        scenario_export_torn_read(ctx, harness_cmd),
         scenario_attempts_list_paging(ctx, harness_cmd),
         scenario_attempts_show(ctx, harness_cmd),
         scenario_attempts_not_found(ctx),
@@ -3085,6 +3088,8 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_stop_after_invalid(ctx),
         scenario_stop_after_restart(ctx, harness_cmd),
         scenario_next_issue_restart(ctx, harness_cmd),
+        scenario_sealed_after_outcome(ctx, harness_cmd),
+        scenario_export_torn_read(ctx, harness_cmd),
         scenario_halt_records_last_halt(ctx, harness_cmd),
         scenario_publication_pending_recovery(ctx, harness_cmd),
     ]

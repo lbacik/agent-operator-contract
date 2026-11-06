@@ -10,11 +10,15 @@ assert what the consumer sent. No real daemon, container or network is used.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
 from typing import Any
 
@@ -1115,3 +1119,170 @@ def test_next_issue_refused_when_capability_missing(
     assert documents.validate_client_envelope(doc) == []
     assert doc["error"]["code"] == "client.unsupported_capability"
     assert _exec_argvs(_recorded(consumer_env)) == [["--contract", "1", "identity"]]
+
+
+def _export_summary(attempt_id: str) -> dict[str, Any]:
+    """A full AttemptSummary for an export tar of one attempt."""
+    return {
+        "attempt_id": attempt_id,
+        "issue": {"number": 43, "title": "Issue 43"},
+        "started_at": "2026-11-06T08:51:00Z",
+        "finished_at": None,
+        "lifecycle_state": "open",
+        "outcome": None,
+        "delivery": None,
+        "attention_required": False,
+        "sealed": False,
+        "sealed_at": None,
+    }
+
+
+def _export_tar_bytes(attempt_id: str, files: dict[str, bytes]) -> bytes:
+    """Build a spec section 11.3 export tar: manifest.json first, then files."""
+    entries = [
+        {
+            "path": name,
+            "kind": "events" if name == "events.jsonl" else "transcript",
+            "media_type": "application/x-ndjson",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        for name, data in files.items()
+    ]
+    manifest = {"contract": "1.0", "attempt": _export_summary(attempt_id), "files": entries}
+    payload = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w") as archive:
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return stream.getvalue()
+
+
+def _export_fixture(
+    attempt_id: str, tar_bytes: bytes, paths: list[str] | None = None
+) -> dict[str, Any]:
+    """An export fixture replayed as raw bytes: tars are not UTF-8 text.
+
+    The tar leaves the package fixtures alone and lives in the test's own
+    isolated fixture dir; ``stdout_base64`` carries it byte for byte.
+    """
+    argv = ["--contract", "1", "attempts", "export", attempt_id]
+    for path in paths or []:
+        argv += ["--path", path]
+    return {
+        "argv": argv,
+        "exit_code": 0,
+        "stdout_base64": base64.b64encode(tar_bytes).decode("ascii"),
+        "stderr": "",
+    }
+
+
+def _export_env(
+    consumer_env: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fixtures: dict[str, dict[str, Any]],
+) -> dict[str, str]:
+    """A fixture dir with inline export recordings for argv-exact replay."""
+    isolated = tmp_path / "export-fixtures"
+    isolated.mkdir(exist_ok=True)
+    for stem, doc in fixtures.items():
+        (isolated / f"{stem}.json").write_text(json.dumps(doc) + "\n", encoding="utf-8")
+    env = dict(consumer_env["env"])
+    env["FAKE_DOCKER_FIXTURES"] = str(isolated)
+    monkeypatch.setenv("FAKE_DOCKER_FIXTURES", str(isolated))
+    return env
+
+
+def test_attempts_export_matching_stream_writes_bytes(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tar_bytes = _export_tar_bytes("#43/1", {"events.jsonl": b"", "transcript.jsonl": b"seed\n"})
+    env = _export_env(
+        consumer_env, tmp_path, monkeypatch, {"export-ok": _export_fixture("#43/1", tar_bytes)}
+    )
+    completed = _run_agentfleet(["attempts", "export", "web-1", "#43/1"], env)
+
+    assert completed.returncode == 0
+    assert completed.stdout == tar_bytes
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "attempts", "export", "#43/1"]
+    ]
+
+
+def test_attempts_export_torn_stream_refetches_then_fails(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bytes that do not match the manifest fail after the bounded refetch.
+
+    The staged tar claims ``b"seed\\n"`` but streams grown bytes, so every
+    attempt is torn: ``agentfleet`` refetches exactly three times, writes no
+    tar bytes, and exits 7 with ``client.export_torn``.
+    """
+    tar_bytes = _export_tar_bytes("#43/1", {"events.jsonl": b"", "transcript.jsonl": b"seed\n"})
+    grown = tar_bytes.replace(b"seed\n", b"seed\n-appended-while-unsealed")
+    assert grown != tar_bytes
+    env = _export_env(
+        consumer_env, tmp_path, monkeypatch, {"export-torn": _export_fixture("#43/1", grown)}
+    )
+    completed = _run_agentfleet(["attempts", "export", "web-1", "#43/1"], env)
+
+    table = documents.client_table()
+    assert completed.returncode == int(table["client.export_torn"]["exit_code"])
+    doc = json.loads(completed.stdout.decode("utf-8"))
+    assert documents.validate_client_envelope(doc) == []
+    assert CLIENT_ENVELOPE_VALIDATOR.is_valid(doc)
+    assert doc["error"]["code"] == "client.export_torn"
+    exec_argvs = _exec_argvs(_recorded(consumer_env))
+    assert exec_argvs == [["--contract", "1", "attempts", "export", "#43/1"]] * 3
+
+
+def test_attempts_export_torn_writes_no_partial_file(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tar_bytes = _export_tar_bytes("#43/1", {"events.jsonl": b"", "transcript.jsonl": b"seed\n"})
+    grown = tar_bytes.replace(b"seed\n", b"seed\n-appended-while-unsealed")
+    env = _export_env(
+        consumer_env, tmp_path, monkeypatch, {"export-torn": _export_fixture("#43/1", grown)}
+    )
+    completed = _run_agentfleet(
+        ["attempts", "export", "web-1", "#43/1", "--output", str(tmp_path / "out.tar")], env
+    )
+
+    assert completed.returncode == 7
+    assert not (tmp_path / "out.tar").exists()
+
+
+def test_attempts_export_stalled_stream_trips_the_progress_timeout(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tar_bytes = _export_tar_bytes("#43/1", {"events.jsonl": b"", "transcript.jsonl": b"seed\n"})
+    fixture = _export_fixture("#43/1", tar_bytes)
+    fixture["delay_seconds"] = 2.0
+    env = _export_env(consumer_env, tmp_path, monkeypatch, {"export-slow": fixture})
+    completed = _run_agentfleet(
+        ["attempts", "export", "web-1", "#43/1", "--timeout", "0.2"], env
+    )
+
+    assert completed.returncode == 6
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "attempts", "export", "#43/1"]
+    ]
+
+
+def test_attempts_export_unknown_id_relays_not_found(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _attempts_env(consumer_env, tmp_path, monkeypatch, "attempts-export-not-found")
+    completed = _run_agentfleet(["attempts", "export", "web-1", "#99/9"], env)
+
+    assert completed.returncode == 5
+    assert "not_found" in completed.stderr.decode("utf-8")
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "attempts", "export", "#99/9"]
+    ]
