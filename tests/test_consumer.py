@@ -458,7 +458,24 @@ def test_ls_schema_patterns_match_library() -> None:
     assert item["contract"]["pattern"] == documents.CONTRACT_MAJOR_PATTERN
 
 
-def _stop_fixture(request_id: str, sequence: int = 7) -> dict[str, Any]:
+def _masked_stop_fixture(source: str, placeholder: str) -> dict[str, Any]:
+    """Copy a fixture, replacing its request ID with a positional placeholder.
+
+    The fake matches ``--request-id`` by position and substitutes the ID the
+    consumer actually sent, so a test for a generated ID stages its fixtures
+    with a placeholder the consumer never sends.
+    """
+    doc = dict(json.loads((FIXTURES_DIR / f"{source}.json").read_text(encoding="utf-8")))
+    argv = list(doc["argv"])
+    old_id = argv[argv.index("--request-id") + 1]
+    argv[argv.index("--request-id") + 1] = placeholder
+    doc["argv"] = argv
+    doc["stdout"] = str(doc["stdout"]).replace(old_id, placeholder)
+    doc["stderr"] = str(doc.get("stderr", "")).replace(old_id, placeholder)
+    return doc
+
+
+def _stop_fixture(request_id: str, sequence: int = 7, replayed: bool = False) -> dict[str, Any]:
     record = {
         "acknowledgement": "accepted",
         "arguments": {},
@@ -471,7 +488,7 @@ def _stop_fixture(request_id: str, sequence: int = 7) -> dict[str, Any]:
         "updated_at": "2026-11-06T09:12:03Z",
     }
     stdout = json.dumps(
-        {"contract": "1.0", "ok": True, "result": {"command": record, "replayed": False}},
+        {"contract": "1.0", "ok": True, "result": {"command": record, "replayed": replayed}},
         sort_keys=True,
         separators=(",", ":"),
     )
@@ -645,6 +662,179 @@ def test_mutation_precheck_allows_core_refuses_major_and_capability() -> None:
         client.ensure_mutation_allowed(identity, "operator-handoff")
     assert capability_info.value.code == "client.unsupported_capability"
     assert capability_info.value.exit_code == 3
+
+
+def test_mutation_timeout_defaults_follow_spec_section_3_3() -> None:
+    assert client.timeout_for("identity") == 10.0
+    assert client.timeout_for("status") == 10.0
+    assert client.timeout_for("command") == 10.0
+    assert client.timeout_for("stop") == 15.0
+    assert client.timeout_for("resume") == 15.0
+    assert client.timeout_for("attempts-list") == 15.0
+    assert client.timeout_for("attempts-export") == 30.0
+    # The only caller is the mutation retry path: an unrecognized operation
+    # carries the mutation default so a short timeout cannot manufacture an
+    # ambiguous outcome.
+    assert client.timeout_for("stop-after") == 15.0
+    assert client.timeout_for("mutation") == 15.0
+
+
+def test_mutation_timeout_override_wins_only_when_positive() -> None:
+    assert client.timeout_for("stop", override=0.2) == 0.2
+    assert client.timeout_for("stop", override=0.0) == 15.0
+    assert client.timeout_for("stop", override=-1.0) == 15.0
+    assert client.timeout_for("identity", override=-1.0) == 10.0
+
+
+def test_mutation_ambiguous_then_replayed_with_same_generated_id(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ambiguous reply is retried with the same generated ID and payload.
+
+    The fixtures carry a placeholder request ID the consumer never sends; the
+    fake matches by position and substitutes the generated ID. The first
+    attempt is ambiguous, the second replays the commit, and ``agentfleet``
+    exits 0 without the caller ever supplying an ID.
+    """
+    placeholder = "req-PLACEHOLDER0001"
+    ambiguous = _masked_stop_fixture("agent-unreachable", placeholder)
+    success = _stop_fixture(placeholder, replayed=True)
+    env = _fixture_env(
+        consumer_env,
+        tmp_path,
+        monkeypatch,
+        ["identity"],
+        {"stop-retry-01": ambiguous, "stop-retry-02": success},
+    )
+    completed = _run_agentfleet(
+        ["stop", "web-1", "--expect-repo", "example-owner/example-repo"],
+        env,
+    )
+
+    assert completed.returncode == 0
+    out = completed.stdout.decode("utf-8")
+    assert "replayed: True" in out
+    exec_argvs = _exec_argvs(_recorded(consumer_env))
+    assert exec_argvs[0] == ["--contract", "1", "identity"]
+    stops = [argv for argv in exec_argvs[1:] if argv[2:3] == ["stop"]]
+    assert len(stops) == 2
+    assert stops[0] == stops[1]
+    generated = stops[0][stops[0].index("--request-id") + 1]
+    assert generated != placeholder
+    assert re.search(documents.REQUEST_ID_PATTERN, generated) is not None
+    assert generated in out
+
+
+def test_mutation_delayed_past_timeout_retries_then_reports_request_id(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A reply slower than the timeout is ambiguous; exhaustion prints the ID.
+
+    The single staged reply sleeps past the 0.2 s timeout, so both attempts
+    time out with the same generated ID, and ``agentfleet`` exits non-zero
+    with the request ID for a ``command`` follow-up instead of resubmitting.
+    """
+    placeholder = "req-PLACEHOLDER0002"
+    slow = _stop_fixture(placeholder)
+    slow["delay_seconds"] = 2.0
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, ["identity"], {"stop-slow": slow})
+    completed = _run_agentfleet(
+        [
+            "stop",
+            "web-1",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--timeout",
+            "0.2",
+            "--max-attempts",
+            "2",
+        ],
+        env,
+    )
+
+    assert completed.returncode == 6
+    combined = completed.stdout.decode("utf-8") + completed.stderr.decode("utf-8")
+    exec_argvs = _exec_argvs(_recorded(consumer_env))
+    stops = [argv for argv in exec_argvs if argv[2:3] == ["stop"]]
+    assert len(stops) == 2
+    assert stops[0] == stops[1]
+    generated = stops[0][stops[0].index("--request-id") + 1]
+    assert generated in combined
+
+
+def test_mutation_internal_not_stored_is_not_retried(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``internal`` with ``details.stored: false`` is definitive, not ambiguous."""
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, ["identity", "internal-not-stored"])
+    completed = _run_agentfleet(
+        [
+            "resume",
+            "web-1",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            "req-3c4d5e6f7a8b",
+        ],
+        env,
+    )
+
+    assert completed.returncode == 7
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "identity"],
+        [
+            "--contract",
+            "1",
+            "resume",
+            "--request-id",
+            "req-3c4d5e6f7a8b",
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+    ]
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "transport-125",
+        "transport-126",
+        "transport-127",
+        "malformed-empty",
+        "malformed-truncated",
+        "malformed-non-json",
+        "contract-unknown-major",
+    ],
+)
+def test_malformed_stdout_is_never_a_success(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Malformed stdout falls back to the exit code and never reads as success.
+
+    Exit 125-127 without an envelope is a transport failure (ambiguous for a
+    mutation); any other incoherent stdout is a client error. Even the
+    ``ok:true`` envelope with an unknown contract major must not exit 0.
+    """
+    fixture = json.loads((FIXTURES_DIR / f"{name}.json").read_text(encoding="utf-8"))
+    request_id = fixture["argv"][fixture["argv"].index("--request-id") + 1]
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, ["identity", name])
+    completed = _run_agentfleet(
+        [
+            "stop",
+            "web-1",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            request_id,
+            "--max-attempts",
+            "1",
+        ],
+        env,
+    )
+
+    assert completed.returncode != 0
+    combined = completed.stdout.decode("utf-8") + completed.stderr.decode("utf-8")
+    assert request_id in combined
 
 
 def test_fake_and_fixtures_usable_from_checkout_without_imports(

@@ -21,6 +21,8 @@ import json
 import os
 import secrets
 import subprocess
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -42,6 +44,24 @@ CLIENT_CONTRACT = f"{CONTRACT_MAJOR}.0"
 MUTATION_TIMEOUT = 15.0
 """Default consumer timeout for mutations (spec section 3.3)."""
 
+READ_TIMEOUT = 10.0
+"""Default consumer timeout for ``identity``, ``status`` and ``command`` (spec section 3.3)."""
+
+ATTEMPTS_LIST_TIMEOUT = 15.0
+"""Default consumer timeout for ``attempts list`` (spec section 3.3)."""
+
+ATTEMPTS_SHOW_TIMEOUT = 15.0
+"""Default consumer timeout for ``attempts show`` (spec section 3.3)."""
+
+ATTEMPTS_EXPORT_TIMEOUT = 30.0
+"""Default consumer progress timeout for ``attempts export`` (spec section 3.3)."""
+
+MAX_MUTATION_ATTEMPTS = 3
+"""Bounded retries for one ambiguous mutation call (spec section 8.4)."""
+
+MUTATION_RETRY_BACKOFF_BASE = 0.05
+"""Base backoff in seconds between ambiguous mutation retries; doubled each time."""
+
 
 def new_request_id() -> str:
     """Generate a mutation request ID before submission (spec section 6.2).
@@ -51,6 +71,128 @@ def new_request_id() -> str:
     passes through untouched instead: only generated IDs come from here.
     """
     return f"req-{secrets.token_hex(8)}"
+
+
+def timeout_for(operation: str, override: float | None = None) -> float:
+    """Return the consumer default timeout for one operation class (spec section 3.3).
+
+    ``override`` wins when positive; otherwise reads carry 10 s, mutations and
+    ``attempts list``/``attempts show`` carry 15 s, and ``attempts export``
+    carries a 30 s progress bound. An unrecognized operation is treated as a
+    mutation (the only caller is the mutation retry path), so it carries 15 s:
+    a too-short timeout would manufacture ambiguous outcomes (spec §8.4).
+    """
+    if override is not None and override > 0:
+        return override
+    if operation in ("identity", "status", "command"):
+        return READ_TIMEOUT
+    if operation in ("attempts-list", "attempts-show", "attempts", "attempts_list"):
+        return ATTEMPTS_LIST_TIMEOUT
+    if operation in ("attempts-export", "attempts_export"):
+        return ATTEMPTS_EXPORT_TIMEOUT
+    return MUTATION_TIMEOUT
+
+
+def is_ambiguous_envelope(envelope: dict[str, object]) -> bool:
+    """Decide whether a mutation outcome is ambiguous (spec sections 4 and 8.4).
+
+    ``agent_unreachable`` is always ambiguous; ``internal`` is ambiguous unless
+    ``details.stored`` is ``false``. Every other envelope (success or a
+    definitive refusal) is not ambiguous.
+    """
+    if envelope.get("ok") is True:
+        return False
+    error = envelope.get("error")
+    if not isinstance(error, dict):
+        return False
+    code = error.get("code")
+    if code == "agent_unreachable":
+        return True
+    if code == "internal":
+        details = error.get("details")
+        return not (isinstance(details, dict) and details.get("stored") is False)
+    return False
+
+
+class AmbiguousMutationError(Exception):
+    """A mutation stayed ambiguous after the bounded retries (spec section 8.4).
+
+    Carries the request ID so the operator can follow up with
+    ``agentfleet command <instance> <request-id>`` instead of resubmitting.
+    """
+
+    def __init__(
+        self,
+        request_id: str,
+        attempts: int,
+        message: str,
+        exit_code: int = 6,
+        envelope: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.request_id = request_id
+        self.attempts = attempts
+        self.exit_code = exit_code
+        self.envelope = envelope
+
+
+def invoke_mutation_with_retry(
+    docker: str,
+    instance: Instance,
+    agentctl_argv: list[str],
+    request_id: str,
+    timeout: float | None = None,
+    max_attempts: int | None = None,
+    backoff_base: float = MUTATION_RETRY_BACKOFF_BASE,
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[ExecResult, dict[str, object]]:
+    """Run one mutation, retrying ambiguous outcomes with the same ID and payload.
+
+    The same ``agentctl_argv`` (same request ID and payload) is resent a
+    bounded number of times with backoff inside this call. An outcome is
+    ambiguous when the exec fails without a producer envelope (timeout or
+    Docker exit 125-127, surfaced as :class:`ExecFailedError`) or when the
+    envelope is ``agent_unreachable`` or ``internal`` without
+    ``details.stored: false``. ``internal`` with ``details.stored: false``
+    and every other envelope are definitive and return at once. When the
+    retries are exhausted, raises :class:`AmbiguousMutationError` carrying the
+    request ID.
+    """
+    operation = agentctl_argv[0] if agentctl_argv else "mutation"
+    effective_timeout = timeout_for(operation, timeout)
+    attempts = max_attempts if max_attempts is not None else MAX_MUTATION_ATTEMPTS
+    if attempts < 1:
+        attempts = 1
+    for attempt in range(1, attempts + 1):
+        try:
+            exec_result = invoke(docker, instance, agentctl_argv, timeout=effective_timeout)
+            envelope = interpret(exec_result)
+        except ExecFailedError as exc:
+            if attempt < attempts:
+                sleep(backoff_base * (2.0 ** (attempt - 1)))
+                continue
+            raise AmbiguousMutationError(
+                request_id, attempts, str(exc), exit_code=exc.exit_code
+            ) from exc
+        if envelope.get("ok") is True or not is_ambiguous_envelope(envelope):
+            return exec_result, envelope
+        if attempt < attempts:
+            sleep(backoff_base * (2.0 ** (attempt - 1)))
+            continue
+        message_obj = envelope.get("error")
+        message = (
+            str(message_obj.get("message"))
+            if isinstance(message_obj, dict) and isinstance(message_obj.get("message"), str)
+            else "mutation outcome is ambiguous"
+        )
+        raise AmbiguousMutationError(
+            request_id,
+            attempts,
+            message,
+            exit_code=exec_result.exit_code,
+            envelope=envelope,
+        )
+    raise AssertionError("unreachable mutation retry loop")  # pragma: no cover
 
 
 def ensure_mutation_allowed(identity: dict[str, Any], capability: str | None) -> None:
@@ -363,6 +505,14 @@ def interpret(exec_result: ExecResult) -> dict[str, object]:
         if 125 <= exec_result.exit_code <= 127:
             raise ExecFailedError(f"docker exec exited {exec_result.exit_code} without an envelope")
         raise MalformedStdoutError("stdout is not a valid envelope")
+    contract = doc.get("contract")
+    major = documents.contract_major_of(contract)
+    if major != str(CONTRACT_MAJOR):
+        if 125 <= exec_result.exit_code <= 127:
+            raise ExecFailedError(
+                f"docker exec exited {exec_result.exit_code} without a coherent envelope"
+            )
+        raise MalformedStdoutError(f"envelope contract {contract!r} is not major {CONTRACT_MAJOR}")
     table = documents.error_table()
     if doc["ok"] is True:
         if exec_result.exit_code != 0:

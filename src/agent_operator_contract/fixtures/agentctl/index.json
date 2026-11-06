@@ -110,6 +110,34 @@
     "usage": {
       "classification": "rejection",
       "note": "Exit 2, usage: malformed argv, nothing stored."
+    },
+    "transport-125": {
+      "classification": "malformed_stdout",
+      "note": "Exit 125, Docker daemon error without an envelope: transport failure, ambiguous for a mutation."
+    },
+    "transport-126": {
+      "classification": "malformed_stdout",
+      "note": "Exit 126, Docker not executable without an envelope: transport failure, ambiguous for a mutation."
+    },
+    "transport-127": {
+      "classification": "malformed_stdout",
+      "note": "Exit 127, Docker not found without an envelope: transport failure, ambiguous for a mutation."
+    },
+    "malformed-empty": {
+      "classification": "malformed_stdout",
+      "note": "Empty stdout: not a valid envelope, classified by exit-code fallback, never parsed as success."
+    },
+    "malformed-truncated": {
+      "classification": "malformed_stdout",
+      "note": "Truncated stdout: not a valid envelope, classified by exit-code fallback, never parsed as success."
+    },
+    "malformed-non-json": {
+      "classification": "malformed_stdout",
+      "note": "Non-JSON stdout: not a valid envelope, classified by exit-code fallback, never parsed as success."
+    },
+    "contract-unknown-major": {
+      "classification": "malformed_stdout",
+      "note": "Envelope with an unknown contract major: not coherent for this consumer, never parsed as success."
     }
   }
 }

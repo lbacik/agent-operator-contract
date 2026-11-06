@@ -7,6 +7,12 @@ Intake and a request ID store on its state volume. Grammar, capability and
 value failures come from the shared part of the library; the stub then applies
 the rest of the section 4.1 order itself: ``--expect-repo``,
 ``payload_mismatch`` or replay, then state (``rejected``) and commit.
+
+A one-shot crash flag supports the producer suite's crash scenario: when a
+file named ``crash-between-commit-and-reply`` exists in the state directory,
+the next committed mutation is saved durably, the flag is removed, and the
+process kills itself before replying, so a retry with the same request ID
+replays the stored record.
 """
 
 from __future__ import annotations
@@ -14,6 +20,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import signal
 import sys
 from typing import Any
 
@@ -21,6 +28,9 @@ from agent_operator_contract import shared
 
 STATE_FILENAME = "agent-operator-contract.json"
 """State file name inside the state directory (durable Intake, command store)."""
+
+CRASH_FLAG_FILENAME = "crash-between-commit-and-reply"
+"""One-shot flag arming a crash between commit and reply (spec section 14)."""
 
 MAX_RECENT_COMMANDS = 20
 MAX_RECENT_EVENTS = 50
@@ -273,7 +283,29 @@ def _supersede(state: dict[str, Any], ref: dict[str, Any] | None) -> None:
     )
 
 
-def _do_stop(state: dict[str, Any], request_id: str, arguments: dict[str, Any]) -> int:
+def _crash_flag_path() -> str | None:
+    """Return the crash flag path, or None when there is no state directory."""
+    directory = os.environ.get("CONTRACT_STATE_DIR", "/data")
+    if not os.path.isdir(directory):
+        return None
+    return os.path.join(directory, CRASH_FLAG_FILENAME)
+
+
+def _consume_crash_flag() -> bool:
+    """Remove a one-shot crash flag; True when a crash was armed."""
+    path = _crash_flag_path()
+    if path is None:
+        return False
+    try:
+        os.remove(path)
+    except OSError:
+        return False
+    return True
+
+
+def _do_stop(
+    state: dict[str, Any], request_id: str, arguments: dict[str, Any]
+) -> tuple[int, str]:
     kind, payload = _mutation_payload("stop", arguments)
     if state.get("intake") == "closed":
         text, exit_code = shared.render_error(
@@ -281,8 +313,7 @@ def _do_stop(state: dict[str, Any], request_id: str, arguments: dict[str, Any]) 
             "intake is already closed",
             request_id=request_id,
         )
-        sys.stdout.write(text)
-        return exit_code
+        return exit_code, text
     if kind == "stop_after":
         _supersede(state, state.get("pending_stop"))
         _supersede(state, state.get("stop_plan"))
@@ -308,11 +339,10 @@ def _do_stop(state: dict[str, Any], request_id: str, arguments: dict[str, Any]) 
         state["stop_plan"] = None
         state["intake"] = "closed"
         record = _commit(state, request_id, kind, payload, "completed", "intake closed by operator")
-    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
-    return 0
+    return 0, shared.render_success({"command": record, "replayed": False})
 
 
-def _do_resume(state: dict[str, Any], request_id: str) -> int:
+def _do_resume(state: dict[str, Any], request_id: str) -> tuple[int, str]:
     if (
         state.get("intake") == "open"
         and state.get("pending_stop") is None
@@ -323,16 +353,14 @@ def _do_resume(state: dict[str, Any], request_id: str) -> int:
             "intake is already open",
             request_id=request_id,
         )
-        sys.stdout.write(text)
-        return exit_code
+        return exit_code, text
     _supersede(state, state.get("pending_stop"))
     _supersede(state, state.get("stop_plan"))
     state["pending_stop"] = None
     state["stop_plan"] = None
     state["intake"] = "open"
     record = _commit(state, request_id, "resume", {}, "completed", "intake reopened by operator")
-    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
-    return 0
+    return 0, shared.render_success({"command": record, "replayed": False})
 
 
 def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedCall) -> int:
@@ -367,9 +395,9 @@ def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedC
         sys.stdout.write(text)
         return exit_code
     if parsed.operation == "stop":
-        exit_code = _do_stop(state, parsed.request_id, parsed.arguments)
+        exit_code, text = _do_stop(state, parsed.request_id, parsed.arguments)
     elif parsed.operation == "resume":
-        exit_code = _do_resume(state, parsed.request_id)
+        exit_code, text = _do_resume(state, parsed.request_id)
     else:  # pragma: no cover - guarded by the advertised capabilities in practice.
         text, exit_code = shared.render_error(
             "internal",
@@ -381,6 +409,10 @@ def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedC
         return exit_code
     if exit_code == 0:
         _save_state(state, path)
+        if _consume_crash_flag():
+            # The commit is durable; die before replying so the retry replays it.
+            os.kill(os.getpid(), signal.SIGKILL)
+    sys.stdout.write(text)
     return exit_code
 
 

@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "stop",
+    "--request-id",
+    "req-malformed-nonjson",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 0,
+  "stdout": "not json at all\n",
+  "stderr": ""
+}

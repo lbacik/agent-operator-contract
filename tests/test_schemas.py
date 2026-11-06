@@ -138,8 +138,21 @@ def test_every_schema_file_on_disk_is_meta_validated() -> None:
     assert on_disk == sorted(documents.SCHEMA_NAMES)
 
 
+def _fixture_classification(name: str) -> str:
+    index = documents.load_fixture_index()
+    fixtures = index.get("fixtures")
+    assert isinstance(fixtures, dict)
+    entry = fixtures.get(name)
+    assert isinstance(entry, dict)
+    classification = entry.get("classification")
+    assert isinstance(classification, str)
+    return classification
+
+
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_positive_fixture_stdout_validates_against_envelope_schema(name: str) -> None:
+    if _fixture_classification(name) == "malformed_stdout":
+        pytest.skip("malformed stdout is not a valid envelope by design")
     doc = json.loads(documents.load_fixture(name)["stdout"])
 
     assert ENVELOPE_VALIDATOR.is_valid(doc), name
@@ -147,6 +160,8 @@ def test_positive_fixture_stdout_validates_against_envelope_schema(name: str) ->
 
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_identity_in_stdout_validates_against_identity_schema(name: str) -> None:
+    if _fixture_classification(name) == "malformed_stdout":
+        pytest.skip("malformed stdout carries no identity by design")
     doc = json.loads(documents.load_fixture(name)["stdout"])
     identities = _identities_in_stdout(doc)
 
@@ -169,6 +184,8 @@ def test_negative_example_rejected_by_library(name: str) -> None:
 
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_library_agrees_with_schema_on_positive_stdout(name: str) -> None:
+    if _fixture_classification(name) == "malformed_stdout":
+        pytest.skip("malformed stdout is rejected by design")
     doc = json.loads(documents.load_fixture(name)["stdout"])
 
     assert (documents.validate_envelope(doc) == []) == ENVELOPE_VALIDATOR.is_valid(doc)
@@ -176,6 +193,8 @@ def test_library_agrees_with_schema_on_positive_stdout(name: str) -> None:
 
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_library_agrees_with_schema_on_identity_in_stdout(name: str) -> None:
+    if _fixture_classification(name) == "malformed_stdout":
+        pytest.skip("malformed stdout carries no identity by design")
     doc = json.loads(documents.load_fixture(name)["stdout"])
 
     for identity in _identities_in_stdout(doc):
@@ -320,6 +339,8 @@ def test_schema_patterns_match_library(schema_name: str, path: list[str], patter
 
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_error_fixture_signals_match_error_table(name: str) -> None:
+    if _fixture_classification(name) == "malformed_stdout":
+        pytest.skip("malformed stdout has no error-code signal by design")
     fixture = documents.load_fixture(name)
     doc = json.loads(fixture["stdout"])
     table = documents.error_table()
@@ -357,6 +378,8 @@ def test_ls_schema_patterns_match_library() -> None:
 def _mutation_results() -> list[tuple[str, Any]]:
     pairs = []
     for name in FIXTURE_NAMES:
+        if _fixture_classification(name) == "malformed_stdout":
+            continue
         doc = json.loads(documents.load_fixture(name)["stdout"])
         if doc.get("ok") is True and isinstance(doc.get("result"), dict):
             result = doc["result"]
@@ -368,6 +391,8 @@ def _mutation_results() -> list[tuple[str, Any]]:
 def _command_results() -> list[tuple[str, Any]]:
     pairs = []
     for name in FIXTURE_NAMES:
+        if _fixture_classification(name) == "malformed_stdout":
+            continue
         doc = json.loads(documents.load_fixture(name)["stdout"])
         if doc.get("ok") is True and isinstance(doc.get("result"), dict):
             result = doc["result"]
@@ -442,6 +467,8 @@ def test_mutation_fixture_signals_match_mutation_schema() -> None:
 def _status_snapshots() -> list[tuple[str, Any]]:
     pairs = []
     for name in FIXTURE_NAMES:
+        if _fixture_classification(name) == "malformed_stdout":
+            continue
         doc = json.loads(documents.load_fixture(name)["stdout"])
         if doc.get("ok") is True and isinstance(doc.get("result"), dict):
             result = doc["result"]

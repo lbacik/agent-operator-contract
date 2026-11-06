@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "stop",
+    "--request-id",
+    "req-malformed-trunc",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 0,
+  "stdout": "{\"contract\":\"1.0\",\"ok\":true,\"result\":\n",
+  "stderr": ""
+}

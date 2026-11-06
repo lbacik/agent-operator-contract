@@ -80,6 +80,7 @@ class _FakeProducer:
         self.intake = "open"
         self.sequence = 1
         self.commands: dict[str, dict[str, Any]] = {}
+        self.crash_armed = False
 
     def _record(self, request_id: str, kind: str, acknowledgement: str) -> dict[str, Any]:
         record = {
@@ -195,6 +196,11 @@ class _FakeProducer:
             and argv[3] == "--request-id"
             and argv[5] == "--expect-repo"
         ):
+            if self.crash_armed:
+                # Commit durably, then die before replying like the stub does.
+                self.crash_armed = False
+                self._mutate(argv[2], argv[4], argv[6])
+                return producer_suite.DockerResult(137, "", "")
             return self._mutate(argv[2], argv[4], argv[6])
         if len(argv) == 4 and argv[:3] == ["--contract", "1", "command"]:
             stored = self.commands.get(argv[3])
@@ -230,8 +236,21 @@ def _fake_harness(
 @pytest.fixture
 def fakes(monkeypatch: pytest.MonkeyPatch) -> _FakeProducer:
     producer = _FakeProducer(CTX)
+
+    def harness(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        if verb == "crash":
+            if params.get("point") == "between-commit-and-reply":
+                producer.crash_armed = True
+                return producer_suite.HarnessResult("ok", {"point": "between-commit-and-reply"}, "")
+            return producer_suite.HarnessResult(
+                "unsupported", None, f"crash-point:{params.get('point')}"
+            )
+        return _fake_harness(cmd, verb, params, timeout)
+
     monkeypatch.setattr(producer_suite, "_docker_exec", producer.handle)
-    monkeypatch.setattr(producer_suite, "_call_harness", _fake_harness)
+    monkeypatch.setattr(producer_suite, "_call_harness", harness)
     return producer
 
 
@@ -248,6 +267,7 @@ def test_scenario_ids_are_stable() -> None:
         "payload-mismatch",
         "resume",
         "command-found",
+        "crash-between-commit-and-reply",
         "hold-lock",
     ]
 
@@ -270,6 +290,7 @@ def test_run_all_passes_with_hold_lock_not_run(fakes: _FakeProducer) -> None:
     assert by_id["payload-mismatch"].status == "passed"
     assert by_id["resume"].status == "passed"
     assert by_id["command-found"].status == "passed"
+    assert by_id["crash-between-commit-and-reply"].status == "passed"
     assert by_id["hold-lock"].status == "not_run"
 
 
@@ -326,6 +347,37 @@ def test_hold_lock_supported_passes(fakes: _FakeProducer, monkeypatch: pytest.Mo
     outcome = producer_suite.scenario_hold_lock(CTX, ["fake-harness"])
 
     assert outcome.status == "passed"
+
+
+def test_crash_scenario_is_not_run_when_harness_cannot_crash(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_crash(cmd: Any, verb: str, params: dict[str, Any], timeout: float) -> Any:
+        if verb == "crash":
+            return producer_suite.HarnessResult("unsupported", None, "crash-point:now")
+        return _fake_harness(cmd, verb, params, timeout)
+
+    monkeypatch.setattr(producer_suite, "_call_harness", no_crash)
+
+    outcome = producer_suite.scenario_crash_between_commit_and_reply(CTX, ["fake-harness"])
+
+    assert outcome.status == "not_run"
+
+
+def test_crash_scenario_fails_when_the_first_attempt_replies(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def claim_without_arming(cmd: Any, verb: str, params: dict[str, Any], timeout: float) -> Any:
+        if verb == "crash":
+            return producer_suite.HarnessResult("ok", {"point": "between-commit-and-reply"}, "")
+        return _fake_harness(cmd, verb, params, timeout)
+
+    monkeypatch.setattr(producer_suite, "_call_harness", claim_without_arming)
+
+    outcome = producer_suite.scenario_crash_between_commit_and_reply(CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "no reply" in outcome.detail
 
 
 def test_supported_but_broken_producer_fails_identity(
@@ -423,6 +475,7 @@ def test_main_reports_per_scenario_and_exits_zero(
     assert "PASS payload-mismatch" in out
     assert "PASS resume" in out
     assert "PASS command-found" in out
+    assert "PASS crash-between-commit-and-reply" in out
     assert "NOT RUN hold-lock" in out
 
 
@@ -460,12 +513,13 @@ def test_every_producer_reply_is_validated(
         return result
 
     monkeypatch.setattr(producer_suite, "_docker_exec", record)
-    monkeypatch.setattr(producer_suite, "_call_harness", _fake_harness)
 
     producer_suite.run_all(CTX, ["fake-harness"])
 
     assert seen
-    for stdout in seen:
+    # The crash attempt gets no reply by design; every other reply validates.
+    assert seen.count("") == 1
+    for stdout in [reply for reply in seen if reply]:
         assert stdout.endswith("\n")
         assert stdout.count("\n") == 1
         assert json.loads(stdout)

@@ -39,6 +39,8 @@ def test_fixture_matches_fixture_format(name: str) -> None:
 
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_fixture_stdout_is_one_json_document_and_a_newline(name: str) -> None:
+    if _fixture_index()[name]["classification"] == "malformed_stdout":
+        pytest.skip("malformed stdout is not one JSON document by design")
     stdout: str = _load_fixture(name)["stdout"]
 
     assert stdout.endswith("\n")
@@ -48,9 +50,41 @@ def test_fixture_stdout_is_one_json_document_and_a_newline(name: str) -> None:
 
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_positive_fixture_stdout_is_a_valid_envelope(name: str) -> None:
+    if _fixture_index()[name]["classification"] == "malformed_stdout":
+        pytest.skip("malformed stdout is not a valid envelope by design")
     doc = json.loads(_load_fixture(name)["stdout"])
 
     assert documents.validate_envelope(doc) == []
+
+
+@pytest.mark.parametrize("name", FIXTURE_NAMES)
+def test_malformed_fixture_stdout_is_never_a_coherent_envelope(name: str) -> None:
+    if _fixture_index()[name]["classification"] != "malformed_stdout":
+        pytest.skip("only malformed stdout fixtures")
+    fixture = _load_fixture(name)
+    stdout: str = fixture["stdout"]
+    exit_code: int = fixture["exit_code"]
+    try:
+        doc = json.loads(stdout)
+    except ValueError:
+        return
+    if not isinstance(doc, dict) or documents.validate_envelope(doc) != []:
+        return
+    contract = doc.get("contract")
+    major = documents.contract_major_of(contract)
+    assert major != "1", name
+    if doc.get("ok") is True:
+        # Never parsed as success: interpret must reject the incoherent reply.
+        from agent_operator_contract import client as _client
+
+        with pytest.raises(_client.ClientError):
+            _client.interpret(
+                _client.ExecResult(
+                    exit_code=exit_code,
+                    stdout=stdout.encode("utf-8"),
+                    stderr=b"",
+                )
+            )
 
 
 def test_fixture_index_covers_every_fixture() -> None:
