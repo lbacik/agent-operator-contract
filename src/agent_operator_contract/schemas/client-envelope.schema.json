@@ -33,6 +33,8 @@
             "client.docker_unavailable",
             "client.exec_failed",
             "client.malformed_stdout",
+            "client.contract_mismatch",
+            "client.unsupported_capability",
             "client.usage"
           ]
         },

@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "stop",
+    "--request-id",
+    "bad request id!",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 1,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"invalid_argument\",\"message\":\"invalid request ID: 'bad request id!'\",\"retryable\":false},\"ok\":false}\n",
+  "stderr": ""
+}

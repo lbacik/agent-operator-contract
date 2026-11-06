@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent operator contract mutation result",
+  "description": "The result document of a committed mutation (spec section 6.2): the stored CommandRecord (spec section 7.5) plus `replayed`, which is true when the request ID already existed with the identical payload and nothing new happened.",
+  "type": "object",
+  "required": ["command", "replayed"],
+  "properties": {
+    "command": {"$ref": "#/$defs/command_record"},
+    "replayed": {"type": "boolean"}
+  },
+  "$defs": {
+    "command_record": {
+      "type": "object",
+      "required": [
+        "request_id",
+        "sequence",
+        "kind",
+        "arguments",
+        "repository",
+        "acknowledgement",
+        "detail",
+        "created_at",
+        "updated_at"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "sequence": {"type": "integer", "minimum": 0},
+        "kind": {
+          "type": "string",
+          "enum": [
+            "stop",
+            "stop_after",
+            "resume",
+            "next_issue",
+            "handoff",
+            "recovery_retry",
+            "recovery_release",
+            "errors_reset"
+          ]
+        },
+        "arguments": {"type": "object"},
+        "repository": {"type": "string", "pattern": "^[^/\\s]+/[^/\\s]+$"},
+        "acknowledgement": {
+          "type": "string",
+          "enum": ["accepted", "completed", "superseded", "not_fulfilled"]
+        },
+        "detail": {"type": "string"},
+        "created_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+        },
+        "updated_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+        }
+      }
+    }
+  }
+}

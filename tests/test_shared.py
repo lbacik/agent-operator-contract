@@ -88,6 +88,19 @@ def test_error_document_marks_retryable_from_the_table() -> None:
         ("acme/widgets", "acme/widgets2", False),
     ],
 )
+def test_required_capability_maps_operations_to_the_spec_table() -> None:
+    assert shared.required_capability("stop", {}) is None
+    assert shared.required_capability("stop", {"after": "3"}) == "stop-after"
+    assert shared.required_capability("resume", {}) is None
+    assert shared.required_capability("next-issue", {}) == "next-issue"
+    assert shared.required_capability("handoff", {}) == "operator-handoff"
+    assert shared.required_capability("recovery-retry", {}) == "recovery-retry"
+    assert shared.required_capability("recovery-release", {}) == "recovery-release"
+    assert shared.required_capability("errors-reset", {}) == "errors-reset"
+    assert shared.required_capability("identity", {}) is None
+    assert shared.required_capability("command", {}) is None
+
+
 def test_repositories_match_is_case_insensitive(expected: str, actual: str, matches: bool) -> None:
     assert shared.repositories_match(expected, actual) is matches
 

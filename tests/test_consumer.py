@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -20,7 +21,7 @@ from typing import Any
 import pytest
 from jsonschema import Draft202012Validator
 
-from agent_operator_contract import documents
+from agent_operator_contract import client, documents
 
 REPO_ROOT = Path(__file__).parent.parent
 FAKE_DOCKER = REPO_ROOT / "tests" / "consumer" / "fake_docker"
@@ -228,6 +229,41 @@ STATUS_FIXTURES = [
 ]
 
 
+def _fixture_env(
+    consumer_env: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    names: list[str],
+    extra: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """A fixture dir with exactly the named recordings, plus inline extras.
+
+    Mutation tests need an ``identity`` recording (the precheck) next to the
+    mutation recording; ``extra`` maps a file stem to a fixture document that
+    is written inline for caller-chosen request IDs and repositories.
+    """
+    isolated = tmp_path / "isolated-fixtures"
+    isolated.mkdir(exist_ok=True)
+    for name in names:
+        (isolated / f"{name}.json").write_text(
+            (FIXTURES_DIR / f"{name}.json").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+    for stem, doc in (extra or {}).items():
+        (isolated / f"{stem}.json").write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
+    env = dict(consumer_env["env"])
+    env["FAKE_DOCKER_FIXTURES"] = str(isolated)
+    monkeypatch.setenv("FAKE_DOCKER_FIXTURES", str(isolated))
+    return env
+
+
+def _exec_argvs(recorded: list[dict[str, Any]]) -> list[list[str]]:
+    return [
+        entry["argv"][entry["argv"].index("/usr/local/bin/agentctl") + 1 :]
+        for entry in recorded
+        if entry["argv"][0] == "exec"
+    ]
+
+
 def _status_env(
     consumer_env: dict[str, Any],
     tmp_path: Path,
@@ -420,6 +456,195 @@ def test_ls_schema_patterns_match_library() -> None:
 
     assert item["name"]["pattern"] == documents.INSTANCE_NAME_PATTERN
     assert item["contract"]["pattern"] == documents.CONTRACT_MAJOR_PATTERN
+
+
+def _stop_fixture(request_id: str, sequence: int = 7) -> dict[str, Any]:
+    record = {
+        "acknowledgement": "accepted",
+        "arguments": {},
+        "created_at": "2026-11-06T09:12:03Z",
+        "detail": "finish the active attempt, then close intake",
+        "kind": "stop",
+        "repository": "example-owner/example-repo",
+        "request_id": request_id,
+        "sequence": sequence,
+        "updated_at": "2026-11-06T09:12:03Z",
+    }
+    stdout = json.dumps(
+        {"contract": "1.0", "ok": True, "result": {"command": record, "replayed": False}},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {
+        "argv": [
+            "--contract",
+            "1",
+            "stop",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        "exit_code": 0,
+        "stdout": stdout + "\n",
+        "stderr": "",
+    }
+
+
+@pytest.mark.parametrize("operation", ["stop", "resume"])
+def test_mutation_without_expect_repo_is_usage_and_sends_nothing(
+    consumer_env: dict[str, Any], operation: str
+) -> None:
+    env: dict[str, str] = consumer_env["env"]
+    completed = _run_agentfleet([operation, "web-1"], env)
+
+    assert completed.returncode == 2
+    doc = json.loads(completed.stdout.decode("utf-8"))
+    assert documents.validate_client_envelope(doc) == []
+    assert CLIENT_ENVELOPE_VALIDATOR.is_valid(doc)
+    assert doc["error"]["code"] == "client.usage"
+    recorded = _recorded(consumer_env)
+    assert not any(entry["argv"][0] == "exec" for entry in recorded)
+
+
+def test_stop_with_supplied_request_id_sends_exactly_that_id(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "req-C0FFEE01"
+    env = _fixture_env(
+        consumer_env,
+        tmp_path,
+        monkeypatch,
+        ["identity"],
+        {"stop-custom": _stop_fixture(request_id)},
+    )
+    completed = _run_agentfleet(
+        [
+            "stop",
+            "web-1",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            request_id,
+        ],
+        env,
+    )
+
+    assert completed.returncode == 0
+    assert request_id in completed.stdout.decode("utf-8")
+    exec_argvs = _exec_argvs(_recorded(consumer_env))
+    assert exec_argvs[0] == ["--contract", "1", "identity"]
+    assert exec_argvs[1] == [
+        "--contract",
+        "1",
+        "stop",
+        "--request-id",
+        request_id,
+        "--expect-repo",
+        "example-owner/example-repo",
+    ]
+
+
+def test_resume_with_supplied_request_id_replays_the_fixture(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, ["identity", "resume-accepted"])
+    request_id = "req-4d5e6f7a8b9c"
+    completed = _run_agentfleet(
+        [
+            "resume",
+            "web-1",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            request_id,
+        ],
+        env,
+    )
+
+    assert completed.returncode == 0
+    assert request_id in completed.stdout.decode("utf-8")
+    exec_argvs = _exec_argvs(_recorded(consumer_env))
+    assert exec_argvs[0] == ["--contract", "1", "identity"]
+    assert exec_argvs[1] == [
+        "--contract",
+        "1",
+        "resume",
+        "--request-id",
+        request_id,
+        "--expect-repo",
+        "example-owner/example-repo",
+    ]
+
+
+def test_mutation_never_sent_when_contract_major_mismatches(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mismatch = dict(
+        json.loads((FIXTURES_DIR / "contract-mismatch.json").read_text(encoding="utf-8"))
+    )
+    mismatch["argv"] = ["--contract", "1", "identity"]
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, [], {"identity": mismatch})
+    completed = _run_agentfleet(
+        ["stop", "web-1", "--expect-repo", "example-owner/example-repo"],
+        env,
+    )
+
+    assert completed.returncode == 4
+    exec_argvs = _exec_argvs(_recorded(consumer_env))
+    assert exec_argvs == [["--contract", "1", "identity"]]
+
+
+def test_command_read_replays_the_fixture(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, ["command-found"])
+    completed = _run_agentfleet(["command", "web-1", "req-3f1c9a2b7d10", "--json"], env)
+    fixture = json.loads((FIXTURES_DIR / "command-found.json").read_text(encoding="utf-8"))
+
+    assert completed.returncode == fixture["exit_code"]
+    assert completed.stdout.decode("utf-8") == fixture["stdout"]
+    assert _exec_argvs(_recorded(consumer_env)) == [fixture["argv"]]
+
+
+def test_command_unknown_id_reports_not_found(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, ["command-not-found"])
+    completed = _run_agentfleet(["command", "web-1", "req-000000000000"], env)
+
+    assert completed.returncode == 5
+    assert "not_found" in completed.stderr.decode("utf-8")
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "command", "req-000000000000"]
+    ]
+
+
+def test_new_request_id_matches_the_contract_pattern() -> None:
+    seen = {client.new_request_id() for _ in range(50)}
+
+    assert len(seen) == 50
+    for request_id in seen:
+        assert re.search(documents.REQUEST_ID_PATTERN, request_id) is not None, request_id
+
+
+def test_mutation_precheck_allows_core_refuses_major_and_capability() -> None:
+    identity: dict[str, Any] = json.loads(
+        json.loads((FIXTURES_DIR / "identity.json").read_text(encoding="utf-8"))["stdout"]
+    )["result"]
+
+    client.ensure_mutation_allowed(identity, None)
+
+    wrong_major = {**identity, "contract": {"major": 2, "minor": 0}}
+    with pytest.raises(client.ClientError) as major_info:
+        client.ensure_mutation_allowed(wrong_major, None)
+    assert major_info.value.code == "client.contract_mismatch"
+    assert major_info.value.exit_code == 4
+
+    with pytest.raises(client.ClientError) as capability_info:
+        client.ensure_mutation_allowed(identity, "operator-handoff")
+    assert capability_info.value.code == "client.unsupported_capability"
+    assert capability_info.value.exit_code == 3
 
 
 def test_fake_and_fixtures_usable_from_checkout_without_imports(

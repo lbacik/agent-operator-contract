@@ -322,6 +322,90 @@ def test_classify_malformed_stdout(fixture: object) -> None:
     assert documents.classify_fixture(fixture) == "malformed_stdout"
 
 
+def _command_record() -> dict[str, object]:
+    return {
+        "request_id": "req-3f1c9a2b7d10",
+        "sequence": 7,
+        "kind": "stop",
+        "arguments": {},
+        "repository": "acme/widgets",
+        "acknowledgement": "accepted",
+        "detail": "finish the active attempt, then close intake",
+        "created_at": "2026-11-06T09:12:03Z",
+        "updated_at": "2026-11-06T09:12:03Z",
+    }
+
+
+def test_validate_command_record_accepts_a_stop_record() -> None:
+    assert documents.validate_command_record(_command_record()) == []
+
+
+def test_validate_command_record_rejects_bad_enums_and_shapes() -> None:
+    assert documents.validate_command_record(None) != []
+    assert documents.validate_command_record({}) != []
+
+    bad_kind = _command_record()
+    bad_kind["kind"] = "halt"
+    assert documents.validate_command_record(bad_kind) != []
+
+    bad_ack = _command_record()
+    bad_ack["acknowledgement"] = "done"
+    assert documents.validate_command_record(bad_ack) != []
+
+    bad_id = _command_record()
+    bad_id["request_id"] = "bad id!"
+    assert documents.validate_command_record(bad_id) != []
+
+    bad_sequence = _command_record()
+    bad_sequence["sequence"] = -1
+    assert documents.validate_command_record(bad_sequence) != []
+
+
+def test_command_kind_and_acknowledgement_enums_match_the_spec() -> None:
+    assert documents.COMMAND_KINDS == (
+        "stop",
+        "stop_after",
+        "resume",
+        "next_issue",
+        "handoff",
+        "recovery_retry",
+        "recovery_release",
+        "errors_reset",
+    )
+    assert documents.ACKNOWLEDGEMENTS == (
+        "accepted",
+        "completed",
+        "superseded",
+        "not_fulfilled",
+    )
+
+
+def test_validate_command_ref_accepts_a_reference() -> None:
+    assert documents.validate_command_ref({"request_id": "req-3f1c9a2b7d10", "sequence": 7}) == []
+    assert documents.validate_command_ref({}) != []
+    assert documents.validate_command_ref({"request_id": "bad id!", "sequence": 7}) != []
+
+
+def test_validate_command_result_accepts_a_command_read() -> None:
+    assert documents.validate_command_result({"command": _command_record()}) == []
+    assert documents.validate_command_result({}) != []
+    assert documents.validate_command_result({"command": {}}) != []
+
+
+def test_validate_mutation_result_accepts_a_commit_and_rejects_shape_mistakes() -> None:
+    assert (
+        documents.validate_mutation_result({"command": _command_record(), "replayed": False}) == []
+    )
+    assert (
+        documents.validate_mutation_result({"command": _command_record(), "replayed": True}) == []
+    )
+    assert documents.validate_mutation_result({"command": _command_record()}) != []
+    assert (
+        documents.validate_mutation_result({"command": _command_record(), "replayed": "no"}) != []
+    )
+    assert documents.validate_mutation_result({"replayed": False}) != []
+
+
 def test_resource_loaders_expose_package_data() -> None:
     assert set(documents.SCHEMA_NAMES) == {
         "envelope",
@@ -334,6 +418,8 @@ def test_resource_loaders_expose_package_data() -> None:
         "ls",
         "status",
         "figure",
+        "command",
+        "mutation-result",
     }
     for name in documents.SCHEMA_NAMES:
         schema = documents.load_schema(name)

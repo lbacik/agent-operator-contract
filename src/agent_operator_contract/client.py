@@ -19,8 +19,10 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import subprocess
 from dataclasses import dataclass
+from typing import Any
 
 from agent_operator_contract import CONTRACT_MAJOR, documents
 
@@ -36,6 +38,45 @@ DOCKER_ENV_VAR = "AGENTFLEET_DOCKER"
 DEFAULT_TIMEOUT = 10.0
 
 CLIENT_CONTRACT = f"{CONTRACT_MAJOR}.0"
+
+MUTATION_TIMEOUT = 15.0
+"""Default consumer timeout for mutations (spec section 3.3)."""
+
+
+def new_request_id() -> str:
+    """Generate a mutation request ID before submission (spec section 6.2).
+
+    The ID comes from a cryptographically secure source and matches the
+    ``^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`` pattern. A caller-supplied ID
+    passes through untouched instead: only generated IDs come from here.
+    """
+    return f"req-{secrets.token_hex(8)}"
+
+
+def ensure_mutation_allowed(identity: dict[str, Any], capability: str | None) -> None:
+    """Refuse a mutation locally when the identity forbids it (spec section 5).
+
+    ``identity`` is the ``result`` of an ``ok:true`` identity reply. Raises
+    :class:`ClientError` without touching the instance further when the
+    reported contract major is not ours (``client.contract_mismatch``) or when
+    the required capability is not advertised
+    (``client.unsupported_capability``).
+    """
+    contract = identity.get("contract")
+    major = contract.get("major") if isinstance(contract, dict) else None
+    if major != CONTRACT_MAJOR:
+        raise ClientError(
+            "client.contract_mismatch",
+            f"instance speaks contract major {major!r}, this client speaks {CONTRACT_MAJOR}",
+        )
+    if capability is not None:
+        capabilities = identity.get("capabilities")
+        advertised = set(capabilities) if isinstance(capabilities, list) else set()
+        if capability not in advertised:
+            raise ClientError(
+                "client.unsupported_capability",
+                f"instance does not advertise {capability!r}; refusing the mutation",
+            )
 
 
 @dataclass(frozen=True)

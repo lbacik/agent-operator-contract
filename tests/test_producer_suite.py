@@ -2,7 +2,9 @@
 
 The docker and harness seams are faked through monkeypatching, so these
 tests cover the suite's own logic: scenario checks, the not-run path for an
-unsupported harness verb, and the expected-failures list.
+unsupported harness verb, and the expected-failures list. The docker fake is a
+small in-memory producer that mirrors the contract's mutation semantics
+(repository guard, idempotency, state) so the mutation scenarios run green.
 """
 
 import json
@@ -29,29 +31,6 @@ IDENTITY = {
     "capabilities": ["next-issue", "stop-after"],
 }
 
-STATUS: dict[str, Any] = {
-    "generated_at": "2026-11-06T09:12:05Z",
-    "identity": IDENTITY,
-    "instance": {
-        "state": "idle",
-        "startup_check": None,
-        "last_halt": None,
-        "observed_at": "2026-11-06T09:12:05Z",
-    },
-    "intake": {
-        "state": "open",
-        "pending_stop": None,
-        "stop_plan": None,
-        "priority": None,
-        "observed_at": "2026-11-06T09:12:05Z",
-    },
-    "current_attempt": None,
-    "last_finished": None,
-    "recent_commands": [],
-    "recent_events": [],
-    "truncated": False,
-}
-
 
 def _ok(result: dict[str, Any]) -> str:
     return shared.render_success(result)
@@ -68,22 +47,159 @@ def _fail(code: str, details: Any = None) -> str:
     return shared.render_document(doc)
 
 
-def _fake_docker(
-    docker: str, container: str, exec_user: str, argv: list[str], timeout: float
-) -> producer_suite.DockerResult:
-    if argv == ["--contract", "1", "identity"]:
-        return producer_suite.DockerResult(0, _ok(IDENTITY), "")
-    if argv == ["--contract", "1", "status"]:
-        return producer_suite.DockerResult(0, _ok(STATUS), "")
-    if argv == ["--contract", "1", "stop", "--after"]:
-        return producer_suite.DockerResult(2, _fail("usage"), "")
-    if argv == ["--contract", "2", "status"]:
-        return producer_suite.DockerResult(4, _fail("contract_mismatch", {"supported": [1]}), "")
-    if argv[:3] == ["--contract", "1", "handoff"]:
-        return producer_suite.DockerResult(
-            3, _fail("unsupported", {"capability": "operator-handoff"}), ""
+def _fail_with_request(code: str, request_id: str, details: Any = None) -> str:
+    doc: dict[str, Any] = {
+        "contract": "1.0",
+        "ok": False,
+        "error": {
+            "code": code,
+            "message": "stub",
+            "retryable": False,
+            "request_id": request_id,
+        },
+    }
+    if details is not None:
+        doc["error"]["details"] = details
+    return shared.render_document(doc)
+
+
+TIMESTAMP = "2026-11-06T09:12:03Z"
+
+
+class _FakeProducer:
+    """A minimal in-memory producer for the suite's own tests.
+
+    Serves ``identity`` and ``status`` from canned documents and ``stop``,
+    ``resume`` and ``command`` with the contract's mutation semantics: the
+    ``--expect-repo`` guard, idempotent replay, ``payload_mismatch`` and the
+    ``rejected`` state guard. Anything else answers as the fixed seams below.
+    """
+
+    def __init__(self, ctx: producer_suite.SuiteContext) -> None:
+        self._ctx = ctx
+        self.intake = "open"
+        self.sequence = 1
+        self.commands: dict[str, dict[str, Any]] = {}
+
+    def _record(self, request_id: str, kind: str, acknowledgement: str) -> dict[str, Any]:
+        record = {
+            "request_id": request_id,
+            "sequence": self.sequence,
+            "kind": kind,
+            "arguments": {},
+            "repository": self._ctx.repository,
+            "acknowledgement": acknowledgement,
+            "detail": f"{kind} {acknowledgement}",
+            "created_at": TIMESTAMP,
+            "updated_at": TIMESTAMP,
+        }
+        self.commands[request_id] = {"kind": kind, "arguments": {}, "record": record}
+        self.sequence += 1
+        return record
+
+    def _status_doc(self) -> dict[str, Any]:
+        identity = dict(IDENTITY)
+        records = sorted(
+            (entry["record"] for entry in self.commands.values()),
+            key=lambda record: record["sequence"],
         )
-    raise AssertionError(f"unexpected agentctl argv: {argv!r}")
+        return {
+            "generated_at": "2026-11-06T09:12:05Z",
+            "identity": identity,
+            "instance": {
+                "state": "idle" if self.intake == "open" else "paused",
+                "startup_check": None,
+                "last_halt": None,
+                "observed_at": "2026-11-06T09:12:05Z",
+            },
+            "intake": {
+                "state": self.intake,
+                "pending_stop": None,
+                "stop_plan": None,
+                "priority": None,
+                "observed_at": "2026-11-06T09:12:05Z",
+            },
+            "current_attempt": None,
+            "last_finished": None,
+            "recent_commands": records[-20:],
+            "recent_events": [],
+            "truncated": False,
+        }
+
+    def _mutate(self, operation: str, request_id: str, expect_repo: str) -> Any:
+        if expect_repo.lower() != self._ctx.repository.lower():
+            return producer_suite.DockerResult(
+                1,
+                _fail_with_request(
+                    "repository_mismatch",
+                    request_id,
+                    {"repository": self._ctx.repository},
+                ),
+                "",
+            )
+        stored = self.commands.get(request_id)
+        if stored is not None:
+            if stored["kind"] == operation and stored["arguments"] == {}:
+                return producer_suite.DockerResult(
+                    0,
+                    _ok({"command": stored["record"], "replayed": True}),
+                    "",
+                )
+            return producer_suite.DockerResult(
+                1, _fail_with_request("payload_mismatch", request_id), ""
+            )
+        if operation == "stop":
+            if self.intake == "closed":
+                return producer_suite.DockerResult(
+                    1, _fail_with_request("rejected", request_id), ""
+                )
+            self.intake = "closed"
+            record = self._record(request_id, "stop", "completed")
+        else:
+            if self.intake == "open":
+                return producer_suite.DockerResult(
+                    1, _fail_with_request("rejected", request_id), ""
+                )
+            self.intake = "open"
+            record = self._record(request_id, "resume", "completed")
+        return producer_suite.DockerResult(0, _ok({"command": record, "replayed": False}), "")
+
+    def handle(
+        self,
+        docker: str,
+        container: str,
+        exec_user: str,
+        argv: list[str],
+        timeout: float,
+    ) -> producer_suite.DockerResult:
+        if argv == ["--contract", "1", "identity"]:
+            return producer_suite.DockerResult(0, _ok(IDENTITY), "")
+        if argv == ["--contract", "1", "status"]:
+            return producer_suite.DockerResult(0, _ok(self._status_doc()), "")
+        if argv == ["--contract", "1", "stop", "--after"]:
+            return producer_suite.DockerResult(2, _fail("usage"), "")
+        if argv == ["--contract", "2", "status"]:
+            return producer_suite.DockerResult(
+                4, _fail("contract_mismatch", {"supported": [1]}), ""
+            )
+        if argv[:3] == ["--contract", "1", "handoff"]:
+            return producer_suite.DockerResult(
+                3, _fail("unsupported", {"capability": "operator-handoff"}), ""
+            )
+        if (
+            len(argv) == 7
+            and argv[:3] == ["--contract", "1", argv[2]]
+            and argv[2] in ("stop", "resume")
+            and argv[3] == "--request-id"
+            and argv[5] == "--expect-repo"
+        ):
+            return self._mutate(argv[2], argv[4], argv[6])
+        if len(argv) == 4 and argv[:3] == ["--contract", "1", "command"]:
+            stored = self.commands.get(argv[3])
+            if stored is None:
+                return producer_suite.DockerResult(1, _fail("not_found"), "")
+            return producer_suite.DockerResult(0, _ok({"command": stored["record"]}), "")
+        raise AssertionError(f"unexpected agentctl argv: {argv!r}")
 
 
 def _fake_harness(
@@ -110,9 +226,11 @@ def _fake_harness(
 
 
 @pytest.fixture
-def fakes(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(producer_suite, "_docker_exec", _fake_docker)
+def fakes(monkeypatch: pytest.MonkeyPatch) -> _FakeProducer:
+    producer = _FakeProducer(CTX)
+    monkeypatch.setattr(producer_suite, "_docker_exec", producer.handle)
     monkeypatch.setattr(producer_suite, "_call_harness", _fake_harness)
+    return producer
 
 
 def test_scenario_ids_are_stable() -> None:
@@ -122,23 +240,80 @@ def test_scenario_ids_are_stable() -> None:
         "argv-usage",
         "contract-mismatch",
         "unsupported-capability",
+        "command-not-found",
+        "repository-mismatch",
+        "stop-replay",
+        "payload-mismatch",
+        "resume",
+        "command-found",
         "hold-lock",
     ]
 
 
-def test_run_all_passes_with_hold_lock_not_run(fakes: None) -> None:
+def test_run_all_passes_with_hold_lock_not_run(fakes: _FakeProducer) -> None:
     outcomes = producer_suite.run_all(CTX, ["fake-harness"])
     by_id = {outcome.scenario_id: outcome for outcome in outcomes}
 
+    assert [outcome.scenario_id for outcome in outcomes] == producer_suite.scenario_ids()
+    for outcome in outcomes:
+        assert outcome.status in ("passed", "not_run"), (outcome.scenario_id, outcome.detail)
     assert by_id["identity"].status == "passed"
     assert by_id["status"].status == "passed"
     assert by_id["argv-usage"].status == "passed"
     assert by_id["contract-mismatch"].status == "passed"
     assert by_id["unsupported-capability"].status == "passed"
+    assert by_id["command-not-found"].status == "passed"
+    assert by_id["repository-mismatch"].status == "passed"
+    assert by_id["stop-replay"].status == "passed"
+    assert by_id["payload-mismatch"].status == "passed"
+    assert by_id["resume"].status == "passed"
+    assert by_id["command-found"].status == "passed"
     assert by_id["hold-lock"].status == "not_run"
 
 
-def test_hold_lock_supported_passes(fakes: None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_mutation_scenarios_fail_when_replay_changes_the_record(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_handle = fakes.handle
+
+    def replay_changes_record(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        result = real_handle(docker, container, exec_user, argv, timeout)
+        if argv[:2] == ["--contract", "1"] and argv[2:3] == ["stop"] and result.exit_code == 0:
+            doc = json.loads(result.stdout)
+            if doc["result"].get("replayed") is True:
+                doc["result"]["command"]["sequence"] += 100
+                return producer_suite.DockerResult(0, shared.render_document(doc), result.stderr)
+        return result
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", replay_changes_record)
+
+    assert producer_suite.scenario_stop_replay(CTX).status == "failed"
+
+
+def test_mutation_scenarios_fail_when_a_rejection_stores(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_handle = fakes.handle
+
+    def rejection_stores(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        result = real_handle(docker, container, exec_user, argv, timeout)
+        if result.exit_code == 1 and len(argv) == 4 and argv[2] == "command":
+            stored = fakes.commands.get(argv[3])
+            if stored is None:
+                record = fakes._record(argv[3], "stop", "completed")
+                return producer_suite.DockerResult(0, _ok({"command": record}), "")
+        return result
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", rejection_stores)
+
+    assert producer_suite.scenario_repository_mismatch(CTX).status == "failed"
+
+
+def test_hold_lock_supported_passes(fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch) -> None:
     def hold_ok(cmd: Any, verb: str, params: dict[str, Any], timeout: float) -> Any:
         if verb == "hold-lock":
             return producer_suite.HarnessResult("ok", {"point": "x", "held_ms": 100}, "")
@@ -175,6 +350,19 @@ def test_supported_but_broken_producer_fails_status(
     monkeypatch.setattr(producer_suite, "_docker_exec", broken)
 
     assert producer_suite.scenario_status(CTX).status == "failed"
+
+
+def test_supported_but_broken_producer_fails_stop_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        return producer_suite.DockerResult(0, "not json\n", "")
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", broken)
+
+    assert producer_suite.scenario_stop_replay(CTX).status == "failed"
 
 
 def test_apply_expect_fail_listing_a_failure_keeps_the_run_green() -> None:
@@ -217,7 +405,7 @@ def test_apply_expect_fail_with_an_unknown_id_fails_the_run() -> None:
 
 
 def test_main_reports_per_scenario_and_exits_zero(
-    fakes: None, capsys: pytest.CaptureFixture[str]
+    fakes: _FakeProducer, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert producer_suite.main(["--harness", "fake-harness"]) == 0
 
@@ -227,11 +415,17 @@ def test_main_reports_per_scenario_and_exits_zero(
     assert "PASS argv-usage" in out
     assert "PASS contract-mismatch" in out
     assert "PASS unsupported-capability" in out
+    assert "PASS command-not-found" in out
+    assert "PASS repository-mismatch" in out
+    assert "PASS stop-replay" in out
+    assert "PASS payload-mismatch" in out
+    assert "PASS resume" in out
+    assert "PASS command-found" in out
     assert "NOT RUN hold-lock" in out
 
 
 def test_main_with_expect_fail_for_a_not_run_fails(
-    fakes: None, capsys: pytest.CaptureFixture[str]
+    fakes: _FakeProducer, capsys: pytest.CaptureFixture[str]
 ) -> None:
     assert producer_suite.main(["--harness", "fake-harness", "--expect-fail", "hold-lock"]) == 1
 
@@ -250,13 +444,16 @@ def test_main_fails_when_setup_fails(
     assert "FAIL setup" in capsys.readouterr().out
 
 
-def test_every_producer_reply_is_validated(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_every_producer_reply_is_validated(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
     seen: list[str] = []
+    real_handle = fakes.handle
 
     def record(
         docker: str, container: str, exec_user: str, argv: list[str], timeout: float
     ) -> producer_suite.DockerResult:
-        result = _fake_docker(docker, container, exec_user, argv, timeout)
+        result = real_handle(docker, container, exec_user, argv, timeout)
         seen.append(result.stdout)
         return result
 

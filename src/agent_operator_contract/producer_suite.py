@@ -275,6 +275,114 @@ def _new_request_id() -> str:
     return f"req-{secrets.token_hex(8)}"
 
 
+def _check_mutation(stdout: str, exit_code: int, *, replayed: bool) -> list[str]:
+    """Check a committed mutation reply: envelope, result shape and replay flag."""
+    problems = _producer_problems(stdout, exit_code)
+    if problems:
+        return problems
+    doc = json.loads(stdout)
+    if doc.get("ok") is not True:
+        return [f"mutation answered ok:false: {stdout.strip()}"]
+    result = doc.get("result")
+    if not isinstance(result, dict):
+        return ["mutation result must be an object"]
+    problems = documents.validate_mutation_result(result)
+    if problems:
+        return problems
+    if result.get("replayed") is not replayed:
+        return [f"replayed is {result.get('replayed')!r}, expected {replayed!r}"]
+    return []
+
+
+def _check_command(
+    stdout: str,
+    exit_code: int,
+    *,
+    request_id: str | None = None,
+    kind: str | None = None,
+) -> list[str]:
+    """Check a ``command`` read reply: envelope, record shape and identity."""
+    problems = _producer_problems(stdout, exit_code)
+    if problems:
+        return problems
+    doc = json.loads(stdout)
+    if doc.get("ok") is not True:
+        return [f"command answered ok:false: {stdout.strip()}"]
+    result = doc.get("result")
+    if not isinstance(result, dict):
+        return ["command result must be an object"]
+    problems = documents.validate_command_result(result)
+    if problems:
+        return problems
+    record = result.get("command")
+    assert isinstance(record, dict)
+    if request_id is not None and record.get("request_id") != request_id:
+        return [f"command request_id is {record.get('request_id')!r}, expected {request_id!r}"]
+    if kind is not None and record.get("kind") != kind:
+        return [f"command kind is {record.get('kind')!r}, expected {kind!r}"]
+    return []
+
+
+def _check_error_request(stdout: str, exit_code: int, code: str, request_id: str) -> list[str]:
+    """Check an ``ok:false`` mutation reply and its echoed request ID."""
+    problems = _check_error(stdout, exit_code, code)
+    if problems:
+        return problems
+    doc = json.loads(stdout)
+    if doc["error"].get("request_id") != request_id:
+        return [f"error request_id is {doc['error'].get('request_id')!r}, expected {request_id!r}"]
+    return []
+
+
+def _intake_state(ctx: SuiteContext, scenario_id: str) -> tuple[str | None, ScenarioOutcome | None]:
+    """Read the current Intake state, or a failed outcome when unreadable."""
+    answered = _exec(scenario_id, ["--contract", "1", "status"], ctx)
+    if isinstance(answered, ScenarioOutcome):
+        return None, answered
+    problems = _check_status(answered.stdout, answered.exit_code, ctx)
+    if problems:
+        return None, ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    doc = json.loads(answered.stdout)
+    return str(doc["result"]["intake"]["state"]), None
+
+
+def _ensure_intake(ctx: SuiteContext, scenario_id: str, want: str) -> ScenarioOutcome | None:
+    """Steer Intake to ``want`` (``open`` or ``closed``) for one scenario.
+
+    Each mutation scenario sets its own precondition through the contract
+    itself, so scenarios stay independent of the order they run in.
+    """
+    state, outcome = _intake_state(ctx, scenario_id)
+    if outcome is not None:
+        return outcome
+    if state == want:
+        return None
+    operation = "resume" if want == "open" else "stop"
+    answered = _exec(
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            operation,
+            "--request-id",
+            _new_request_id(),
+            "--expect-repo",
+            ctx.repository,
+        ],
+        ctx,
+    )
+    if isinstance(answered, ScenarioOutcome):
+        return answered
+    problems = _check_mutation(answered.stdout, answered.exit_code, replayed=False)
+    if problems:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"could not steer intake {state} -> {want}: {'; '.join(problems)}",
+        )
+    return None
+
+
 def scenario_identity(ctx: SuiteContext) -> ScenarioOutcome:
     """Online ``identity`` matches the harness setup."""
     answered = _exec("identity", ["--contract", "1", "identity"], ctx)
@@ -378,12 +486,279 @@ def scenario_hold_lock(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Scenari
     return ScenarioOutcome("hold-lock", "passed")
 
 
+def scenario_command_not_found(ctx: SuiteContext) -> ScenarioOutcome:
+    """``command`` of an unknown request ID answers ``not_found``."""
+    scenario_id = "command-not-found"
+    answered = _exec(scenario_id, ["--contract", "1", "command", _new_request_id()], ctx)
+    if isinstance(answered, ScenarioOutcome):
+        return answered
+    problems = _check_error(answered.stdout, answered.exit_code, "not_found")
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_repository_mismatch(ctx: SuiteContext) -> ScenarioOutcome:
+    """A wrong ``--expect-repo`` on any mutation is rejected and stores nothing."""
+    scenario_id = "repository-mismatch"
+    wrong = f"{ctx.repository}-wrong"
+    for operation in ("stop", "resume"):
+        request_id = _new_request_id()
+        answered = _exec(
+            scenario_id,
+            [
+                "--contract",
+                "1",
+                operation,
+                "--request-id",
+                request_id,
+                "--expect-repo",
+                wrong,
+            ],
+            ctx,
+        )
+        if isinstance(answered, ScenarioOutcome):
+            return answered
+        problems = _check_error_request(
+            answered.stdout, answered.exit_code, "repository_mismatch", request_id
+        )
+        if problems:
+            return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+        try:
+            doc = json.loads(answered.stdout)
+        except ValueError:
+            return ScenarioOutcome(scenario_id, "failed", "repository_mismatch is not JSON")
+        if doc["error"].get("details", {}).get("repository") != ctx.repository:
+            return ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"details.repository is not {ctx.repository!r}: {answered.stdout.strip()}",
+            )
+        stored = _exec(scenario_id, ["--contract", "1", "command", request_id], ctx)
+        if isinstance(stored, ScenarioOutcome):
+            return stored
+        nothing = _check_error(stored.stdout, stored.exit_code, "not_found")
+        if nothing:
+            return ScenarioOutcome(
+                scenario_id, "failed", f"rejected {operation} stored {request_id}"
+            )
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_stop_replay(ctx: SuiteContext) -> ScenarioOutcome:
+    """An identical resend replays the stored record with ``replayed: true``."""
+    scenario_id = "stop-replay"
+    steer = _ensure_intake(ctx, scenario_id, "open")
+    if steer is not None:
+        return steer
+    request_id = _new_request_id()
+    argv = [
+        "--contract",
+        "1",
+        "stop",
+        "--request-id",
+        request_id,
+        "--expect-repo",
+        ctx.repository,
+    ]
+    first = _exec(scenario_id, argv, ctx)
+    if isinstance(first, ScenarioOutcome):
+        return first
+    problems = _check_mutation(first.stdout, first.exit_code, replayed=False)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    committed = json.loads(first.stdout)["result"]["command"]
+    if committed.get("kind") != "stop" or committed.get("request_id") != request_id:
+        return ScenarioOutcome(
+            scenario_id, "failed", f"committed record is not this stop: {first.stdout.strip()}"
+        )
+    second = _exec(scenario_id, argv, ctx)
+    if isinstance(second, ScenarioOutcome):
+        return second
+    problems = _check_mutation(second.stdout, second.exit_code, replayed=True)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    replayed_record = json.loads(second.stdout)["result"]["command"]
+    if replayed_record != committed:
+        return ScenarioOutcome(scenario_id, "failed", "the replay changed the stored record")
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_payload_mismatch(ctx: SuiteContext) -> ScenarioOutcome:
+    """The same request ID with a different payload is rejected; nothing stored."""
+    scenario_id = "payload-mismatch"
+    steer = _ensure_intake(ctx, scenario_id, "open")
+    if steer is not None:
+        return steer
+    request_id = _new_request_id()
+    committed = _exec(
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "stop",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        ctx,
+    )
+    if isinstance(committed, ScenarioOutcome):
+        return committed
+    problems = _check_mutation(committed.stdout, committed.exit_code, replayed=False)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    record = json.loads(committed.stdout)["result"]["command"]
+    different = _exec(
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "resume",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        ctx,
+    )
+    if isinstance(different, ScenarioOutcome):
+        return different
+    problems = _check_error_request(
+        different.stdout, different.exit_code, "payload_mismatch", request_id
+    )
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    stored = _exec(scenario_id, ["--contract", "1", "command", request_id], ctx)
+    if isinstance(stored, ScenarioOutcome):
+        return stored
+    problems = _check_command(stored.stdout, stored.exit_code, request_id=request_id, kind="stop")
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    if json.loads(stored.stdout)["result"]["command"] != record:
+        return ScenarioOutcome(scenario_id, "failed", "the mismatched payload changed the record")
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_resume(ctx: SuiteContext) -> ScenarioOutcome:
+    """``resume`` reopens closed Intake; a second ``resume`` is ``rejected``."""
+    scenario_id = "resume"
+    steer = _ensure_intake(ctx, scenario_id, "closed")
+    if steer is not None:
+        return steer
+    request_id = _new_request_id()
+    reopened = _exec(
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "resume",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        ctx,
+    )
+    if isinstance(reopened, ScenarioOutcome):
+        return reopened
+    problems = _check_mutation(reopened.stdout, reopened.exit_code, replayed=False)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    record = json.loads(reopened.stdout)["result"]["command"]
+    if record.get("kind") != "resume" or record.get("request_id") != request_id:
+        return ScenarioOutcome(
+            scenario_id, "failed", f"committed record is not this resume: {reopened.stdout.strip()}"
+        )
+    state, outcome = _intake_state(ctx, scenario_id)
+    if outcome is not None:
+        return outcome
+    if state != "open":
+        return ScenarioOutcome(scenario_id, "failed", f"intake is {state!r} after resume")
+    refused_id = _new_request_id()
+    refused = _exec(
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "resume",
+            "--request-id",
+            refused_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        ctx,
+    )
+    if isinstance(refused, ScenarioOutcome):
+        return refused
+    problems = _check_error_request(refused.stdout, refused.exit_code, "rejected", refused_id)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    stored = _exec(scenario_id, ["--contract", "1", "command", refused_id], ctx)
+    if isinstance(stored, ScenarioOutcome):
+        return stored
+    nothing = _check_error(stored.stdout, stored.exit_code, "not_found")
+    if nothing:
+        return ScenarioOutcome(scenario_id, "failed", f"rejected resume stored {refused_id}")
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_command_found(ctx: SuiteContext) -> ScenarioOutcome:
+    """``command`` of a known request ID returns the stored record."""
+    scenario_id = "command-found"
+    steer = _ensure_intake(ctx, scenario_id, "open")
+    if steer is not None:
+        return steer
+    request_id = _new_request_id()
+    committed = _exec(
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "stop",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        ctx,
+    )
+    if isinstance(committed, ScenarioOutcome):
+        return committed
+    problems = _check_mutation(committed.stdout, committed.exit_code, replayed=False)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    record = json.loads(committed.stdout)["result"]["command"]
+    stored = _exec(scenario_id, ["--contract", "1", "command", request_id], ctx)
+    if isinstance(stored, ScenarioOutcome):
+        return stored
+    problems = _check_command(stored.stdout, stored.exit_code, request_id=request_id, kind="stop")
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    if json.loads(stored.stdout)["result"]["command"] != record:
+        return ScenarioOutcome(scenario_id, "failed", "command read differs from the commit")
+    return ScenarioOutcome(scenario_id, "passed")
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("identity", "online identity matches the harness setup"),
     Scenario("status", "online status validates and matches the harness setup"),
     Scenario("argv-usage", "malformed argv answers usage with exit 2"),
     Scenario("contract-mismatch", "--contract 2 answers contract_mismatch and executes nothing"),
     Scenario("unsupported-capability", "an unadvertised capability answers unsupported"),
+    Scenario("command-not-found", "command of an unknown request ID answers not_found"),
+    Scenario(
+        "repository-mismatch",
+        "a wrong --expect-repo on any mutation is rejected and stores nothing",
+    ),
+    Scenario("stop-replay", "an identical resend replays the stored record"),
+    Scenario(
+        "payload-mismatch",
+        "the same request ID with a different payload is rejected and stores nothing",
+    ),
+    Scenario("resume", "resume reopens closed intake and a second resume is rejected"),
+    Scenario("command-found", "command of a known request ID returns the stored record"),
     Scenario("hold-lock", "the hold-lock harness verb answers with the time held"),
 )
 """Every scenario of this suite version, with stable identifiers."""
@@ -402,6 +777,12 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_argv_usage(ctx),
         scenario_contract_mismatch(ctx),
         scenario_unsupported_capability(ctx),
+        scenario_command_not_found(ctx),
+        scenario_repository_mismatch(ctx),
+        scenario_stop_replay(ctx),
+        scenario_payload_mismatch(ctx),
+        scenario_resume(ctx),
+        scenario_command_found(ctx),
         scenario_hold_lock(ctx, harness_cmd),
     ]
 

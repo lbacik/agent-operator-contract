@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "resume",
+    "--request-id",
+    "req-3c4d5e6f7a8b",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 7,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"internal\",\"details\":{\"stored\":false},\"message\":\"engine error before commit; nothing stored\",\"request_id\":\"req-3c4d5e6f7a8b\",\"retryable\":true},\"ok\":false}\n",
+  "stderr": ""
+}

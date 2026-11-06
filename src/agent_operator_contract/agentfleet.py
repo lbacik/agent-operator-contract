@@ -3,12 +3,18 @@
 ``agentfleet <operation> <instance> [arguments]`` manages a Fleet of Managed
 Instances through the operator contract. ``ls`` lists the Fleet from discovery
 labels and container state alone (no ``exec``) and flags duplicate instance
-names rather than hiding them. ``identity`` and ``status`` relay the producer
-reply: human output by default, ``--json`` prints the producer's envelope
-verbatim. The client's own failures (unknown instance, duplicate instance,
-Docker unavailable, malformed producer stdout, usage) print an envelope-shaped
-document with an ``error.code`` in the ``client.`` namespace and exit with the
-matching class from spec section 4 (see ``client-table.json``).
+names rather than hiding them. ``identity``, ``status`` and ``command`` relay
+the producer reply: human output by default, ``--json`` prints the producer's
+envelope verbatim. ``stop`` and ``resume`` submit mutations: the request ID is
+generated before submission from a cryptographically secure source (or taken
+from ``--request-id``), ``--expect-repo`` is always supplied by the caller and
+never derived from the instance's identity, and an ``identity`` read precedes
+every mutation to check the contract major and the required capability before
+anything is sent. The client's own failures (unknown instance, duplicate
+instance, Docker unavailable, malformed producer stdout, usage, local contract
+or capability refusal) print an envelope-shaped document with an
+``error.code`` in the ``client.`` namespace and exit with the matching class
+from spec section 4 (see ``client-table.json``).
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any, NoReturn
 
-from agent_operator_contract import CONTRACT_MAJOR, __version__, client
+from agent_operator_contract import CONTRACT_MAJOR, __version__, client, shared
 
 LS_VERSION = 1
 
@@ -274,6 +280,151 @@ def _run_status(docker: str, name: str, use_json: bool) -> int:
     return result.exit_code
 
 
+def _print_producer_failure(
+    envelope: dict[str, object], exit_code: int, use_json: bool, stdout: bytes
+) -> int:
+    """Relay a producer ``ok:false`` envelope: verbatim as JSON, terse otherwise."""
+    if use_json:
+        sys.stdout.buffer.write(stdout)
+        sys.stdout.buffer.flush()
+        return exit_code
+    error = envelope["error"]
+    assert isinstance(error, dict)
+    sys.stderr.write(f"agentfleet: {error.get('code')}: {error.get('message')}\n")
+    return exit_code
+
+
+def _run_mutation(
+    docker: str,
+    name: str,
+    operation: str,
+    expect_repo: str,
+    request_id: str | None,
+    use_json: bool,
+) -> int:
+    """Submit ``stop`` or ``resume`` after the identity precheck (spec section 5).
+
+    An ``identity`` read precedes every mutation: when it fails, or when the
+    reported contract major or capabilities forbid the mutation, nothing is
+    sent. ``--expect-repo`` always comes from the caller, never from the
+    instance's own identity. The request ID of every mutation is printed, so an
+    ambiguous outcome can be followed up with ``command <request-id>``.
+    """
+    try:
+        fleet = client.discover(docker)
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    try:
+        instance = client.resolve(fleet, name)
+    except client.UnknownInstanceError as exc:
+        return _print_client_error(exc, use_json, {"instance": name})
+    except client.DuplicateInstanceError as exc:
+        return _print_client_error(exc, use_json, {"instance": name})
+    try:
+        identity_result = client.invoke(docker, instance, ["identity"])
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    try:
+        identity_envelope = client.interpret(identity_result)
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    if identity_envelope["ok"] is not True:
+        return _print_producer_failure(
+            identity_envelope, identity_result.exit_code, use_json, identity_result.stdout
+        )
+    identity_doc = identity_envelope["result"]
+    assert isinstance(identity_doc, dict)
+    try:
+        client.ensure_mutation_allowed(identity_doc, shared.required_capability(operation, {}))
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    sent_id = request_id if request_id is not None else client.new_request_id()
+    try:
+        mutation = client.invoke(
+            docker,
+            instance,
+            [operation, "--request-id", sent_id, "--expect-repo", expect_repo],
+            timeout=client.MUTATION_TIMEOUT,
+        )
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    try:
+        envelope = client.interpret(mutation)
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    if use_json:
+        sys.stdout.buffer.write(mutation.stdout)
+        sys.stdout.buffer.flush()
+        return mutation.exit_code
+    if envelope["ok"] is True:
+        result_doc = envelope["result"]
+        assert isinstance(result_doc, dict)
+        command = result_doc.get("command")
+        assert isinstance(command, dict)
+        sys.stdout.write(f"request_id: {command.get('request_id', sent_id)}\n")
+        sys.stdout.write(f"acknowledgement: {command.get('acknowledgement', '')}\n")
+        sys.stdout.write(f"replayed: {result_doc.get('replayed', '')}\n")
+        return 0
+    error = envelope["error"]
+    assert isinstance(error, dict)
+    shown = error.get("request_id", sent_id)
+    sys.stdout.write(f"request_id: {shown}\n")
+    sys.stdout.flush()
+    sys.stderr.write(f"agentfleet: {error.get('code')}: {error.get('message')}\n")
+    return mutation.exit_code
+
+
+def _human_command(command: object) -> str:
+    if not isinstance(command, dict):
+        return "command: <unreadable>\n"
+    lines = [
+        f"request_id: {command.get('request_id', '')}",
+        f"sequence: {command.get('sequence', '')}",
+        f"kind: {command.get('kind', '')}",
+        f"acknowledgement: {command.get('acknowledgement', '')}",
+        f"repository: {command.get('repository', '')}",
+        f"detail: {command.get('detail', '')}",
+        f"created_at: {command.get('created_at', '')}",
+        f"updated_at: {command.get('updated_at', '')}",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _run_command(docker: str, name: str, request_id: str, use_json: bool) -> int:
+    """Relay one ``command <request-id>`` read (spec section 6.1)."""
+    try:
+        fleet = client.discover(docker)
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    try:
+        instance = client.resolve(fleet, name)
+    except client.UnknownInstanceError as exc:
+        return _print_client_error(exc, use_json, {"instance": name})
+    except client.DuplicateInstanceError as exc:
+        return _print_client_error(exc, use_json, {"instance": name})
+    try:
+        result = client.invoke(docker, instance, ["command", request_id])
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    try:
+        envelope = client.interpret(result)
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    if use_json:
+        sys.stdout.buffer.write(result.stdout)
+        sys.stdout.buffer.flush()
+        return result.exit_code
+    if envelope["ok"] is True:
+        result_doc = envelope["result"]
+        assert isinstance(result_doc, dict)
+        sys.stdout.write(_human_command(result_doc.get("command")))
+        return 0
+    error = envelope["error"]
+    assert isinstance(error, dict)
+    sys.stderr.write(f"agentfleet: {error.get('code')}: {error.get('message')}\n")
+    return result.exit_code
+
+
 class _Parser(argparse.ArgumentParser):
     def error(self, message: str) -> NoReturn:
         doc = client.ClientError("client.usage", message).document()
@@ -317,6 +468,35 @@ def _build_parser() -> argparse.ArgumentParser:
     status_parser.add_argument("instance", help="instance name from the discovery labels")
     status_parser.add_argument("--json", dest="json", action="store_true")
     status_parser.add_argument("--docker", dest="docker", default=None)
+    stop_parser = sub.add_parser("stop", help="close one instance's intake (drain)")
+    stop_parser.add_argument("instance", help="instance name from the discovery labels")
+    stop_parser.add_argument(
+        "--expect-repo",
+        required=True,
+        help="Target Repository as owner/name; never taken from the instance itself",
+    )
+    stop_parser.add_argument(
+        "--request-id",
+        default=None,
+        help="durable request ID (generated when omitted)",
+    )
+    resume_parser = sub.add_parser("resume", help="reopen one instance's intake")
+    resume_parser.add_argument("instance", help="instance name from the discovery labels")
+    resume_parser.add_argument(
+        "--expect-repo",
+        required=True,
+        help="Target Repository as owner/name; never taken from the instance itself",
+    )
+    resume_parser.add_argument(
+        "--request-id",
+        default=None,
+        help="durable request ID (generated when omitted)",
+    )
+    command_parser = sub.add_parser(
+        "command", help="read one committed Operator Command by request ID"
+    )
+    command_parser.add_argument("instance", help="instance name from the discovery labels")
+    command_parser.add_argument("request_id", help="durable request ID of the command")
     return parser
 
 
@@ -332,6 +512,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         return _run_identity(docker, str(args.instance), use_json)
     if args.operation == "status":
         return _run_status(docker, str(args.instance), use_json)
+    if args.operation in ("stop", "resume"):
+        return _run_mutation(
+            docker,
+            str(args.instance),
+            str(args.operation),
+            str(args.expect_repo),
+            args.request_id if isinstance(args.request_id, str) else None,
+            use_json,
+        )
+    if args.operation == "command":
+        return _run_command(docker, str(args.instance), str(args.request_id), use_json)
     doc = client.ClientError("client.usage", f"unknown operation {args.operation!r}").document()
     sys.stdout.write(json.dumps(doc, sort_keys=True) + "\n")
     return 2

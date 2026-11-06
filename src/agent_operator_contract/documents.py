@@ -82,6 +82,8 @@ SCHEMA_NAMES: tuple[str, ...] = (
     "harness-reply",
     "status",
     "figure",
+    "command",
+    "mutation-result",
 )
 
 STATUS_STATES: tuple[str, ...] = (
@@ -660,7 +662,8 @@ def _validate_attempt_summary(doc: object, prefix: str) -> list[str]:
     return errors
 
 
-def _validate_command_record(doc: object, prefix: str) -> list[str]:
+def validate_command_record(doc: object, prefix: str = "command") -> list[str]:
+    """Check a CommandRecord; the empty list means valid (spec section 7.5)."""
     if not isinstance(doc, dict):
         return [f"{prefix} must be an object"]
     errors: list[str] = []
@@ -695,6 +698,58 @@ def _validate_command_record(doc: object, prefix: str) -> list[str]:
         errors.append(f"{prefix}.created_at must be an RFC 3339 UTC timestamp")
     if "updated_at" in doc and not _validate_timestamp(doc["updated_at"]):
         errors.append(f"{prefix}.updated_at must be an RFC 3339 UTC timestamp")
+    return errors
+
+
+def validate_command_ref(doc: object, prefix: str = "command_ref") -> list[str]:
+    """Check a CommandRef; the empty list means valid (spec section 7.5)."""
+    if not isinstance(doc, dict):
+        return [f"{prefix} must be an object"]
+    errors: list[str] = []
+    for key in ("request_id", "sequence"):
+        if key not in doc:
+            errors.append(f"{prefix} is missing required property: {key!r}")
+    if "request_id" in doc and not _matches(REQUEST_ID_PATTERN, doc["request_id"]):
+        errors.append(f"{prefix}.request_id must match the request ID pattern")
+    if "sequence" in doc and (type(doc["sequence"]) is not int or doc["sequence"] < 0):
+        errors.append(f"{prefix}.sequence must be an integer >= 0")
+    return errors
+
+
+def validate_command_result(doc: object) -> list[str]:
+    """Check a ``command <request-id>`` result; the empty list means valid.
+
+    The result is ``{"command": CommandRecord}`` (spec section 6.1). Unknown
+    fields are ignored so a minor can add them.
+    """
+    if not isinstance(doc, dict):
+        return ["command result must be an object"]
+    errors: list[str] = []
+    if "command" not in doc:
+        errors.append("command result is missing required property: 'command'")
+    else:
+        errors.extend(validate_command_record(doc["command"], "command result.command"))
+    return errors
+
+
+def validate_mutation_result(doc: object) -> list[str]:
+    """Check a mutation result; the empty list means valid (spec section 6.2).
+
+    The result is ``{"command": CommandRecord, "replayed": bool}``: ``replayed``
+    is true when the request ID already existed with the identical payload and
+    nothing new happened. Unknown fields are ignored so a minor can add them.
+    """
+    if not isinstance(doc, dict):
+        return ["mutation result must be an object"]
+    errors: list[str] = []
+    if "command" not in doc:
+        errors.append("mutation result is missing required property: 'command'")
+    else:
+        errors.extend(validate_command_record(doc["command"], "mutation result.command"))
+    if "replayed" not in doc:
+        errors.append("mutation result is missing required property: 'replayed'")
+    elif type(doc["replayed"]) is not bool:
+        errors.append("mutation result.replayed must be a boolean")
     return errors
 
 
@@ -867,7 +922,7 @@ def validate_status(doc: object) -> list[str]:
             errors.append("status.recent_commands must contain at most 20 entries")
         else:
             for index, entry in enumerate(commands):
-                errors.extend(_validate_command_record(entry, f"status.recent_commands[{index}]"))
+                errors.extend(validate_command_record(entry, f"status.recent_commands[{index}]"))
     if "recent_events" in doc:
         events = doc["recent_events"]
         if not isinstance(events, list):

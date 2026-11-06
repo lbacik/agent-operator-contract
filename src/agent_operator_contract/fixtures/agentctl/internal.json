@@ -1,0 +1,14 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "stop",
+    "--request-id",
+    "req-2b3c4d5e6f7a",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 7,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"internal\",\"message\":\"engine error while committing; the outcome is unknown, retry with the same request ID\",\"request_id\":\"req-2b3c4d5e6f7a\",\"retryable\":true},\"ok\":false}\n",
+  "stderr": ""
+}
