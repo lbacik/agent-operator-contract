@@ -8,7 +8,7 @@ This repository owns the normative specification, its fixtures and conformance s
 - [Adoption plan](docs/adoption-plan.md) across the five repositories
 - [Glossary](CONTEXT.md)
 - [Decisions](docs/adr/)
-- [Consumer fixture examples](examples/agentctl/)
+- [Consumer fixtures and JSON Schemas](src/agent_operator_contract/fixtures/agentctl/)
 
 ## Versioning
 

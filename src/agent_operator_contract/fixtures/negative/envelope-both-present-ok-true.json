@@ -1,0 +1,10 @@
+{
+  "contract": "1.0",
+  "ok": true,
+  "result": {},
+  "error": {
+    "code": "internal",
+    "message": "both result and error",
+    "retryable": true
+  }
+}

@@ -13,9 +13,11 @@ agentfleet = "agent_operator_contract.agentfleet:main"
 
 [dependency-groups]
 dev = [
+    "jsonschema>=4.26.0",
     "mypy>=1.13",
     "pytest>=8.3",
     "ruff>=0.8",
+    "types-jsonschema>=4.26.0.20261006",
 ]
 
 [build-system]

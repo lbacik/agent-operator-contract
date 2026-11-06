@@ -1,0 +1,9 @@
+{
+  "contract": "1.0",
+  "ok": false,
+  "error": {
+    "code": "timeout",
+    "message": "no such 1.0 code",
+    "retryable": true
+  }
+}

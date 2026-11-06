@@ -1,0 +1,9 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "status"
+  ],
+  "exit_code": 0,
+  "stdout": "{}\n"
+}
