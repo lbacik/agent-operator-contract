@@ -420,6 +420,11 @@ def test_resource_loaders_expose_package_data() -> None:
         "figure",
         "command",
         "mutation-result",
+        "attempt-summary",
+        "manifest-entry",
+        "attempts-list",
+        "attempts-show",
+        "contract-event",
     }
     for name in documents.SCHEMA_NAMES:
         schema = documents.load_schema(name)

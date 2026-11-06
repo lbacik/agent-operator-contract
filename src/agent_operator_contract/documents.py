@@ -706,13 +706,9 @@ def _validate_attempt_summary(doc: object, prefix: str) -> list[str]:
                             )
                         else:
                             if "number" not in pull:
-                                errors.append(
-                                    f"{prefix}.delivery.pull_request is missing 'number'"
-                                )
+                                errors.append(f"{prefix}.delivery.pull_request is missing 'number'")
                             elif type(pull["number"]) is not int or pull["number"] < 1:
-                                errors.append(
-                                    f"{prefix}.delivery.pull_request.number must be >= 1"
-                                )
+                                errors.append(f"{prefix}.delivery.pull_request.number must be >= 1")
                             if "url" not in pull:
                                 errors.append(f"{prefix}.delivery.pull_request is missing 'url'")
                             elif not isinstance(pull["url"], str) or not pull["url"]:
@@ -765,9 +761,7 @@ def validate_manifest_entry(doc: object, prefix: str = "manifest entry") -> list
             errors.append(f"{prefix}.path must be a relative POSIX path without '..'")
     if "kind" in doc and doc["kind"] not in MANIFEST_KINDS:
         errors.append(f"{prefix}.kind {doc['kind']!r} is not a known 1.0 kind")
-    if "media_type" in doc and (
-        not isinstance(doc["media_type"], str) or not doc["media_type"]
-    ):
+    if "media_type" in doc and (not isinstance(doc["media_type"], str) or not doc["media_type"]):
         errors.append(f"{prefix}.media_type must be a non-empty string")
     if "size" in doc and (type(doc["size"]) is not int or doc["size"] < 0):
         errors.append(f"{prefix}.size must be an integer >= 0")
@@ -822,9 +816,7 @@ def validate_attempts_show(doc: object) -> list[str]:
         errors.append("attempts show result.manifest must be an array")
     else:
         for index, entry in enumerate(doc["manifest"]):
-            errors.extend(
-                validate_manifest_entry(entry, f"attempts show result.manifest[{index}]")
-            )
+            errors.extend(validate_manifest_entry(entry, f"attempts show result.manifest[{index}]"))
     return errors
 
 

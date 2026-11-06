@@ -607,6 +607,7 @@ def _parse_contract_event(doc: object, prefix: str, strict: bool) -> ContractEve
     # validate_contract_event uses the "contract event" prefix; re-map to this prefix.
     if errors:
         raise StatusError(f"{prefix}: {'; '.join(errors)}")
+
     def _opt_str(name: str) -> str | None:
         value = data.get(name)
         return value if isinstance(value, str) else None
