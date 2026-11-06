@@ -5,11 +5,14 @@ harness verbs that need no container run as-is, while ``setup`` against a
 missing Docker CLI must answer ``failed`` instead of crashing.
 """
 
+import io
 import json
 import os
 import subprocess
 import sys
+import tarfile
 from pathlib import Path
+from typing import Any
 
 from agent_operator_contract import documents
 

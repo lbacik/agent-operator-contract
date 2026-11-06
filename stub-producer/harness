@@ -69,6 +69,9 @@ CRASH_POINTS = (
 
 STATE_FILE = "/data/agent-operator-contract.json"
 
+LOCK_FILE = "/data/agent-operator-contract.lock"
+"""Engine lock file inside the container (must match the stub LOCK_FILENAME)."""
+
 REPOSITORY_PATTERN = re.compile(r"^[^/\s]+/[^/\s]+$")
 
 DOCKER_TIMEOUT = 120.0
@@ -267,7 +270,7 @@ def _do_setup(verb: str, params: dict[str, Any]) -> tuple[str, int]:
             return _error(verb, "failed", f"docker inspect failed: {inspected.stderr.strip()}")
     except (OSError, subprocess.TimeoutExpired) as exc:
         return _error(verb, "failed", f"docker is unavailable: {exc}")
-    _write_state({"container": name, "volume": volume})
+    _write_state({"container": name, "volume": volume, "data_path": "/data"})
     startup_hold = False
     if isinstance(config, dict) and config.get("native.startup_hold") is True:
         startup_hold = True
@@ -532,9 +535,37 @@ def _do_hold_lock(verb: str, params: dict[str, Any], instance: dict[str, Any]) -
     duration = params.get("duration_ms")
     if type(duration) is not int or not 1 <= duration <= 60000:
         return _error(verb, "usage", "harness 'hold-lock' duration_ms must be 1..60000")
-    started = time.monotonic()
-    time.sleep(duration / 1000.0)
-    held_ms = max(1, int((time.monotonic() - started) * 1000))
+    container = str(instance["container"])
+    data_path = str(instance.get("data_path", "/data"))
+    lock_path = f"{data_path}/{LOCK_FILE.rsplit('/', 1)[-1]}"
+    script = (
+        "import fcntl,json,time\n"
+        f"lock={lock_path!r}\n"
+        f"duration={duration / 1000.0!r}\n"
+        "handle=open(lock,'a')\n"
+        "fcntl.flock(handle.fileno(),fcntl.LOCK_EX)\n"
+        "started=time.monotonic()\n"
+        "time.sleep(duration)\n"
+        "held=max(1,round((time.monotonic()-started)*1000))\n"
+        "fcntl.flock(handle.fileno(),fcntl.LOCK_UN)\n"
+        "print(json.dumps({'held_ms':held}))\n"
+    )
+    try:
+        completed = _run_docker(
+            ["exec", "-i", "--user", "agent", container, "python3", "-"],
+            stdin_text=script,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _error(verb, "failed", f"docker is unavailable: {exc}")
+    if completed.returncode != 0:
+        return _error(verb, "failed", f"engine lock hold failed: {completed.stderr.strip()}")
+    try:
+        reply = json.loads(completed.stdout)
+    except ValueError:
+        return _error(verb, "failed", f"engine lock hold returned non-JSON: {completed.stdout!r}")
+    held_ms = reply.get("held_ms")
+    if type(held_ms) is not int or held_ms < 1:
+        return _error(verb, "failed", f"engine lock hold returned invalid held_ms: {held_ms!r}")
     return _ok(verb, {"held_ms": held_ms})
 
 
