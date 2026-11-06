@@ -633,9 +633,9 @@ def test_attempts_list_paging_cursor_shapes() -> None:
 
 def test_manifest_entry_kind_enum_matches_library() -> None:
     assert MANIFEST_ENTRY_SCHEMA["properties"]["kind"]["enum"] == list(documents.MANIFEST_KINDS)
-    assert ATTEMPTS_SHOW_SCHEMA["$defs"]["manifest_entry"]["properties"]["kind"][
-        "enum"
-    ] == list(documents.MANIFEST_KINDS)
+    assert ATTEMPTS_SHOW_SCHEMA["$defs"]["manifest_entry"]["properties"]["kind"]["enum"] == list(
+        documents.MANIFEST_KINDS
+    )
 
 
 def test_manifest_entry_schema_patterns_match_library() -> None:
@@ -666,8 +666,7 @@ def test_contract_event_enums_match_library() -> None:
 def test_contract_event_schema_patterns_match_library() -> None:
     assert CONTRACT_EVENT_SCHEMA["properties"]["at"]["pattern"] == documents.TIMESTAMP_PATTERN
     assert (
-        CONTRACT_EVENT_SCHEMA["properties"]["request_id"]["pattern"]
-        == documents.REQUEST_ID_PATTERN
+        CONTRACT_EVENT_SCHEMA["properties"]["request_id"]["pattern"] == documents.REQUEST_ID_PATTERN
     )
 
 

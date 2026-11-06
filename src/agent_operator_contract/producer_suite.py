@@ -944,6 +944,270 @@ def scenario_budget_attempts(
     return result
 
 
+def _check_attempts_list_result(stdout: str, exit_code: int) -> list[str]:
+    """Validate an ``attempts list`` result: envelope, shape and newest-first order."""
+    problems = _check_ok_result(stdout, exit_code)
+    if problems:
+        return problems
+    doc = json.loads(stdout)
+    result = doc.get("result")
+    if not isinstance(result, dict):
+        return ["attempts list result must be an object"]
+    problems = documents.validate_attempts_list(result)
+    if problems:
+        return problems
+    attempts = result.get("attempts")
+    assert isinstance(attempts, list)
+    started = [entry.get("started_at") for entry in attempts if isinstance(entry, dict)]
+    if any(not isinstance(value, str) for value in started):
+        return ["attempts list entries must carry started_at timestamps"]
+    if started != sorted(started, reverse=True):
+        # The active attempt is newest; allow it first even when its timestamp
+        # ties the newest finished one.
+        return ["attempts list must be newest first"]
+    return []
+
+
+def _check_attempts_show_result(stdout: str, exit_code: int, attempt_id: str) -> list[str]:
+    """Validate an ``attempts show`` result for one attempt."""
+    problems = _check_ok_result(stdout, exit_code)
+    if problems:
+        return problems
+    doc = json.loads(stdout)
+    result = doc.get("result")
+    if not isinstance(result, dict):
+        return ["attempts show result must be an object"]
+    problems = documents.validate_attempts_show(result)
+    if problems:
+        return problems
+    attempt = result.get("attempt")
+    assert isinstance(attempt, dict)
+    if attempt.get("attempt_id") != attempt_id:
+        return [f"attempts show is for {attempt.get('attempt_id')!r}, not {attempt_id!r}"]
+    manifest = result.get("manifest")
+    assert isinstance(manifest, list)
+    kinds = [entry.get("path") for entry in manifest if isinstance(entry, dict)]
+    if "events.jsonl" not in kinds:
+        return ["attempts show manifest must include events.jsonl"]
+    return []
+
+
+def _paging_checks(ctx: SuiteContext, scenario_id: str) -> ScenarioOutcome:
+    """Run the ``attempts list`` paging checks; the caller handles harness cleanup."""
+    listed = _exec(scenario_id, ["--contract", "1", "attempts", "list"], ctx)
+    if isinstance(listed, ScenarioOutcome):
+        return listed
+    problems = _check_attempts_list_result(listed.stdout, listed.exit_code)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    default_doc = json.loads(listed.stdout)["result"]
+    default_attempts = default_doc["attempts"]
+    if len(default_attempts) > 20:
+        return ScenarioOutcome(
+            scenario_id, "failed", "the default attempts list page holds at most 20"
+        )
+    first_page = _exec(scenario_id, ["--contract", "1", "attempts", "list", "--limit", "1"], ctx)
+    if isinstance(first_page, ScenarioOutcome):
+        return first_page
+    problems = _check_attempts_list_result(first_page.stdout, first_page.exit_code)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    first_doc = json.loads(first_page.stdout)["result"]
+    if len(first_doc["attempts"]) != 1:
+        return ScenarioOutcome(scenario_id, "failed", "--limit 1 must return one attempt")
+    if first_doc["attempts"][0] != default_attempts[0]:
+        return ScenarioOutcome(
+            scenario_id, "failed", "the first page must start with the newest attempt"
+        )
+    cursor = first_doc.get("next_cursor")
+    total = len(default_attempts)
+    if total > 1:
+        if not isinstance(cursor, str) or not cursor:
+            return ScenarioOutcome(
+                scenario_id, "failed", "a partial page must carry an opaque next_cursor"
+            )
+        if cursor in ("0", "1"):
+            return ScenarioOutcome(
+                scenario_id, "failed", "the cursor must be opaque, not a plain offset"
+            )
+        second_page = _exec(
+            scenario_id,
+            ["--contract", "1", "attempts", "list", "--limit", "1", "--before", cursor],
+            ctx,
+        )
+        if isinstance(second_page, ScenarioOutcome):
+            return second_page
+        problems = _check_attempts_list_result(second_page.stdout, second_page.exit_code)
+        if problems:
+            return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+        second_doc = json.loads(second_page.stdout)["result"]
+        if not second_doc["attempts"]:
+            return ScenarioOutcome(
+                scenario_id, "failed", "following next_cursor must return more attempts"
+            )
+        if second_doc["attempts"][0] == first_doc["attempts"][0]:
+            return ScenarioOutcome(
+                scenario_id, "failed", "pages must not repeat the cursor boundary"
+            )
+    rejected = _exec(
+        scenario_id,
+        ["--contract", "1", "attempts", "list", "--limit", "101"],
+        ctx,
+    )
+    if isinstance(rejected, ScenarioOutcome):
+        return rejected
+    problems = _check_error(rejected.stdout, rejected.exit_code, "invalid_argument")
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    bad_cursor = _exec(
+        scenario_id,
+        ["--contract", "1", "attempts", "list", "--before", "not-a-cursor"],
+        ctx,
+    )
+    if isinstance(bad_cursor, ScenarioOutcome):
+        return bad_cursor
+    problems = _check_error(bad_cursor.stdout, bad_cursor.exit_code, "invalid_argument")
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_attempts_list_paging(
+    ctx: SuiteContext, harness_cmd: Sequence[str]
+) -> ScenarioOutcome:
+    """``attempts list`` pages newest first with a default of 20, max 100, opaque cursor."""
+    scenario_id = "attempts-list-paging"
+    issue = 109
+    attempt_id, outcome, created = _attempt_id_for_reads(ctx, harness_cmd, scenario_id, issue)
+    if outcome is not None or attempt_id is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no attempt to read")
+    result = _paging_checks(ctx, scenario_id)
+    if created:
+        cleanup = _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        if result.status == "passed" and cleanup is not None:
+            return cleanup
+    return result
+
+
+def scenario_attempts_show(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
+    """``attempts show`` returns the archive with its manifest for a known attempt."""
+    scenario_id = "attempts-show"
+    issue = 110
+    attempt_id, outcome, created = _attempt_id_for_reads(ctx, harness_cmd, scenario_id, issue)
+    if outcome is not None or attempt_id is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no attempt to read")
+    answered = _exec(scenario_id, ["--contract", "1", "attempts", "show", attempt_id], ctx)
+    if isinstance(answered, ScenarioOutcome):
+        result: ScenarioOutcome = answered
+    else:
+        problems = _check_attempts_show_result(answered.stdout, answered.exit_code, attempt_id)
+        if problems:
+            result = ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+        else:
+            result = ScenarioOutcome(scenario_id, "passed")
+    if created:
+        cleanup = _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        if result.status == "passed" and cleanup is not None:
+            return cleanup
+    return result
+
+
+def scenario_attempts_not_found(ctx: SuiteContext) -> ScenarioOutcome:
+    """``attempts show`` of an unknown attempt answers ``not_found``."""
+    scenario_id = "attempts-not-found"
+    answered = _exec(scenario_id, ["--contract", "1", "attempts", "show", "no-such-attempt"], ctx)
+    if isinstance(answered, ScenarioOutcome):
+        return answered
+    problems = _check_error(answered.stdout, answered.exit_code, "not_found")
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def _export_events_payload(
+    ctx: SuiteContext, scenario_id: str, attempt_id: str
+) -> tuple[bytes | None, ScenarioOutcome | None]:
+    """Stream one export and return its raw tar bytes."""
+    try:
+        proc = _popen_export(
+            ctx.docker,
+            ctx.container,
+            ctx.exec_user,
+            ["--contract", "1", "attempts", "export", attempt_id],
+        )
+    except OSError as exc:
+        return None, ScenarioOutcome(scenario_id, "failed", f"export did not start: {exc}")
+    try:
+        data, _ = proc.communicate(timeout=ctx.timeout)
+    except subprocess.TimeoutExpired:
+        _stop_export(proc)
+        return None, ScenarioOutcome(scenario_id, "failed", "export did not finish")
+    if proc.returncode != 0:
+        return None, ScenarioOutcome(scenario_id, "failed", f"export exited {proc.returncode}")
+    return data, None
+
+
+def scenario_contract_events(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
+    """Every ``recent_events`` entry and every ``events.jsonl`` line is a Contract Event."""
+    scenario_id = "contract-events"
+    issue = 111
+    attempt_id, outcome, created = _attempt_id_for_reads(ctx, harness_cmd, scenario_id, issue)
+    if outcome is not None or attempt_id is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no attempt to read")
+    result = ScenarioOutcome(scenario_id, "passed")
+    try:
+        snapshot, outcome = _snapshot(ctx, scenario_id)
+        if outcome is not None or snapshot is None:
+            return outcome or ScenarioOutcome(scenario_id, "failed", "no status snapshot")
+        events = snapshot.get("recent_events")
+        if not isinstance(events, list):
+            return ScenarioOutcome(scenario_id, "failed", "recent_events must be an array")
+        for index, entry in enumerate(events):
+            problems = documents.validate_contract_event(entry)
+            if problems:
+                return ScenarioOutcome(
+                    scenario_id,
+                    "failed",
+                    f"recent_events[{index}] is not a Contract Event: {'; '.join(problems)}",
+                )
+        data, outcome = _export_events_payload(ctx, scenario_id, attempt_id)
+        if outcome is not None or data is None:
+            return outcome or ScenarioOutcome(scenario_id, "failed", "no export stream")
+        try:
+            with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+                try:
+                    member = archive.getmember("events.jsonl")
+                except KeyError:
+                    return ScenarioOutcome(scenario_id, "failed", "the export lacks events.jsonl")
+                extracted = archive.extractfile(member)
+                payload = extracted.read() if extracted is not None else b""
+        except (tarfile.TarError, OSError) as exc:
+            return ScenarioOutcome(scenario_id, "failed", f"export is not a tar: {exc}")
+        for number, line in enumerate(payload.decode("utf-8").splitlines()):
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                return ScenarioOutcome(
+                    scenario_id, "failed", f"events.jsonl line {number} is not JSON"
+                )
+            problems = documents.validate_contract_event(entry)
+            if problems:
+                return ScenarioOutcome(
+                    scenario_id,
+                    "failed",
+                    f"events.jsonl line {number} is not a Contract Event: {'; '.join(problems)}",
+                )
+        result = ScenarioOutcome(scenario_id, "passed")
+    finally:
+        if created:
+            cleanup = _drop_issue(ctx, harness_cmd, scenario_id, issue)
+            if result.status == "passed" and cleanup is not None:
+                return cleanup
+    return result
+
+
 def scenario_budget_export(
     ctx: SuiteContext,
     harness_cmd: Sequence[str],
@@ -2012,6 +2276,16 @@ SCENARIOS: tuple[Scenario, ...] = (
     Scenario("budget-attempts", "attempts list and show answer within 5 s"),
     Scenario("budget-export", "attempts export starts streaming within 5 s"),
     Scenario(
+        "attempts-list-paging",
+        "attempts list pages newest first with default 20, max 100 and opaque cursor",
+    ),
+    Scenario("attempts-show", "attempts show returns the archive with its manifest"),
+    Scenario("attempts-not-found", "attempts show of an unknown attempt answers not_found"),
+    Scenario(
+        "contract-events",
+        "every recent_events entry and every events.jsonl line is a Contract Event",
+    ),
+    Scenario(
         "snapshot-bounds",
         "the snapshot fits 256 KiB with oldest-first truncation and sorted order",
     ),
@@ -2069,6 +2343,10 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_budget_mutations(ctx),
         scenario_budget_attempts(ctx, harness_cmd),
         scenario_budget_export(ctx, harness_cmd),
+        scenario_attempts_list_paging(ctx, harness_cmd),
+        scenario_attempts_show(ctx, harness_cmd),
+        scenario_attempts_not_found(ctx),
+        scenario_contract_events(ctx, harness_cmd),
         scenario_snapshot_bounds(ctx),
         scenario_stop_before_claim_crash(ctx, harness_cmd),
         scenario_stop_after_claim_sigterm(ctx, harness_cmd),
