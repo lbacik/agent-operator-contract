@@ -1,0 +1,272 @@
+#!/usr/bin/env python3
+"""Stub conformance harness: a minimal, test-only engine host executable.
+
+Implements ``setup`` and ``teardown`` from the Conformance Harness protocol
+(spec section 15.1) by steering a stub producer container over the Docker
+CLI. Every other known verb answers ``unsupported`` with
+``details.what: "verb"``, so the producer suite reports the dependent
+scenarios as not run. Language-neutral: standard library only, no import of
+this repository's code.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import subprocess
+import sys
+import uuid
+from typing import Any
+
+HARNESS_VERSION = "1.0"
+
+KNOWN_VERBS = (
+    "setup",
+    "teardown",
+    "set-issue",
+    "hold",
+    "release",
+    "finish-attempt",
+    "hold-lock",
+    "crash",
+    "terminate",
+    "stop-container",
+    "start-container",
+    "halt",
+    "grow-archive",
+    "defer-publication",
+)
+
+KNOWN_CAPABILITIES = (
+    "stop-after",
+    "next-issue",
+    "operator-handoff",
+    "recovery-retry",
+    "recovery-release",
+    "errors-reset",
+    "pool",
+)
+
+REPOSITORY_PATTERN = re.compile(r"^[^/\s]+/[^/\s]+$")
+
+DOCKER_TIMEOUT = 120.0
+
+
+def _docker() -> str:
+    return os.environ.get("DOCKER", "docker")
+
+
+def _image() -> str:
+    return os.environ.get("STUB_PRODUCER_IMAGE", "stub-producer:dev")
+
+
+def _state_path() -> str:
+    return os.environ.get("STUB_HARNESS_STATE", "/tmp/stub-producer-harness-state.json")
+
+
+def _render(doc: dict[str, Any]) -> str:
+    return json.dumps(doc, sort_keys=True, separators=(",", ":")) + "\n"
+
+
+def _ok(verb: str, result: dict[str, Any]) -> tuple[str, int]:
+    return _render({"harness": HARNESS_VERSION, "verb": verb, "ok": True, "result": result}), 0
+
+
+def _error(
+    verb: str | None,
+    code: str,
+    message: str,
+    details: dict[str, Any] | None = None,
+) -> tuple[str, int]:
+    error: dict[str, Any] = {"code": code, "message": message}
+    if details is not None:
+        error["details"] = details
+    doc: dict[str, Any] = {"harness": HARNESS_VERSION, "ok": False, "error": error}
+    if verb is not None:
+        doc["verb"] = verb
+    exits = {"failed": 1, "usage": 2, "unsupported": 3}
+    return _render(doc), exits[code]
+
+
+def _run_docker(args: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [_docker(), *args],
+        capture_output=True,
+        text=True,
+        timeout=DOCKER_TIMEOUT,
+    )
+
+
+def _read_state() -> dict[str, Any] | None:
+    try:
+        with open(_state_path(), encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _write_state(state: dict[str, Any]) -> None:
+    with open(_state_path(), "w", encoding="utf-8") as handle:
+        json.dump(state, handle)
+
+
+def _clear_state() -> None:
+    try:
+        os.remove(_state_path())
+    except FileNotFoundError:
+        pass
+    except OSError:
+        pass
+
+
+def _do_setup(verb: str, params: dict[str, Any]) -> tuple[str, int]:
+    for key in params:
+        if key not in ("repository", "capabilities", "config"):
+            return _error(verb, "usage", f"harness 'setup' has an unexpected parameter: {key!r}")
+    repository = params.get("repository")
+    if not isinstance(repository, str) or REPOSITORY_PATTERN.search(repository) is None:
+        return _error(verb, "usage", "harness 'setup' repository must be written owner/name")
+    capabilities = params.get("capabilities")
+    if capabilities is None:
+        capabilities = [cap for cap in KNOWN_CAPABILITIES if cap != "pool"]
+    elif not isinstance(capabilities, list) or any(
+        not isinstance(item, str) or not item for item in capabilities
+    ):
+        return _error(
+            verb, "usage", "harness 'setup' capabilities must be an array of non-empty strings"
+        )
+    for name in capabilities:
+        if name not in KNOWN_CAPABILITIES:
+            return _error(
+                verb,
+                "unsupported",
+                f"stub harness cannot advertise capability {name!r}",
+                {"what": "capability", "name": name},
+            )
+    config = params.get("config")
+    if config is not None:
+        if not isinstance(config, dict):
+            return _error(verb, "usage", "harness 'setup' config must be an object")
+        for key in config:
+            if not key.startswith("native."):
+                return _error(
+                    verb,
+                    "usage",
+                    f"harness 'setup' config allows only native.* keys, got {key!r}",
+                )
+    existing = _read_state()
+    if existing and existing.get("container"):
+        return _error(verb, "failed", "an instance already exists; teardown first")
+    name = f"stub-{uuid.uuid4().hex[:12]}"
+    volume = f"{name}-data"
+    try:
+        created = _run_docker(["volume", "create", volume])
+        if created.returncode != 0:
+            return _error(verb, "failed", f"docker volume create failed: {created.stderr.strip()}")
+        run = _run_docker(
+            [
+                "run",
+                "-d",
+                "--name",
+                name,
+                "--volume",
+                f"{volume}:/data",
+                "--env",
+                f"CONTRACT_REPOSITORY={repository}",
+                "--env",
+                f"CONTRACT_CAPABILITIES={','.join(sorted(capabilities))}",
+                _image(),
+                "sleep",
+                "infinity",
+            ]
+        )
+        if run.returncode != 0:
+            _run_docker(["volume", "rm", volume])
+            return _error(verb, "failed", f"docker run failed: {run.stderr.strip()}")
+        inspected = _run_docker(["inspect", "--format", "{{.Id}}", _image()])
+        if inspected.returncode != 0:
+            return _error(verb, "failed", f"docker inspect failed: {inspected.stderr.strip()}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _error(verb, "failed", f"docker is unavailable: {exc}")
+    _write_state({"container": name, "volume": volume})
+    return _ok(
+        verb,
+        {
+            "container": name,
+            "image": inspected.stdout.strip(),
+            "volumes": [{"name": volume, "path": "/data"}],
+            "exec_user": "agent",
+            "repository": repository,
+            "capabilities": sorted(capabilities),
+        },
+    )
+
+
+def _do_teardown(verb: str, params: dict[str, Any]) -> tuple[str, int]:
+    if params:
+        return _error(verb, "usage", "harness 'teardown' takes no parameters")
+    state = _read_state()
+    if not state or not state.get("container"):
+        return _ok(verb, {"removed": False})
+    container = str(state["container"])
+    volume = str(state.get("volume", ""))
+    try:
+        removed = _run_docker(["rm", "--force", container])
+        if volume:
+            _run_docker(["volume", "rm", volume])
+        if removed.returncode != 0:
+            return _error(verb, "failed", f"docker rm failed: {removed.stderr.strip()}")
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _error(verb, "failed", f"docker is unavailable: {exc}")
+    _clear_state()
+    return _ok(verb, {"removed": True})
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) != 2:
+        text, exit_code = _error(None, "usage", "expected: <harness> <verb> '<request-json>'")
+        sys.stdout.write(text)
+        return exit_code
+    verb, raw = argv
+    try:
+        request = json.loads(raw)
+    except ValueError:
+        text, exit_code = _error(None, "usage", "the request document is not valid JSON")
+        sys.stdout.write(text)
+        return exit_code
+    if not isinstance(request, dict) or request.get("verb") != verb:
+        text, exit_code = _error(
+            None, "usage", "the argv verb and the document verb must agree"
+        )
+        sys.stdout.write(text)
+        return exit_code
+    params = request.get("params")
+    if not isinstance(params, dict):
+        text, exit_code = _error(verb, "usage", "harness request params must be an object")
+        sys.stdout.write(text)
+        return exit_code
+    if verb not in KNOWN_VERBS:
+        text, exit_code = _error(verb, "usage", f"unknown harness verb: {verb!r}")
+        sys.stdout.write(text)
+        return exit_code
+    if verb == "setup":
+        text, exit_code = _do_setup(verb, params)
+    elif verb == "teardown":
+        text, exit_code = _do_teardown(verb, params)
+    else:
+        text, exit_code = _error(
+            verb,
+            "unsupported",
+            f"stub harness does not implement {verb!r}",
+            {"what": "verb", "name": verb},
+        )
+    sys.stdout.write(text)
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

@@ -23,6 +23,22 @@ jobs:
       - run: uv run mypy
       - run: uv run pytest
 
+  producer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: "3.11"
+      - run: uv sync --locked
+      - name: Build the stub producer image (test-only, never published)
+        run: docker build -f stub-producer/Dockerfile -t stub-producer:ci .
+      - name: Run the producer suite against the stub producer
+        run: |
+          STUB_PRODUCER_IMAGE=stub-producer:ci \
+            uv run --locked python -m agent_operator_contract.producer_suite \
+              --harness ./stub-producer/harness
+
   package:
     runs-on: ubuntu-latest
     strategy:
