@@ -591,7 +591,9 @@ def scenario_unsupported_capability(ctx: SuiteContext) -> ScenarioOutcome:
     request ID stays reusable for a supported operation.
     """
     scenario_id = "unsupported-capability"
-    missing = [capability for capability in _CAPABILITY_PROBES if capability not in ctx.capabilities]
+    missing = [
+        capability for capability in _CAPABILITY_PROBES if capability not in ctx.capabilities
+    ]
     if not missing:
         return ScenarioOutcome(scenario_id, "passed")
     for capability in missing:
@@ -657,8 +659,7 @@ def scenario_unsupported_capability(ctx: SuiteContext) -> ScenarioOutcome:
             return ScenarioOutcome(
                 scenario_id,
                 "failed",
-                f"request ID of unsupported {capability} is not reusable: "
-                + "; ".join(problems),
+                f"request ID of unsupported {capability} is not reusable: " + "; ".join(problems),
             )
     return ScenarioOutcome(scenario_id, "passed")
 
@@ -2197,9 +2198,7 @@ def scenario_stop_after_invalid(ctx: SuiteContext) -> ScenarioOutcome:
         return stored
     nothing = _check_error(stored.stdout, stored.exit_code, "not_found")
     if nothing:
-        return ScenarioOutcome(
-            scenario_id, "failed", f"invalid --after stored {request_id}"
-        )
+        return ScenarioOutcome(scenario_id, "failed", f"invalid --after stored {request_id}")
     reuse = _exec(
         scenario_id,
         [
@@ -2225,9 +2224,7 @@ def scenario_stop_after_invalid(ctx: SuiteContext) -> ScenarioOutcome:
     return ScenarioOutcome(scenario_id, "passed")
 
 
-def scenario_stop_after_restart(
-    ctx: SuiteContext, harness_cmd: Sequence[str]
-) -> ScenarioOutcome:
+def scenario_stop_after_restart(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """``stop --after N`` in progress, restart: the counter survives and continues."""
     scenario_id = "stop-after-restart"
     settled = _settle(ctx, harness_cmd, scenario_id)
@@ -2272,8 +2269,7 @@ def scenario_stop_after_restart(
         return ScenarioOutcome(
             scenario_id,
             "failed",
-            f"stop --after with an active attempt must be accepted, got: "
-            f"{planned.stdout.strip()}",
+            f"stop --after with an active attempt must be accepted, got: {planned.stdout.strip()}",
         )
     _, outcome = _harness(
         ctx, harness_cmd, scenario_id, "finish-attempt", {"native_outcome": "complete"}
@@ -2289,11 +2285,7 @@ def scenario_stop_after_restart(
     if outcome is not None or snapshot is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "no status after finalizing")
     plan = snapshot["intake"]["stop_plan"]
-    if (
-        not isinstance(plan, dict)
-        or plan.get("remaining") != 2
-        or plan.get("counted") != 1
-    ):
+    if not isinstance(plan, dict) or plan.get("remaining") != 2 or plan.get("counted") != 1:
         return ScenarioOutcome(
             scenario_id, "failed", f"the plan must count one of two, got {plan!r}"
         )
@@ -2332,11 +2324,7 @@ def scenario_stop_after_restart(
     if outcome is not None or snapshot is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "no status after startup")
     plan = snapshot["intake"]["stop_plan"]
-    if (
-        not isinstance(plan, dict)
-        or plan.get("remaining") != 2
-        or plan.get("counted") != 1
-    ):
+    if not isinstance(plan, dict) or plan.get("remaining") != 2 or plan.get("counted") != 1:
         return ScenarioOutcome(
             scenario_id, "failed", f"the counter must survive the restart, got {plan!r}"
         )
@@ -2372,9 +2360,7 @@ def scenario_stop_after_restart(
     if outcome is not None or snapshot is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "no status after the plan")
     if snapshot["intake"]["stop_plan"] is not None:
-        return ScenarioOutcome(
-            scenario_id, "failed", "the completed plan must clear from intake"
-        )
+        return ScenarioOutcome(scenario_id, "failed", "the completed plan must clear from intake")
     if snapshot["intake"]["state"] != "closed":
         return ScenarioOutcome(scenario_id, "failed", "intake must close when the plan completes")
     stored, outcome = _read_command(ctx, scenario_id, plan_id)
@@ -2398,9 +2384,7 @@ def scenario_stop_after_restart(
     return ScenarioOutcome(scenario_id, "passed")
 
 
-def scenario_next_issue_restart(
-    ctx: SuiteContext, harness_cmd: Sequence[str]
-) -> ScenarioOutcome:
+def scenario_next_issue_restart(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """``next issue N`` committed, restart before Claim: priority survives and applies."""
     scenario_id = "next-issue-restart"
     settled = _settle(ctx, harness_cmd, scenario_id)
@@ -2486,9 +2470,7 @@ def scenario_next_issue_restart(
             scenario_id, "failed", "the priority must still apply after the restart"
         )
     if snapshot["intake"]["priority"] is not None:
-        return ScenarioOutcome(
-            scenario_id, "failed", "a consumed priority must clear from intake"
-        )
+        return ScenarioOutcome(scenario_id, "failed", "a consumed priority must clear from intake")
     stored, outcome = _read_command(ctx, scenario_id, priority_id)
     if outcome is not None or stored is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "priority record is missing")
@@ -2564,8 +2546,7 @@ def scenario_next_issue_restart(
         return ScenarioOutcome(
             scenario_id,
             "failed",
-            f"an ineligible priority must be not_fulfilled, got "
-            f"{stored.get('acknowledgement')!r}",
+            f"an ineligible priority must be not_fulfilled, got {stored.get('acknowledgement')!r}",
         )
     _, outcome = _harness(
         ctx, harness_cmd, scenario_id, "finish-attempt", {"native_outcome": "complete"}
@@ -2802,6 +2783,18 @@ SCENARIOS: tuple[Scenario, ...] = (
         "resume while a stop is accepted: the stop is superseded",
     ),
     Scenario(
+        "stop-after-invalid",
+        "stop --after 0 is invalid_argument; nothing stored, ID reusable",
+    ),
+    Scenario(
+        "stop-after-restart",
+        "stop --after N in progress, restart: the counter survives and continues",
+    ),
+    Scenario(
+        "next-issue-restart",
+        "next issue N committed, restart before Claim: priority survives and applies",
+    ),
+    Scenario(
         "halt-records-last-halt",
         "halt: a halted event is recorded and the next start reports it",
     ),
@@ -2848,6 +2841,9 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_stop_after_claim_sigterm(ctx, harness_cmd),
         scenario_stop_during_starting(ctx, harness_cmd),
         scenario_resume_supersedes_stop(ctx, harness_cmd),
+        scenario_stop_after_invalid(ctx),
+        scenario_stop_after_restart(ctx, harness_cmd),
+        scenario_next_issue_restart(ctx, harness_cmd),
         scenario_halt_records_last_halt(ctx, harness_cmd),
         scenario_publication_pending_recovery(ctx, harness_cmd),
     ]

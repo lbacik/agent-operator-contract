@@ -8,7 +8,8 @@ them. It is built as a Docker image in CI and never published.
   uses the shared part of the library (`agent_operator_contract.shared`) to
   parse argv and render replies. It serves `identity`, `status`, the
   `command` read and `attempts list` / `attempts show` plus the core
-  mutations `stop` and `resume` (and a minimal `stop --after` plan) with
+  mutations `stop` and `resume` (a minimal `stop --after` plan and a one-shot
+  `next issue` priority) with
   durable Intake, Claims and Attempts on its state volume. The engine opens a
   Claim for an eligible issue behind a Claim boundary, runs recovery at start,
   records Halts durably, and honors harness holds (notably `before-claim`)

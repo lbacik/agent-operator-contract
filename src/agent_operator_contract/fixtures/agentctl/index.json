@@ -47,6 +47,14 @@
       "classification": "rejection",
       "note": "Exit 1, invalid_argument: malformed request ID, nothing stored."
     },
+    "invalid-argument-after-0": {
+      "classification": "rejection",
+      "note": "Exit 1, invalid_argument: stop --after 0 is outside 1-999, nothing stored."
+    },
+    "next-issue-accepted": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with replayed:false: the next issue priority committed."
+    },
     "offline-status-halted": {
       "classification": "success",
       "note": "Exit 0, ok:true with an offline status snapshot carrying last_halt."
@@ -98,6 +106,10 @@
     "stop-accepted": {
       "classification": "success",
       "note": "Exit 0, ok:true with replayed:false: the stop committed."
+    },
+    "stop-after-accepted": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with replayed:false: the stop --after plan committed."
     },
     "stop-replayed": {
       "classification": "replay",

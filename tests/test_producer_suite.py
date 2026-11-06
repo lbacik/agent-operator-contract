@@ -75,6 +75,24 @@ def _fake_decode_cursor(cursor: str) -> int | None:
     return offset
 
 
+def _is_int_in(value: str, low: int, high: int | None) -> bool:
+    """Mirror the shared value check: canonical decimal digits within bounds."""
+    try:
+        number = int(value, 10)
+    except ValueError:
+        return False
+    if str(number) != value:
+        return False
+    return number >= low and (high is None or number <= high)
+
+
+def _probe_request_id(argv: list[str]) -> str:
+    """Echo the probe's ``--request-id`` value, like a producer ``unsupported``."""
+    if "--request-id" in argv:
+        return argv[argv.index("--request-id") + 1]
+    return "req-unused"
+
+
 def _fail_with_request(code: str, request_id: str, details: Any = None) -> str:
     doc: dict[str, Any] = {
         "contract": "1.0",
@@ -126,19 +144,26 @@ class _FakeProducer:
         self.tick = 0
         self.extra_events: list[dict[str, Any]] = []
 
-    def _record(self, request_id: str, kind: str, acknowledgement: str) -> dict[str, Any]:
+    def _record(
+        self,
+        request_id: str,
+        kind: str,
+        acknowledgement: str,
+        arguments: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {} if arguments is None else arguments
         record = {
             "request_id": request_id,
             "sequence": self.sequence,
             "kind": kind,
-            "arguments": {},
+            "arguments": payload,
             "repository": self._ctx.repository,
             "acknowledgement": acknowledgement,
             "detail": f"{kind} {acknowledgement}",
             "created_at": TIMESTAMP,
             "updated_at": TIMESTAMP,
         }
-        self.commands[request_id] = {"kind": kind, "arguments": {}, "record": record}
+        self.commands[request_id] = {"kind": kind, "arguments": payload, "record": record}
         self.sequence += 1
         return record
 
@@ -256,8 +281,13 @@ class _FakeProducer:
         return ""
 
     def _mutate(
-        self, operation: str, request_id: str, expect_repo: str
+        self,
+        operation: str,
+        request_id: str,
+        expect_repo: str,
+        arguments: dict[str, Any] | None = None,
     ) -> producer_suite.DockerResult:
+        payload = {} if arguments is None else arguments
         if expect_repo.lower() != self._ctx.repository.lower():
             return producer_suite.DockerResult(
                 1,
@@ -270,7 +300,7 @@ class _FakeProducer:
             )
         stored = self.commands.get(request_id)
         if stored is not None:
-            if stored["kind"] == operation and stored["arguments"] == {}:
+            if stored["kind"] == operation and stored["arguments"] == payload:
                 return producer_suite.DockerResult(
                     0,
                     _ok({"command": stored["record"], "replayed": True}),
@@ -286,13 +316,17 @@ class _FakeProducer:
                 )
             self.intake = "closed"
             record = self._record(request_id, "stop", "completed")
-        else:
+        elif operation == "resume":
             if self.intake == "open":
                 return producer_suite.DockerResult(
                     1, _fail_with_request("rejected", request_id), ""
                 )
             self.intake = "open"
             record = self._record(request_id, "resume", "completed")
+        elif operation in ("stop_after", "next_issue"):
+            record = self._record(request_id, operation, "accepted", payload)
+        else:
+            raise AssertionError(f"unexpected fake mutation: {operation!r}")
         return producer_suite.DockerResult(0, _ok({"command": record, "replayed": False}), "")
 
     def handle(
@@ -375,6 +409,69 @@ class _FakeProducer:
         if argv[:3] == ["--contract", "1", "handoff"]:
             return producer_suite.DockerResult(
                 3, _fail("unsupported", {"capability": "operator-handoff"}), ""
+            )
+        if (
+            len(argv) == 9
+            and argv[:3] == ["--contract", "1", "stop"]
+            and argv[3] == "--after"
+            and argv[5] == "--request-id"
+            and argv[7] == "--expect-repo"
+        ):
+            if "stop-after" not in self._ctx.capabilities:
+                return producer_suite.DockerResult(
+                    3,
+                    _fail_with_request("unsupported", argv[6], {"capability": "stop-after"}),
+                    "",
+                )
+            if not _is_int_in(argv[4], 1, 999):
+                return producer_suite.DockerResult(
+                    1, _fail_with_request("invalid_argument", argv[6]), ""
+                )
+            return self._mutate("stop_after", argv[6], argv[8], {"after": int(argv[4])})
+        if (
+            len(argv) == 9
+            and argv[:4] == ["--contract", "1", "next", "issue"]
+            and argv[5] == "--request-id"
+            and argv[7] == "--expect-repo"
+        ):
+            if "next-issue" not in self._ctx.capabilities:
+                return producer_suite.DockerResult(
+                    3,
+                    _fail_with_request("unsupported", argv[6], {"capability": "next-issue"}),
+                    "",
+                )
+            if not _is_int_in(argv[4], 1, None):
+                return producer_suite.DockerResult(
+                    1, _fail_with_request("invalid_argument", argv[6]), ""
+                )
+            return self._mutate("next_issue", argv[6], argv[8], {"issue": int(argv[4])})
+        if len(argv) >= 4 and argv[:3] == ["--contract", "1", "recovery"]:
+            capability = (
+                "recovery-retry"
+                if argv[3] == "retry"
+                else "recovery-release"
+                if argv[3] == "release"
+                else None
+            )
+            if capability is not None:
+                return producer_suite.DockerResult(
+                    3,
+                    _fail_with_request(
+                        "unsupported",
+                        _probe_request_id(argv),
+                        {"capability": capability},
+                    ),
+                    "",
+                )
+        if len(argv) >= 3 and argv[:3] == ["--contract", "1", "errors"]:
+            return producer_suite.DockerResult(
+                3,
+                _fail_with_request(
+                    "unsupported",
+                    _probe_request_id(argv),
+                    {"capability": "errors-reset"},
+                ),
+                "",
             )
         if (
             len(argv) == 7
@@ -470,6 +567,9 @@ def test_scenario_ids_are_stable() -> None:
         "stop-after-claim-sigterm",
         "stop-during-starting",
         "resume-supersedes-stop",
+        "stop-after-invalid",
+        "stop-after-restart",
+        "next-issue-restart",
         "halt-records-last-halt",
         "publication-pending-recovery",
     ]
@@ -509,6 +609,9 @@ def test_run_all_passes_with_hold_lock_not_run(fakes: _FakeProducer) -> None:
     assert by_id["stop-after-claim-sigterm"].status == "not_run"
     assert by_id["stop-during-starting"].status == "not_run"
     assert by_id["resume-supersedes-stop"].status == "not_run"
+    assert by_id["stop-after-invalid"].status == "passed"
+    assert by_id["stop-after-restart"].status == "not_run"
+    assert by_id["next-issue-restart"].status == "not_run"
     assert by_id["halt-records-last-halt"].status == "not_run"
     assert by_id["publication-pending-recovery"].status == "not_run"
 
@@ -702,6 +805,9 @@ def test_main_reports_per_scenario_and_exits_zero(
     assert "NOT RUN budget-attempts" in out
     assert "NOT RUN budget-export" in out
     assert "PASS snapshot-bounds" in out
+    assert "PASS stop-after-invalid" in out
+    assert "NOT RUN stop-after-restart" in out
+    assert "NOT RUN next-issue-restart" in out
 
 
 def test_main_with_expect_fail_for_a_not_run_fails(

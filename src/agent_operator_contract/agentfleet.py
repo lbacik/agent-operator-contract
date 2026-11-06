@@ -5,7 +5,8 @@ Instances through the operator contract. ``ls`` lists the Fleet from discovery
 labels and container state alone (no ``exec``) and flags duplicate instance
 names rather than hiding them. ``identity``, ``status`` and ``command`` relay
 the producer reply: human output by default, ``--json`` prints the producer's
-envelope verbatim. ``stop`` and ``resume`` submit mutations: the request ID is
+envelope verbatim. ``stop``, ``resume``, ``stop-after`` and ``next-issue``
+submit mutations: the request ID is
 generated before submission from a cryptographically secure source (or taken
 from ``--request-id``), ``--expect-repo`` is always supplied by the caller and
 never derived from the instance's identity, and an ``identity`` read precedes
@@ -368,8 +369,10 @@ def _run_mutation(
     use_json: bool,
     timeout: float | None = None,
     max_attempts: int | None = None,
+    capability: str | None = None,
+    argv_prefix: Sequence[str] | None = None,
 ) -> int:
-    """Submit ``stop`` or ``resume`` after the identity precheck (spec section 5).
+    """Submit a mutation after the identity precheck (spec section 5).
 
     An ``identity`` read precedes every mutation: when it fails, or when the
     reported contract major or capabilities forbid the mutation, nothing is
@@ -378,7 +381,21 @@ def _run_mutation(
     call with the same request ID and payload; the request ID of every mutation
     is printed, so an ambiguous outcome can be followed up with
     ``command <request-id>``.
+
+    ``operation`` names the mutation for display and error details;
+    ``argv_prefix`` is the agentctl argv before ``--request-id`` (defaults to
+    ``[operation]``); ``capability`` is the required optional capability, or
+    ``None`` when the caller leaves the default derived from ``operation``.
     """
+
+    if argv_prefix is None:
+        prefix = [operation]
+        effective_capability = (
+            capability if capability is not None else shared.required_capability(operation, {})
+        )
+    else:
+        prefix = list(argv_prefix)
+        effective_capability = capability
     try:
         fleet = client.discover(docker)
     except client.ClientError as exc:
@@ -404,11 +421,11 @@ def _run_mutation(
     identity_doc = identity_envelope["result"]
     assert isinstance(identity_doc, dict)
     try:
-        client.ensure_mutation_allowed(identity_doc, shared.required_capability(operation, {}))
+        client.ensure_mutation_allowed(identity_doc, effective_capability)
     except client.ClientError as exc:
         return _print_client_error(exc, use_json)
     sent_id = request_id if request_id is not None else client.new_request_id()
-    argv = [operation, "--request-id", sent_id, "--expect-repo", expect_repo]
+    argv = [*prefix, "--request-id", sent_id, "--expect-repo", expect_repo]
     effective_timeout = _mutation_timeout(timeout)
     effective_attempts = _mutation_max_attempts(max_attempts)
     try:
@@ -749,6 +766,68 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="bounded retries for an ambiguous mutation (default: 3 attempts)",
     )
+    stop_after_parser = sub.add_parser(
+        "stop-after", help="close one instance's intake after N finalized attempts"
+    )
+    stop_after_parser.add_argument("instance", help="instance name from the discovery labels")
+    stop_after_parser.add_argument("after", help="finalized attempts before intake closes (1-999)")
+    stop_after_parser.add_argument(
+        "--expect-repo",
+        required=True,
+        help="Target Repository as owner/name; never taken from the instance itself",
+    )
+    stop_after_parser.add_argument(
+        "--request-id",
+        default=None,
+        help="durable request ID (generated when omitted)",
+    )
+    stop_after_parser.add_argument("--json", dest="json", action="store_true")
+    stop_after_parser.add_argument("--docker", dest="docker", default=None)
+    stop_after_parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=float,
+        default=None,
+        help="consumer timeout in seconds (default: §3.3 class default, 15 s for mutations)",
+    )
+    stop_after_parser.add_argument(
+        "--max-attempts",
+        dest="max_attempts",
+        type=int,
+        default=None,
+        help="bounded retries for an ambiguous mutation (default: 3 attempts)",
+    )
+    next_issue_parser = sub.add_parser(
+        "next-issue", help="prioritize one issue number for the next claim"
+    )
+    next_issue_parser.add_argument("instance", help="instance name from the discovery labels")
+    next_issue_parser.add_argument("issue", help="issue number prioritized for the next claim")
+    next_issue_parser.add_argument(
+        "--expect-repo",
+        required=True,
+        help="Target Repository as owner/name; never taken from the instance itself",
+    )
+    next_issue_parser.add_argument(
+        "--request-id",
+        default=None,
+        help="durable request ID (generated when omitted)",
+    )
+    next_issue_parser.add_argument("--json", dest="json", action="store_true")
+    next_issue_parser.add_argument("--docker", dest="docker", default=None)
+    next_issue_parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=float,
+        default=None,
+        help="consumer timeout in seconds (default: §3.3 class default, 15 s for mutations)",
+    )
+    next_issue_parser.add_argument(
+        "--max-attempts",
+        dest="max_attempts",
+        type=int,
+        default=None,
+        help="bounded retries for an ambiguous mutation (default: 3 attempts)",
+    )
     command_parser = sub.add_parser(
         "command", help="read one committed Operator Command by request ID"
     )
@@ -799,6 +878,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             use_json,
             timeout=float(timeout) if isinstance(timeout, (int, float)) else None,
             max_attempts=int(max_attempts) if isinstance(max_attempts, int) else None,
+        )
+    if args.operation == "stop-after":
+        timeout = getattr(args, "timeout", None)
+        max_attempts = getattr(args, "max_attempts", None)
+        return _run_mutation(
+            docker,
+            str(args.instance),
+            "stop-after",
+            str(args.expect_repo),
+            args.request_id if isinstance(args.request_id, str) else None,
+            use_json,
+            timeout=float(timeout) if isinstance(timeout, (int, float)) else None,
+            max_attempts=int(max_attempts) if isinstance(max_attempts, int) else None,
+            capability="stop-after",
+            argv_prefix=["stop", "--after", str(args.after)],
+        )
+    if args.operation == "next-issue":
+        timeout = getattr(args, "timeout", None)
+        max_attempts = getattr(args, "max_attempts", None)
+        return _run_mutation(
+            docker,
+            str(args.instance),
+            "next-issue",
+            str(args.expect_repo),
+            args.request_id if isinstance(args.request_id, str) else None,
+            use_json,
+            timeout=float(timeout) if isinstance(timeout, (int, float)) else None,
+            max_attempts=int(max_attempts) if isinstance(max_attempts, int) else None,
+            capability="next-issue",
+            argv_prefix=["next", "issue", str(args.issue)],
         )
     if args.operation == "command":
         return _run_command(docker, str(args.instance), str(args.request_id), use_json)

@@ -335,6 +335,122 @@ def test_stub_resume_supersedes_a_pending_stop_plan(tmp_path: Path) -> None:
     )
 
 
+def _next_issue(
+    issue: int, request_id: str, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "next",
+            "issue",
+            str(issue),
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+
+
+def test_stub_stop_after_zero_is_invalid_argument(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    refused = _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "stop",
+            "--after",
+            "0",
+            "--request-id",
+            "req-000000000020",
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+
+    assert refused.returncode == 1
+    assert json.loads(refused.stdout)["error"]["code"] == "invalid_argument"
+    assert _command("req-000000000020", env).returncode == 5
+    assert _stop("example-owner/example-repo", "req-000000000020", env).returncode == 0
+
+
+def test_stub_next_issue_commits_priority_and_claims_it(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 122, True)
+    _patch_state(env, "doc['hold'] = {'point': 'before-claim', 'scope': 'next'}")
+
+    prioritized = _next_issue(122, "req-000000000021", env)
+
+    assert prioritized.returncode == 0
+    record = json.loads(prioritized.stdout)["result"]["command"]
+    assert record["kind"] == "next_issue"
+    assert record["acknowledgement"] == "accepted"
+    held = _status(env)
+    assert held["current_attempt"] is None
+    assert held["intake"]["priority"]["issue"] == 122  # type: ignore[index]
+
+    _patch_state(env, "doc['hold'] = None")
+    snapshot = _status(env)
+
+    assert snapshot["current_attempt"]["issue"]["number"] == 122  # type: ignore[index]
+    assert snapshot["intake"]["priority"] is None  # type: ignore[index]
+    stored = _command("req-000000000021", env)
+    assert json.loads(stored.stdout)["result"]["command"]["acknowledgement"] == "completed"
+
+
+def test_stub_next_issue_supersedes_the_previous_priority(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 122, True)
+    _patch_state(env, "doc['hold'] = {'point': 'before-claim', 'scope': 'next'}")
+
+    assert _next_issue(121, "req-000000000022", env).returncode == 0
+    assert _next_issue(122, "req-000000000023", env).returncode == 0
+
+    _patch_state(env, "doc['hold'] = None")
+    snapshot = _status(env)
+
+    assert snapshot["current_attempt"]["issue"]["number"] == 122  # type: ignore[index]
+    assert (
+        json.loads(_command("req-000000000022", env).stdout)["result"]["command"]["acknowledgement"]
+        == "superseded"
+    )
+    assert (
+        json.loads(_command("req-000000000023", env).stdout)["result"]["command"]["acknowledgement"]
+        == "completed"
+    )
+
+
+def test_stub_next_issue_ineligible_at_commit_is_rejected(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 124, False)
+
+    refused = _next_issue(124, "req-000000000024", env)
+
+    assert refused.returncode == 1
+    assert json.loads(refused.stdout)["error"]["code"] == "rejected"
+    assert _command("req-000000000024", env).returncode == 5
+    assert _stop("example-owner/example-repo", "req-000000000024", env).returncode == 0
+
+
+def test_stub_next_issue_ineligible_at_claim_is_not_fulfilled(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 123, True)
+    _set_issue(env, 124, True)
+    _patch_state(env, "doc['hold'] = {'point': 'before-claim', 'scope': 'next'}")
+
+    assert _next_issue(124, "req-000000000025", env).returncode == 0
+    _set_issue(env, 124, False)
+    _patch_state(env, "doc['hold'] = None")
+    snapshot = _status(env)
+
+    assert snapshot["current_attempt"]["issue"]["number"] == 123  # type: ignore[index]
+    stored = _command("req-000000000025", env)
+    assert json.loads(stored.stdout)["result"]["command"]["acknowledgement"] == "not_fulfilled"
+
+
 def test_stub_command_found_and_not_found(tmp_path: Path) -> None:
     env = _durable_env(tmp_path)
     assert _stop("example-owner/example-repo", "req-000000000007", env).returncode == 0
