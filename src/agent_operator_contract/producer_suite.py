@@ -32,7 +32,7 @@ import threading
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from agent_operator_contract import CONTRACT_MAJOR, documents
 
@@ -1033,14 +1033,20 @@ def scenario_snapshot_bounds(ctx: SuiteContext) -> ScenarioOutcome:
             scenario_id, "failed", f"capabilities {capabilities!r} are not sorted"
         )
     sequences = [record.get("sequence") for record in recent_commands if isinstance(record, dict)]
-    if any(not isinstance(sequence, int) for sequence in sequences) or sequences != sorted(
-        sequences
-    ):
+    if any(not isinstance(sequence, int) for sequence in sequences):
+        return ScenarioOutcome(
+            scenario_id, "failed", "recent_commands are not oldest-first (newest last)"
+        )
+    if sequences != sorted(cast("list[int]", sequences)):
         return ScenarioOutcome(
             scenario_id, "failed", "recent_commands are not oldest-first (newest last)"
         )
     stamped = [event.get("at") for event in recent_events if isinstance(event, dict)]
-    if any(not isinstance(at, str) for at in stamped) or stamped != sorted(stamped):
+    if any(not isinstance(at, str) for at in stamped):
+        return ScenarioOutcome(
+            scenario_id, "failed", "recent_events are not oldest-first (newest last)"
+        )
+    if stamped != sorted(cast("list[str]", stamped)):
         return ScenarioOutcome(
             scenario_id, "failed", "recent_events are not oldest-first (newest last)"
         )
