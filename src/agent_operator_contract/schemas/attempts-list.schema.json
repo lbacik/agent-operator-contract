@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent operator contract attempts list result",
+  "description": "The result of attempts list (spec section 6.1): newest-first AttemptSummary entries plus the opaque next_cursor, null when there is no further page.",
+  "type": "object",
+  "required": ["attempts", "next_cursor"],
+  "properties": {
+    "attempts": {"type": "array", "items": {"$ref": "#/$defs/attempt_summary"}},
+    "next_cursor": {"type": ["string", "null"], "minLength": 1}
+  },
+  "$defs": {
+    "attempt_summary": {
+      "type": "object",
+      "required": [
+        "attempt_id",
+        "issue",
+        "started_at",
+        "finished_at",
+        "lifecycle_state",
+        "outcome",
+        "delivery",
+        "attention_required",
+        "sealed",
+        "sealed_at"
+      ],
+      "properties": {
+        "attempt_id": {"type": "string", "minLength": 1},
+        "issue": {
+          "type": "object",
+          "required": ["number", "title"],
+          "properties": {
+            "number": {"type": "integer", "minimum": 1},
+            "title": {"type": ["string", "null"]}
+          }
+        },
+        "started_at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+        },
+        "finished_at": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+        },
+        "lifecycle_state": {"type": "string", "minLength": 1},
+        "outcome": {
+          "type": ["object", "null"],
+          "required": ["native", "reason", "label"],
+          "properties": {
+            "native": {"type": "string", "minLength": 1},
+            "reason": {"type": ["string", "null"]},
+            "label": {"type": "string", "minLength": 1}
+          }
+        },
+        "delivery": {
+          "type": ["object", "null"],
+          "required": ["pull_request"],
+          "properties": {
+            "pull_request": {
+              "type": ["object", "null"],
+              "required": ["number", "url"],
+              "properties": {
+                "number": {"type": "integer", "minimum": 1},
+                "url": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        },
+        "attention_required": {"type": "boolean"},
+        "sealed": {"type": "boolean"},
+        "sealed_at": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"sealed": {"const": true}}, "required": ["sealed"]},
+          "then": {"properties": {"sealed_at": {"type": "string"}}}
+        },
+        {
+          "if": {"properties": {"sealed": {"const": false}}, "required": ["sealed"]},
+          "then": {"properties": {"sealed_at": {"const": null}}}
+        }
+      ]
+    }
+  }
+}

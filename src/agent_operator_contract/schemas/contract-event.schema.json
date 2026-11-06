@@ -1,0 +1,88 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent operator contract ContractEvent",
+  "description": "One contract event (spec section 10): base fields plus the extra fields of each event. Native events use the native. prefix and carry no required extras.",
+  "type": "object",
+  "required": ["at", "level", "event", "text"],
+  "properties": {
+    "at": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"
+    },
+    "level": {"type": "string", "enum": ["debug", "info", "warning", "error"]},
+    "event": {"type": "string", "minLength": 1},
+    "text": {"type": "string", "maxLength": 300},
+    "attempt_id": {"type": "string", "minLength": 1},
+    "phase": {"type": "string", "minLength": 1},
+    "issue": {"type": "integer", "minimum": 1},
+    "request_id": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"},
+    "kind": {
+      "type": "string",
+      "enum": [
+        "stop",
+        "stop_after",
+        "resume",
+        "next_issue",
+        "handoff",
+        "recovery_retry",
+        "recovery_release",
+        "errors_reset"
+      ]
+    },
+    "acknowledgement": {
+      "type": "string",
+      "enum": ["accepted", "completed", "superseded", "not_fulfilled"]
+    },
+    "outcome": {"type": "string", "minLength": 1},
+    "reason": {"type": ["string", "null"]},
+    "check": {"type": "string", "minLength": 1},
+    "result": {"type": "string", "enum": ["started", "ok", "skipped", "failed"]},
+    "agent_version": {"type": "string", "minLength": 1}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"event": {"const": "process_started"}}, "required": ["event"]},
+      "then": {"required": ["agent_version"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "startup_check"}}, "required": ["event"]},
+      "then": {"required": ["check", "result"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "halted"}}, "required": ["event"]},
+      "then": {"required": ["reason"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "claim_opened"}}, "required": ["event"]},
+      "then": {"required": ["attempt_id", "issue"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "phase_changed"}}, "required": ["event"]},
+      "then": {"required": ["attempt_id", "phase"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "outcome_recorded"}}, "required": ["event"]},
+      "then": {"required": ["attempt_id", "outcome", "reason"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "attempt_finished"}}, "required": ["event"]},
+      "then": {"required": ["attempt_id"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "attempt_released"}}, "required": ["event"]},
+      "then": {"required": ["attempt_id"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "sealed"}}, "required": ["event"]},
+      "then": {"required": ["attempt_id"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "command_accepted"}}, "required": ["event"]},
+      "then": {"required": ["request_id", "kind", "acknowledgement"]}
+    },
+    {
+      "if": {"properties": {"event": {"const": "command_resolved"}}, "required": ["event"]},
+      "then": {"required": ["request_id", "acknowledgement"]}
+    }
+  ]
+}

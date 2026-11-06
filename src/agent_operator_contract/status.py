@@ -132,12 +132,23 @@ class CommandRecord:
 
 @dataclass(frozen=True)
 class ContractEvent:
-    """One contract event (spec section 10)."""
+    """One contract event (spec section 10), with its per-event extra fields."""
 
     at: str
     level: str
     event: str
     text: str
+    attempt_id: str | None = None
+    phase: str | None = None
+    issue: int | None = None
+    request_id: str | None = None
+    kind: str | None = None
+    acknowledgement: str | None = None
+    outcome: str | None = None
+    reason: str | None = None
+    check: str | None = None
+    result: str | None = None
+    agent_version: str | None = None
 
 
 @dataclass(frozen=True)
@@ -469,6 +480,10 @@ def _parse_attempt_summary(doc: object, prefix: str, strict: bool) -> AttemptSum
     if type(sealed) is not bool:
         raise _fail(prefix, "sealed must be a boolean")
     sealed_at = _parse_nullable_timestamp(_required(data, "sealed_at", prefix), prefix, "sealed_at")
+    if sealed is True and sealed_at is None:
+        raise _fail(prefix, "sealed_at must be set when sealed is true")
+    if sealed is False and sealed_at is not None:
+        raise _fail(prefix, "sealed_at must be null when sealed is false")
     return AttemptSummary(
         attempt_id=attempt_id,
         issue_number=number,
@@ -586,7 +601,41 @@ def _parse_contract_event(doc: object, prefix: str, strict: bool) -> ContractEve
         raise _fail(prefix, "text must be a string")
     if len(text) > 300:
         raise _fail(prefix, "text must be at most 300 characters")
-    return ContractEvent(at=at, level=level, event=event, text=text)
+    if event.startswith("native."):
+        return ContractEvent(at=at, level=level, event=event, text=text)
+    errors = documents.validate_contract_event(dict(data))
+    # validate_contract_event uses the "contract event" prefix; re-map to this prefix.
+    if errors:
+        raise StatusError(f"{prefix}: {'; '.join(errors)}")
+    def _opt_str(name: str) -> str | None:
+        value = data.get(name)
+        return value if isinstance(value, str) else None
+
+    def _opt_issue() -> int | None:
+        value = data.get("issue")
+        return value if type(value) is int else None
+
+    def _opt_reason() -> str | None:
+        value = data.get("reason")
+        return value if isinstance(value, str) else None
+
+    return ContractEvent(
+        at=at,
+        level=level,
+        event=event,
+        text=text,
+        attempt_id=_opt_str("attempt_id"),
+        phase=_opt_str("phase"),
+        issue=_opt_issue(),
+        request_id=_opt_str("request_id"),
+        kind=_opt_str("kind"),
+        acknowledgement=_opt_str("acknowledgement"),
+        outcome=_opt_str("outcome"),
+        reason=_opt_reason(),
+        check=_opt_str("check"),
+        result=_opt_str("result"),
+        agent_version=_opt_str("agent_version"),
+    )
 
 
 def _parse_identity(doc: object, prefix: str, strict: bool) -> Identity:

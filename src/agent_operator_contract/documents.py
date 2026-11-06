@@ -84,6 +84,11 @@ SCHEMA_NAMES: tuple[str, ...] = (
     "figure",
     "command",
     "mutation-result",
+    "attempt-summary",
+    "manifest-entry",
+    "attempts-list",
+    "attempts-show",
+    "contract-event",
 )
 
 STATUS_STATES: tuple[str, ...] = (
@@ -151,6 +156,43 @@ ACKNOWLEDGEMENTS: tuple[str, ...] = (
 
 EVENT_LEVELS: tuple[str, ...] = ("debug", "info", "warning", "error")
 """Every Contract Event ``level`` of spec section 10."""
+
+MANIFEST_KINDS: tuple[str, ...] = (
+    "events",
+    "transcript",
+    "tool_call",
+    "tool_result",
+    "model_output",
+    "command_output",
+    "record",
+    "other",
+)
+"""Every ``ManifestEntry.kind`` of spec section 7.6."""
+
+STARTUP_CHECK_RESULTS: tuple[str, ...] = ("started", "ok", "skipped", "failed")
+"""Every ``startup_check`` event ``result`` of spec section 10."""
+
+MANIFEST_PATH_PATTERN = r"^(?!/)(?!.*\.\.).+$"
+"""Relative POSIX path: no leading slash, no ``..`` segment (spec section 7.6)."""
+
+SHA256_PATTERN = r"^[0-9a-f]{64}$"
+"""Lowercase hex sha256 of a manifest file (spec section 7.6)."""
+
+CONTRACT_EVENTS: tuple[str, ...] = (
+    "process_started",
+    "startup_check",
+    "ready",
+    "halted",
+    "claim_opened",
+    "phase_changed",
+    "outcome_recorded",
+    "attempt_finished",
+    "attempt_released",
+    "sealed",
+    "command_accepted",
+    "command_resolved",
+)
+"""Every Contract Event name of spec section 10 (``native.`` names excluded)."""
 
 HARNESS_VERSION = "1.0"
 """The harness protocol version the suite speaks (spec section 15.1)."""
@@ -649,8 +691,34 @@ def _validate_attempt_summary(doc: object, prefix: str) -> list[str]:
                     errors.append(f"{prefix}.outcome.label must be a non-empty string")
     if "delivery" in doc:
         delivery = doc["delivery"]
-        if delivery is not None and not isinstance(delivery, dict):
-            errors.append(f"{prefix}.delivery must be an object or null")
+        if delivery is not None:
+            if not isinstance(delivery, dict):
+                errors.append(f"{prefix}.delivery must be an object or null")
+            else:
+                if "pull_request" not in delivery:
+                    errors.append(f"{prefix}.delivery is missing required property: 'pull_request'")
+                else:
+                    pull = delivery["pull_request"]
+                    if pull is not None:
+                        if not isinstance(pull, dict):
+                            errors.append(
+                                f"{prefix}.delivery.pull_request must be an object or null"
+                            )
+                        else:
+                            if "number" not in pull:
+                                errors.append(
+                                    f"{prefix}.delivery.pull_request is missing 'number'"
+                                )
+                            elif type(pull["number"]) is not int or pull["number"] < 1:
+                                errors.append(
+                                    f"{prefix}.delivery.pull_request.number must be >= 1"
+                                )
+                            if "url" not in pull:
+                                errors.append(f"{prefix}.delivery.pull_request is missing 'url'")
+                            elif not isinstance(pull["url"], str) or not pull["url"]:
+                                errors.append(
+                                    f"{prefix}.delivery.pull_request.url must be non-empty"
+                                )
     if "attention_required" in doc and type(doc["attention_required"]) is not bool:
         errors.append(f"{prefix}.attention_required must be a boolean")
     if "sealed" in doc and type(doc["sealed"]) is not bool:
@@ -659,6 +727,104 @@ def _validate_attempt_summary(doc: object, prefix: str) -> list[str]:
         sealed_at = doc["sealed_at"]
         if sealed_at is not None and not _validate_timestamp(sealed_at):
             errors.append(f"{prefix}.sealed_at must be an RFC 3339 UTC timestamp or null")
+    if "sealed" in doc and "sealed_at" in doc and type(doc["sealed"]) is bool:
+        if doc["sealed"] is True and doc["sealed_at"] is None:
+            errors.append(f"{prefix}.sealed_at must be set when sealed is true")
+        if doc["sealed"] is False and doc["sealed_at"] is not None:
+            errors.append(f"{prefix}.sealed_at must be null when sealed is false")
+    return errors
+
+
+def validate_attempt_summary(doc: object) -> list[str]:
+    """Check an AttemptSummary; the empty list means valid (spec section 7.4).
+
+    ``sealed_at`` is set exactly when ``sealed`` is true.
+    """
+    if not isinstance(doc, dict):
+        return ["attempt must be an object"]
+    return _validate_attempt_summary(doc, "attempt")
+
+
+def _validate_manifest_path(value: object) -> bool:
+    return _matches(MANIFEST_PATH_PATTERN, value) and isinstance(value, str) and value != ""
+
+
+def validate_manifest_entry(doc: object, prefix: str = "manifest entry") -> list[str]:
+    """Check a ManifestEntry; the empty list means valid (spec section 7.6)."""
+    if not isinstance(doc, dict):
+        return [f"{prefix} must be an object"]
+    errors: list[str] = []
+    for key in ("path", "kind", "media_type", "size", "sha256"):
+        if key not in doc:
+            errors.append(f"{prefix} is missing required property: {key!r}")
+    if "path" in doc:
+        path = doc["path"]
+        if not isinstance(path, str) or not path:
+            errors.append(f"{prefix}.path must be a non-empty string")
+        elif path.startswith("/") or ".." in path.split("/"):
+            errors.append(f"{prefix}.path must be a relative POSIX path without '..'")
+    if "kind" in doc and doc["kind"] not in MANIFEST_KINDS:
+        errors.append(f"{prefix}.kind {doc['kind']!r} is not a known 1.0 kind")
+    if "media_type" in doc and (
+        not isinstance(doc["media_type"], str) or not doc["media_type"]
+    ):
+        errors.append(f"{prefix}.media_type must be a non-empty string")
+    if "size" in doc and (type(doc["size"]) is not int or doc["size"] < 0):
+        errors.append(f"{prefix}.size must be an integer >= 0")
+    if "sha256" in doc and not _matches(SHA256_PATTERN, doc["sha256"]):
+        errors.append(f"{prefix}.sha256 must be lowercase hex sha256")
+    return errors
+
+
+def validate_attempts_list(doc: object) -> list[str]:
+    """Check an ``attempts list`` result; the empty list means valid (spec section 6.1).
+
+    The result is ``{"attempts": [AttemptSummary], "next_cursor": string|null}``,
+    newest first. Unknown fields are ignored so a minor can add them.
+    """
+    if not isinstance(doc, dict):
+        return ["attempts list result must be an object"]
+    errors: list[str] = []
+    if "attempts" not in doc:
+        errors.append("attempts list result is missing required property: 'attempts'")
+    elif not isinstance(doc["attempts"], list):
+        errors.append("attempts list result.attempts must be an array")
+    else:
+        for index, entry in enumerate(doc["attempts"]):
+            errors.extend(
+                _validate_attempt_summary(entry, f"attempts list result.attempts[{index}]")
+            )
+    if "next_cursor" not in doc:
+        errors.append("attempts list result is missing required property: 'next_cursor'")
+    elif doc["next_cursor"] is not None and (
+        not isinstance(doc["next_cursor"], str) or not doc["next_cursor"]
+    ):
+        errors.append("attempts list result.next_cursor must be a string or null")
+    return errors
+
+
+def validate_attempts_show(doc: object) -> list[str]:
+    """Check an ``attempts show`` result; the empty list means valid (spec section 6.1).
+
+    The result is ``{"attempt": AttemptSummary, "manifest": [ManifestEntry]}``.
+    Unknown fields are ignored so a minor can add them.
+    """
+    if not isinstance(doc, dict):
+        return ["attempts show result must be an object"]
+    errors: list[str] = []
+    if "attempt" not in doc:
+        errors.append("attempts show result is missing required property: 'attempt'")
+    else:
+        errors.extend(_validate_attempt_summary(doc["attempt"], "attempts show result.attempt"))
+    if "manifest" not in doc:
+        errors.append("attempts show result is missing required property: 'manifest'")
+    elif not isinstance(doc["manifest"], list):
+        errors.append("attempts show result.manifest must be an array")
+    else:
+        for index, entry in enumerate(doc["manifest"]):
+            errors.extend(
+                validate_manifest_entry(entry, f"attempts show result.manifest[{index}]")
+            )
     return errors
 
 
@@ -764,7 +930,8 @@ def _validate_contract_event(doc: object, prefix: str) -> list[str]:
         errors.append(f"{prefix}.at must be an RFC 3339 UTC timestamp")
     if "level" in doc and doc["level"] not in EVENT_LEVELS:
         errors.append(f"{prefix}.level {doc['level']!r} is not a known 1.0 level")
-    if "event" in doc and (not isinstance(doc["event"], str) or not doc["event"]):
+    event = doc.get("event")
+    if "event" in doc and (not isinstance(event, str) or not event):
         errors.append(f"{prefix}.event must be a non-empty string")
     if "text" in doc:
         text = doc["text"]
@@ -772,7 +939,101 @@ def _validate_contract_event(doc: object, prefix: str) -> list[str]:
             errors.append(f"{prefix}.text must be a string")
         elif len(text) > 300:
             errors.append(f"{prefix}.text must be at most 300 characters")
+    if not isinstance(event, str) or not event:
+        return errors
+    if event.startswith("native."):
+        return errors
+    if event not in CONTRACT_EVENTS:
+        return errors
+    if event == "process_started":
+        if "agent_version" not in doc:
+            errors.append(f"{prefix} is missing required property: 'agent_version'")
+        elif not isinstance(doc["agent_version"], str) or not doc["agent_version"]:
+            errors.append(f"{prefix}.agent_version must be a non-empty string")
+    elif event == "startup_check":
+        if "check" not in doc:
+            errors.append(f"{prefix} is missing required property: 'check'")
+        elif not isinstance(doc["check"], str) or not doc["check"]:
+            errors.append(f"{prefix}.check must be a non-empty string")
+        if "result" not in doc:
+            errors.append(f"{prefix} is missing required property: 'result'")
+        elif doc["result"] not in STARTUP_CHECK_RESULTS:
+            errors.append(f"{prefix}.result {doc.get('result')!r} is not known")
+    elif event == "halted":
+        if "reason" not in doc:
+            errors.append(f"{prefix} is missing required property: 'reason'")
+        elif not isinstance(doc["reason"], str) or not doc["reason"]:
+            errors.append(f"{prefix}.reason must be a non-empty string")
+    elif event == "claim_opened":
+        if "attempt_id" not in doc:
+            errors.append(f"{prefix} is missing required property: 'attempt_id'")
+        elif not isinstance(doc["attempt_id"], str) or not doc["attempt_id"]:
+            errors.append(f"{prefix}.attempt_id must be a non-empty string")
+        if "issue" not in doc:
+            errors.append(f"{prefix} is missing required property: 'issue'")
+        elif type(doc["issue"]) is not int or doc["issue"] < 1:
+            errors.append(f"{prefix}.issue must be an integer >= 1")
+    elif event == "phase_changed":
+        if "attempt_id" not in doc:
+            errors.append(f"{prefix} is missing required property: 'attempt_id'")
+        elif not isinstance(doc["attempt_id"], str) or not doc["attempt_id"]:
+            errors.append(f"{prefix}.attempt_id must be a non-empty string")
+        if "phase" not in doc:
+            errors.append(f"{prefix} is missing required property: 'phase'")
+        elif not isinstance(doc["phase"], str) or not doc["phase"]:
+            errors.append(f"{prefix}.phase must be a non-empty string")
+    elif event == "outcome_recorded":
+        if "attempt_id" not in doc:
+            errors.append(f"{prefix} is missing required property: 'attempt_id'")
+        elif not isinstance(doc["attempt_id"], str) or not doc["attempt_id"]:
+            errors.append(f"{prefix}.attempt_id must be a non-empty string")
+        if "outcome" not in doc:
+            errors.append(f"{prefix} is missing required property: 'outcome'")
+        elif not isinstance(doc["outcome"], str) or not doc["outcome"]:
+            errors.append(f"{prefix}.outcome must be a non-empty string")
+        if "reason" not in doc:
+            errors.append(f"{prefix} is missing required property: 'reason'")
+        elif doc["reason"] is not None and not isinstance(doc["reason"], str):
+            errors.append(f"{prefix}.reason must be a string or null")
+    elif event in ("attempt_finished", "attempt_released", "sealed"):
+        if "attempt_id" not in doc:
+            errors.append(f"{prefix} is missing required property: 'attempt_id'")
+        elif not isinstance(doc["attempt_id"], str) or not doc["attempt_id"]:
+            errors.append(f"{prefix}.attempt_id must be a non-empty string")
+    elif event == "command_accepted":
+        if "request_id" not in doc:
+            errors.append(f"{prefix} is missing required property: 'request_id'")
+        elif not _matches(REQUEST_ID_PATTERN, doc["request_id"]):
+            errors.append(f"{prefix}.request_id must match the request ID pattern")
+        if "kind" not in doc:
+            errors.append(f"{prefix} is missing required property: 'kind'")
+        elif doc["kind"] not in COMMAND_KINDS:
+            errors.append(f"{prefix}.kind {doc.get('kind')!r} is not a known 1.0 kind")
+        if "acknowledgement" not in doc:
+            errors.append(f"{prefix} is missing required property: 'acknowledgement'")
+        elif doc["acknowledgement"] not in ACKNOWLEDGEMENTS:
+            errors.append(f"{prefix}.acknowledgement {doc.get('acknowledgement')!r} is not known")
+    elif event == "command_resolved":
+        if "request_id" not in doc:
+            errors.append(f"{prefix} is missing required property: 'request_id'")
+        elif not _matches(REQUEST_ID_PATTERN, doc["request_id"]):
+            errors.append(f"{prefix}.request_id must match the request ID pattern")
+        if "acknowledgement" not in doc:
+            errors.append(f"{prefix} is missing required property: 'acknowledgement'")
+        elif doc["acknowledgement"] not in ACKNOWLEDGEMENTS:
+            errors.append(f"{prefix}.acknowledgement {doc.get('acknowledgement')!r} is not known")
     return errors
+
+
+def validate_contract_event(doc: object) -> list[str]:
+    """Check a Contract Event; the empty list means valid (spec section 10).
+
+    The base fields plus the extra fields of each event are enforced. Native
+    events (``native.`` prefix) carry no required extras and are ignored.
+    """
+    if not isinstance(doc, dict):
+        return ["contract event must be an object"]
+    return _validate_contract_event(doc, "contract event")
 
 
 def validate_status(doc: object) -> list[str]:

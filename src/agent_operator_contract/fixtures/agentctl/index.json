@@ -138,6 +138,22 @@
     "contract-unknown-major": {
       "classification": "malformed_stdout",
       "note": "Envelope with an unknown contract major: not coherent for this consumer, never parsed as success."
+    },
+    "attempts-list": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with two AttemptSummary entries, newest first, no further page."
+    },
+    "attempts-list-paged": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with one AttemptSummary and an opaque next_cursor for the next page."
+    },
+    "attempts-show-unsealed": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with an unsealed attempt and its manifest."
+    },
+    "attempts-not-found": {
+      "classification": "not_found",
+      "note": "Exit 5, not_found: unknown Attempt ID."
     }
   }
 }
