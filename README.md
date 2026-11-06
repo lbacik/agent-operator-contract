@@ -13,3 +13,7 @@ This repository owns the normative specification, its fixtures and conformance s
 ## Versioning
 
 One version line: the tag `vX.Y.Z` is the contract version and `X` is the contract major. The library and `agentfleet` are released with it. Engines and consumers depend on this repository as a git dependency pinned to a tag and run its fixtures and conformance suite in their own CI.
+
+## Development
+
+Requires [uv](https://docs.astral.sh/uv/). `uv sync` sets up the environment; `uv run pytest` runs the tests. See [AGENTS.md](AGENTS.md#stack) for the stack conventions and the full check.
