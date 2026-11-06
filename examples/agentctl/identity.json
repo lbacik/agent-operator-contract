@@ -1,0 +1,10 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "identity"
+  ],
+  "exit_code": 0,
+  "stdout": "{\"contract\":\"1.0\",\"ok\":true,\"result\":{\"agent_version\":\"0.9.0\",\"backend\":\"coding-agent\",\"capabilities\":[\"next-issue\",\"stop-after\"],\"contract\":{\"major\":1,\"minor\":0},\"mode\":\"online\",\"process_started_at\":\"2026-11-06T08:00:00Z\",\"repository\":\"example-owner/example-repo\"}}\n",
+  "stderr": ""
+}

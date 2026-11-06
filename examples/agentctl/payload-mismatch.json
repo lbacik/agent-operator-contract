@@ -1,0 +1,16 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "next",
+    "issue",
+    "43",
+    "--request-id",
+    "req-3f1c9a2b7d10",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 1,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"payload_mismatch\",\"message\":\"request req-3f1c9a2b7d10 was already used for a different command\",\"request_id\":\"req-3f1c9a2b7d10\",\"retryable\":false},\"ok\":false}\n",
+  "stderr": ""
+}

@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "command",
+    "req-000000000000"
+  ],
+  "exit_code": 5,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"not_found\",\"message\":\"no command is recorded for req-000000000000\",\"retryable\":false},\"ok\":false}\n",
+  "stderr": ""
+}
