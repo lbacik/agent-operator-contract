@@ -13,13 +13,17 @@ them. It is built as a Docker image in CI and never published.
   Claim for an eligible issue behind a Claim boundary, runs recovery at start,
   records Halts durably, and honors harness holds (notably `before-claim`)
   and one-shot crashes armed by the harness; anything else well-formed
-  answers `internal`.
+  answers `internal`. Mutations commit while holding the engine lock file;
+  `status` never waits on it and instead serves the last prepared snapshot
+  while the lock is held. Snapshots are bounded to 256 KiB with oldest-first
+  truncation (events, then figures, then commands).
 - [`harness`](harness): the Conformance Harness executable. It implements the
   protocol verbs by steering a stub container over the Docker CLI: `setup`,
   `teardown`, `set-issue` (eligible/ineligible), `hold`/`release` at named
   points, `finish-attempt` with a native outcome, `crash` at every crash
   point, `terminate` (SIGTERM), `stop-container`/`start-container`, `halt`
-  with a reason, `grow-archive`, `hold-lock` and `defer-publication`
+  with a reason, `grow-archive`, `hold-lock` (holds the engine lock file
+  for the requested duration) and `defer-publication`
   (leaves a publication effect pending at restart). State mutations run
   inside the container over `docker exec`, so the stub engine honors holds,
   crashes, Halts and deferred publication across restarts.

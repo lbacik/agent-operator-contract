@@ -5,11 +5,19 @@ harness verbs that need no container run as-is, while ``setup`` against a
 missing Docker CLI must answer ``failed`` instead of crashing.
 """
 
+import hashlib
+import io
 import json
 import os
 import subprocess
 import sys
+import tarfile
+import threading
+import time
 from pathlib import Path
+from typing import Any
+
+import pytest
 
 from agent_operator_contract import documents
 
@@ -951,6 +959,7 @@ def test_harness_verbs_without_a_container_answer_failed(tmp_path: Path) -> None
     for verb in (
         "set-issue",
         "hold",
+        "hold-lock",
         "release",
         "finish-attempt",
         "crash",
@@ -1028,3 +1037,342 @@ def test_harness_setup_unknown_capability_is_unsupported(tmp_path: Path) -> None
     assert completed.returncode == 3
     doc = json.loads(completed.stdout)
     assert doc["error"]["details"] == {"what": "capability", "name": "time-travel"}
+
+
+def _run_agentctl_raw(argv: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[bytes]:
+    """Run ``agentctl`` capturing raw bytes (``attempts export`` streams a tar)."""
+    return subprocess.run(
+        [sys.executable, str(AGENTCTL), *argv],
+        capture_output=True,
+        timeout=60,
+        env=env,
+    )
+
+
+def _agentctl_module(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """Load the stub ``agentctl`` as a module so tests can drive its bounds."""
+    import runpy
+
+    monkeypatch.syspath_prepend(str(PACKAGE_SRC))
+    return runpy.run_path(str(AGENTCTL), run_name="stub_agentctl_bounds")
+
+
+def _sized_event(index: int, size: int) -> dict[str, Any]:
+    return {
+        "at": f"2026-01-01T00:{index // 60:02d}:{index % 60:02d}Z",
+        "level": "info",
+        "event": "note",
+        "text": f"event-{index}-" + "x" * size,
+    }
+
+
+def _sized_command(sequence: int, size: int) -> dict[str, Any]:
+    return {
+        "request_id": f"req-bound-{sequence:06d}",
+        "sequence": sequence,
+        "kind": "stop",
+        "detail": "y" * size,
+    }
+
+
+def test_stub_apply_bounds_drops_oldest_events_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import copy
+
+    namespace = _agentctl_module(monkeypatch)
+    events = [_sized_event(index, 6000) for index in range(50)]
+    commands = [_sized_command(1, 100)]
+    figures = {"load": "small"}
+    snapshot: dict[str, Any] = {
+        "recent_events": events,
+        "recent_commands": commands,
+        "current_attempt": {"attempt_id": "stub-1", "figures": figures},
+        "truncated": False,
+    }
+    saved_events = copy.deepcopy(events)
+    saved_commands = copy.deepcopy(commands)
+
+    bounded: dict[str, Any] = namespace["_apply_bounds"](snapshot)
+
+    assert namespace["_snapshot_size_bytes"](bounded) <= namespace["SNAPSHOT_MAX_BYTES"]
+    assert bounded["truncated"] is True
+    assert events == saved_events
+    assert commands == saved_commands
+    assert bounded["recent_commands"] == commands
+    assert bounded["current_attempt"]["figures"] == figures
+    remaining = bounded["recent_events"]
+    assert len(remaining) < len(events)
+    assert remaining == events[len(events) - len(remaining) :]
+    assert remaining[-1] == events[-1]
+
+
+def test_stub_apply_bounds_drops_figures_before_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _agentctl_module(monkeypatch)
+    commands = [_sized_command(1, 100), _sized_command(2, 100)]
+    snapshot: dict[str, Any] = {
+        "recent_events": [_sized_event(0, 100)],
+        "recent_commands": commands,
+        "current_attempt": {
+            "attempt_id": "stub-1",
+            "figures": {f"figure-{index}": "y" * 100_000 for index in range(3)},
+        },
+        "truncated": False,
+    }
+
+    bounded: dict[str, Any] = namespace["_apply_bounds"](snapshot)
+
+    assert namespace["_snapshot_size_bytes"](bounded) <= namespace["SNAPSHOT_MAX_BYTES"]
+    assert bounded["truncated"] is True
+    assert bounded["recent_events"] == []
+    assert len(bounded["current_attempt"]["figures"]) < 3
+    assert bounded["recent_commands"] == commands
+
+
+def test_stub_apply_bounds_drops_oldest_commands_last(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    namespace = _agentctl_module(monkeypatch)
+    commands = [_sized_command(sequence, 60_000) for sequence in range(1, 6)]
+    snapshot: dict[str, Any] = {
+        "recent_events": [_sized_event(0, 100)],
+        "recent_commands": commands,
+        "current_attempt": {"attempt_id": "stub-1", "figures": {"load": "small"}},
+        "truncated": False,
+    }
+
+    bounded: dict[str, Any] = namespace["_apply_bounds"](snapshot)
+
+    assert namespace["_snapshot_size_bytes"](bounded) <= namespace["SNAPSHOT_MAX_BYTES"]
+    assert bounded["truncated"] is True
+    assert bounded["recent_events"] == []
+    assert bounded["current_attempt"]["figures"] == {}
+    remaining = bounded["recent_commands"]
+    assert 1 <= len(remaining) < len(commands)
+    assert remaining == commands[len(commands) - len(remaining) :]
+    assert [record["sequence"] for record in remaining] == sorted(
+        record["sequence"] for record in remaining
+    )
+
+
+def test_stub_recent_commands_capped_at_twenty(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    for index in range(11):
+        assert _stop("example-owner/example-repo", f"req-cap-{index:06d}-stop", env).returncode == 0
+        reopened = _run_agentctl(
+            [
+                "--contract",
+                "1",
+                "resume",
+                "--request-id",
+                f"req-cap-{index:06d}-resume",
+                "--expect-repo",
+                "example-owner/example-repo",
+            ],
+            env,
+        )
+        assert reopened.returncode == 0
+
+    snapshot = _status(env)
+    recent = snapshot["recent_commands"]
+    assert isinstance(recent, list)
+    assert len(recent) == 20
+    sequences = [record["sequence"] for record in recent if isinstance(record, dict)]
+    assert sequences == list(range(3, 23))
+
+
+def test_stub_capabilities_are_sorted(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    env["CONTRACT_CAPABILITIES"] = "stop-after,next-issue"
+
+    identity = _run_agentctl(["--contract", "1", "identity"], env)
+
+    assert identity.returncode == 0
+    assert json.loads(identity.stdout)["result"]["capabilities"] == [
+        "next-issue",
+        "stop-after",
+    ]
+
+    snapshot = _status(env)
+    identity_doc = snapshot["identity"]
+    assert isinstance(identity_doc, dict)
+    assert identity_doc["capabilities"] == ["next-issue", "stop-after"]
+
+
+def test_stub_status_under_held_lock_serves_prepared_state(tmp_path: Path) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    env = _durable_env(tmp_path)
+    baseline = _status(env)
+    baseline_instance = baseline["instance"]
+    baseline_intake = baseline["intake"]
+    assert isinstance(baseline_instance, dict)
+    assert isinstance(baseline_intake, dict)
+
+    lock_path = tmp_path / "volume" / "agent-operator-contract.lock"
+    with open(lock_path, "a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            started = time.monotonic()
+            answered = _run_agentctl(["--contract", "1", "status"], env)
+            elapsed = time.monotonic() - started
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    assert answered.returncode == 0, answered.stderr
+    doc = json.loads(answered.stdout)
+    assert documents.validate_envelope(doc) == []
+    assert documents.validate_status(doc["result"]) == []
+    assert elapsed < 3.0
+    during = doc["result"]
+    assert isinstance(during, dict)
+    assert isinstance(during["instance"], dict)
+    assert isinstance(during["intake"], dict)
+    assert during["instance"]["observed_at"] <= baseline_instance["observed_at"]
+    assert during["intake"]["observed_at"] <= baseline_intake["observed_at"]
+
+
+def test_stub_mutation_waits_for_the_engine_lock(tmp_path: Path) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    env = _durable_env(tmp_path)
+    lock_path = tmp_path / "volume" / "agent-operator-contract.lock"
+    lock_path.write_text("", encoding="utf-8")
+    outcome: dict[str, Any] = {}
+
+    def _commit() -> None:
+        started = time.monotonic()
+        completed = _stop("example-owner/example-repo", "req-lock-wait-1", env)
+        outcome["elapsed"] = time.monotonic() - started
+        outcome["returncode"] = completed.returncode
+        outcome["stdout"] = completed.stdout
+
+    with open(lock_path, encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        worker = threading.Thread(target=_commit)
+        worker.start()
+        time.sleep(1.5)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    worker.join(timeout=60)
+
+    assert outcome["elapsed"] >= 1.0
+    assert outcome["returncode"] == 0
+    assert json.loads(outcome["stdout"])["result"]["command"]["request_id"] == "req-lock-wait-1"
+
+
+def test_stub_attempts_export_streams_manifest_first(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 201, True)
+    snapshot = _status(env)
+    current = snapshot["current_attempt"]
+    assert isinstance(current, dict)
+    assert isinstance(current["attempt_id"], str)
+    attempt_id: str = current["attempt_id"]
+
+    completed = _run_agentctl_raw(["--contract", "1", "attempts", "export", attempt_id], env)
+
+    assert completed.returncode == 0, completed.stderr
+    with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
+        names = archive.getnames()
+        assert names
+        assert names[0] == "manifest.json"
+        manifest_file = archive.extractfile("manifest.json")
+        assert manifest_file is not None
+        manifest = json.loads(manifest_file.read())
+        assert manifest["attempt"]["attempt_id"] == attempt_id
+        for entry in manifest["files"]:
+            member = archive.extractfile(entry["path"])
+            assert member is not None
+            data = member.read()
+            assert len(data) == entry["size"]
+            assert hashlib.sha256(data).hexdigest() == entry["sha256"]
+
+
+def test_stub_attempts_export_unknown_attempt_is_not_found(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+
+    completed = _run_agentctl(["--contract", "1", "attempts", "export", "no-such-attempt"], env)
+
+    assert completed.returncode == 5
+    assert json.loads(completed.stdout)["error"]["code"] == "not_found"
+
+
+def test_stub_attempts_export_unknown_path_is_not_found(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 202, True)
+    snapshot = _status(env)
+    current = snapshot["current_attempt"]
+    assert isinstance(current, dict)
+    assert isinstance(current["attempt_id"], str)
+
+    completed = _run_agentctl(
+        ["--contract", "1", "attempts", "export", current["attempt_id"], "--path", "nope.bin"],
+        env,
+    )
+
+    assert completed.returncode == 5
+    assert json.loads(completed.stdout)["error"]["code"] == "not_found"
+
+
+def test_harness_hold_lock_holds_the_engine_lock(tmp_path: Path) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    lock_file = tmp_path / "engine.lock"
+    lock_file.write_text("", encoding="utf-8")
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os\n"
+        "import sys\n"
+        "if len(sys.argv) < 2 or sys.argv[1] != 'exec':\n"
+        "    sys.exit(0)\n"
+        "target = os.environ['FAKE_LOCK_PATH']\n"
+        "script = sys.stdin.read().replace('/data/agent-operator-contract.lock', target)\n"
+        "exec(compile(script, '<engine>', 'exec'), {})\n",
+        encoding="utf-8",
+    )
+    fake_docker.chmod(0o755)
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps({"container": "stub-1", "volume": "stub-1-data"}))
+    env = dict(os.environ)
+    env["DOCKER"] = str(fake_docker)
+    env["STUB_HARNESS_STATE"] = str(state)
+    env["FAKE_LOCK_PATH"] = str(lock_file)
+    replies: list[subprocess.CompletedProcess[str]] = []
+
+    def _hold() -> None:
+        replies.append(
+            _run_harness(
+                [
+                    "hold-lock",
+                    json.dumps({"verb": "hold-lock", "params": {"duration_ms": 2000}}),
+                ],
+                env,
+            )
+        )
+
+    holder = threading.Thread(target=_hold)
+    started = time.monotonic()
+    holder.start()
+    deadline = time.monotonic() + 30.0
+    saw_locked = False
+    while time.monotonic() < deadline:
+        with open(lock_file, encoding="utf-8") as probe:
+            try:
+                fcntl.flock(probe.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                saw_locked = True
+                break
+            fcntl.flock(probe.fileno(), fcntl.LOCK_UN)
+        if replies:
+            break
+        time.sleep(0.05)
+    holder.join(timeout=60)
+    elapsed = time.monotonic() - started
+
+    assert saw_locked, "hold-lock never held the engine lock"
+    assert elapsed >= 1.5
+    assert len(replies) == 1
+    assert replies[0].returncode == 0, replies[0].stdout
+    doc = json.loads(replies[0].stdout)
+    assert documents.validate_harness_reply(doc) == []
+    assert doc["result"]["held_ms"] >= 2000

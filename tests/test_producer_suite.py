@@ -7,7 +7,11 @@ small in-memory producer that mirrors the contract's mutation semantics
 (repository guard, idempotency, state) so the mutation scenarios run green.
 """
 
+import io
 import json
+import tarfile
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -72,7 +76,12 @@ class _FakeProducer:
     Serves ``identity`` and ``status`` from canned documents and ``stop``,
     ``resume`` and ``command`` with the contract's mutation semantics: the
     ``--expect-repo`` guard, idempotent replay, ``payload_mismatch`` and the
-    ``rejected`` state guard. Anything else answers as the fixed seams below.
+    ``rejected`` state guard. Opens a claim on ``status`` for an eligible
+    issue and serves ``attempts list``/``show`` from it. ``status`` serves
+    the last prepared snapshot while ``engine_lock`` is held, like a real
+    engine; ``blocking_reads`` makes it wait on the lock instead, and
+    ``always_fresh`` makes it re-read under the hold. Anything else answers
+    as the fixed seams below.
     """
 
     def __init__(self, ctx: producer_suite.SuiteContext) -> None:
@@ -81,6 +90,17 @@ class _FakeProducer:
         self.sequence = 1
         self.commands: dict[str, dict[str, Any]] = {}
         self.crash_armed = False
+        self.latency: dict[str, float] = {}
+        self.engine_lock = threading.Lock()
+        self.prepared: dict[str, Any] | None = None
+        self.blocking_reads = False
+        self.always_fresh = False
+        self.eligible: set[int] = set()
+        self.active_attempt: dict[str, Any] | None = None
+        self.finished_attempts: list[dict[str, Any]] = []
+        self.attempt_counter = 0
+        self.tick = 0
+        self.extra_events: list[dict[str, Any]] = []
 
     def _record(self, request_id: str, kind: str, acknowledgement: str) -> dict[str, Any]:
         record = {
@@ -98,34 +118,118 @@ class _FakeProducer:
         self.sequence += 1
         return record
 
-    def _status_doc(self) -> dict[str, Any]:
+    def _observed_at(self) -> str:
+        return f"2026-11-06T09:12:{5 + self.tick:02d}Z"
+
+    def _attempt_doc(self, active: dict[str, Any], observed_at: str) -> dict[str, Any]:
+        unknown: dict[str, Any] = {
+            "value": None,
+            "unit": "tokens",
+            "basis": "unavailable",
+            "reason": "fake has no telemetry",
+        }
+        return {
+            "attempt_id": active["attempt_id"],
+            "issue": {"number": active["issue_number"], "title": active["issue_title"]},
+            "native_phase": "claimed",
+            "started_at": active["started_at"],
+            "last_activity_at": active["started_at"],
+            "observed_at": observed_at,
+            "budget": {
+                "raw_tokens": dict(unknown),
+                "effective_tokens": dict(unknown),
+                "enforced_tokens": "none",
+                "limits": [],
+            },
+            "figures": {},
+        }
+
+    def _summary_doc(self, active: dict[str, Any], finished_at: str | None) -> dict[str, Any]:
+        return {
+            "attempt_id": active["attempt_id"],
+            "issue": {"number": active["issue_number"], "title": active["issue_title"]},
+            "started_at": active["started_at"],
+            "finished_at": finished_at,
+            "lifecycle_state": "open" if finished_at is None else "finished",
+            "outcome": None
+            if finished_at is None
+            else {"native": "complete", "reason": None, "label": "Complete"},
+            "delivery": None,
+            "attention_required": False,
+            "sealed": finished_at is not None,
+            "sealed_at": finished_at,
+        }
+
+    def _fresh_doc(self) -> dict[str, Any]:
+        self.tick += 1
+        observed_at = self._observed_at()
+        if self.intake == "open" and self.active_attempt is None and self.eligible:
+            self.attempt_counter += 1
+            issue = min(self.eligible)
+            self.active_attempt = {
+                "attempt_id": f"fake-{self.attempt_counter}",
+                "issue_number": issue,
+                "issue_title": None,
+                "started_at": observed_at,
+            }
         identity = dict(IDENTITY)
         records = sorted(
             (entry["record"] for entry in self.commands.values()),
             key=lambda record: record["sequence"],
         )
+        current = None
+        if self.active_attempt is not None:
+            current = self._attempt_doc(self.active_attempt, observed_at)
         return {
-            "generated_at": "2026-11-06T09:12:05Z",
+            "generated_at": observed_at,
             "identity": identity,
             "instance": {
                 "state": "idle" if self.intake == "open" else "paused",
                 "startup_check": None,
                 "last_halt": None,
-                "observed_at": "2026-11-06T09:12:05Z",
+                "observed_at": observed_at,
             },
             "intake": {
                 "state": self.intake,
                 "pending_stop": None,
                 "stop_plan": None,
                 "priority": None,
-                "observed_at": "2026-11-06T09:12:05Z",
+                "observed_at": observed_at,
             },
-            "current_attempt": None,
-            "last_finished": None,
+            "current_attempt": current,
+            "last_finished": self.finished_attempts[-1] if self.finished_attempts else None,
             "recent_commands": records[-20:],
-            "recent_events": [],
+            "recent_events": list(self.extra_events),
             "truncated": False,
         }
+
+    def _status_reply(self) -> producer_suite.DockerResult:
+        if self.blocking_reads:
+            with self.engine_lock:
+                return producer_suite.DockerResult(0, _ok(self._fresh_doc()), "")
+        if self.always_fresh:
+            return producer_suite.DockerResult(0, _ok(self._fresh_doc()), "")
+        if self.engine_lock.acquire(blocking=False):
+            try:
+                doc = self._fresh_doc()
+            finally:
+                self.engine_lock.release()
+            self.prepared = doc
+            return producer_suite.DockerResult(0, _ok(doc), "")
+        if self.prepared is None:
+            with self.engine_lock:
+                doc = self._fresh_doc()
+            self.prepared = doc
+            return producer_suite.DockerResult(0, _ok(doc), "")
+        return producer_suite.DockerResult(0, _ok(self.prepared), "")
+
+    @staticmethod
+    def _op_key(argv: list[str]) -> str:
+        if len(argv) >= 4 and argv[2] == "attempts":
+            return f"attempts-{argv[3]}"
+        if len(argv) >= 3:
+            return str(argv[2])
+        return ""
 
     def _mutate(
         self, operation: str, request_id: str, expect_repo: str
@@ -175,10 +279,32 @@ class _FakeProducer:
         argv: list[str],
         timeout: float,
     ) -> producer_suite.DockerResult:
+        delay = self.latency.get(self._op_key(argv), 0.0)
+        if delay:
+            time.sleep(delay)
         if argv == ["--contract", "1", "identity"]:
             return producer_suite.DockerResult(0, _ok(IDENTITY), "")
         if argv == ["--contract", "1", "status"]:
-            return producer_suite.DockerResult(0, _ok(self._status_doc()), "")
+            return self._status_reply()
+        if argv == ["--contract", "1", "attempts", "list"]:
+            summaries: list[dict[str, Any]] = []
+            if self.active_attempt is not None:
+                summaries.append(self._summary_doc(self.active_attempt, None))
+            summaries.extend(reversed(self.finished_attempts))
+            return producer_suite.DockerResult(
+                0, _ok({"attempts": summaries, "next_cursor": None}), ""
+            )
+        if len(argv) == 5 and argv[:4] == ["--contract", "1", "attempts", "show"]:
+            summaries = []
+            if self.active_attempt is not None:
+                summaries.append(self._summary_doc(self.active_attempt, None))
+            summaries.extend(self.finished_attempts)
+            for summary in summaries:
+                if summary["attempt_id"] == argv[4]:
+                    return producer_suite.DockerResult(
+                        0, _ok({"attempt": summary, "manifest": []}), ""
+                    )
+            return producer_suite.DockerResult(5, _fail("not_found"), "")
         if argv == ["--contract", "1", "stop", "--after"]:
             return producer_suite.DockerResult(2, _fail("usage"), "")
         if argv == ["--contract", "2", "status"]:
@@ -269,6 +395,12 @@ def test_scenario_ids_are_stable() -> None:
         "command-found",
         "crash-between-commit-and-reply",
         "hold-lock",
+        "status-during-lock",
+        "budget-reads",
+        "budget-mutations",
+        "budget-attempts",
+        "budget-export",
+        "snapshot-bounds",
         "stop-before-claim-crash",
         "stop-after-claim-sigterm",
         "stop-during-starting",
@@ -298,6 +430,12 @@ def test_run_all_passes_with_hold_lock_not_run(fakes: _FakeProducer) -> None:
     assert by_id["command-found"].status == "passed"
     assert by_id["crash-between-commit-and-reply"].status == "passed"
     assert by_id["hold-lock"].status == "not_run"
+    assert by_id["status-during-lock"].status == "not_run"
+    assert by_id["budget-reads"].status == "passed"
+    assert by_id["budget-mutations"].status == "passed"
+    assert by_id["budget-attempts"].status == "not_run"
+    assert by_id["budget-export"].status == "not_run"
+    assert by_id["snapshot-bounds"].status == "passed"
     assert by_id["stop-before-claim-crash"].status == "not_run"
     assert by_id["stop-after-claim-sigterm"].status == "not_run"
     assert by_id["stop-during-starting"].status == "not_run"
@@ -489,6 +627,12 @@ def test_main_reports_per_scenario_and_exits_zero(
     assert "PASS command-found" in out
     assert "PASS crash-between-commit-and-reply" in out
     assert "NOT RUN hold-lock" in out
+    assert "NOT RUN status-during-lock" in out
+    assert "PASS budget-reads" in out
+    assert "PASS budget-mutations" in out
+    assert "NOT RUN budget-attempts" in out
+    assert "NOT RUN budget-export" in out
+    assert "PASS snapshot-bounds" in out
 
 
 def test_main_with_expect_fail_for_a_not_run_fails(
@@ -535,3 +679,369 @@ def test_every_producer_reply_is_validated(
         assert stdout.endswith("\n")
         assert stdout.count("\n") == 1
         assert json.loads(stdout)
+
+
+def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) -> None:
+    """Harness override that supports set-issue, release and finish-attempt."""
+
+    def harness(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        if verb == "set-issue":
+            issue = int(params["issue"])
+            if params["eligible"]:
+                producer.eligible.add(issue)
+            else:
+                producer.eligible.discard(issue)
+            return producer_suite.HarnessResult(
+                "ok", {"issue": issue, "eligible": params["eligible"]}, ""
+            )
+        if verb == "release":
+            return producer_suite.HarnessResult("ok", {"released": True}, "")
+        if verb == "finish-attempt":
+            active = producer.active_attempt
+            if active is None:
+                return producer_suite.HarnessResult("error", None, "no active attempt")
+            producer.finished_attempts.append(producer._summary_doc(active, "2026-11-06T09:13:00Z"))
+            producer.active_attempt = None
+            return producer_suite.HarnessResult(
+                "ok",
+                {"attempt_id": active["attempt_id"], "native_outcome": "complete"},
+                "",
+            )
+        return _fake_harness(cmd, verb, params, timeout)
+
+    monkeypatch.setattr(producer_suite, "_call_harness", harness)
+
+
+def _holding_harness(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) -> None:
+    """Harness override whose hold-lock really holds the fake engine lock."""
+
+    def harness(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        if verb == "hold-lock":
+            with producer.engine_lock:
+                time.sleep(params["duration_ms"] / 1000.0)
+            return producer_suite.HarnessResult("ok", {"held_ms": params["duration_ms"]}, "")
+        return _fake_harness(cmd, verb, params, timeout)
+
+    monkeypatch.setattr(producer_suite, "_call_harness", harness)
+
+
+def test_status_during_lock_passes_with_prepared_state(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _holding_harness(monkeypatch, fakes)
+
+    outcome = producer_suite.scenario_status_during_lock(
+        CTX, ["fake-harness"], duration_ms=800, settle_s=0.05
+    )
+
+    assert outcome.status == "passed", outcome.detail
+
+
+def test_status_during_lock_fails_when_reads_wait_on_the_lock(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fakes.blocking_reads = True
+    _holding_harness(monkeypatch, fakes)
+
+    outcome = producer_suite.scenario_status_during_lock(
+        CTX, ["fake-harness"], duration_ms=600, budget_s=0.15, settle_s=0.05
+    )
+
+    assert outcome.status == "failed"
+    assert "budget" in outcome.detail
+
+
+def test_status_during_lock_fails_when_status_rereads_under_the_hold(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fakes.always_fresh = True
+    _holding_harness(monkeypatch, fakes)
+
+    outcome = producer_suite.scenario_status_during_lock(
+        CTX, ["fake-harness"], duration_ms=600, settle_s=0.05
+    )
+
+    assert outcome.status == "failed"
+    assert "prepared state" in outcome.detail
+
+
+def test_status_during_lock_is_not_run_without_hold_lock(fakes: _FakeProducer) -> None:
+    outcome = producer_suite.scenario_status_during_lock(
+        CTX, ["fake-harness"], duration_ms=200, settle_s=0.01
+    )
+
+    assert outcome.status == "not_run"
+
+
+def test_budget_reads_passes(fakes: _FakeProducer) -> None:
+    assert producer_suite.scenario_budget_reads(CTX).status == "passed"
+
+
+def test_budget_reads_fails_when_identity_is_slow(fakes: _FakeProducer) -> None:
+    fakes.latency = {"identity": 0.3}
+
+    outcome = producer_suite.scenario_budget_reads(CTX, budget_s=0.1)
+
+    assert outcome.status == "failed"
+    assert "identity" in outcome.detail
+
+
+def test_budget_mutations_passes(fakes: _FakeProducer) -> None:
+    assert producer_suite.scenario_budget_mutations(CTX).status == "passed"
+
+
+def test_budget_mutations_fails_when_stop_is_slow(fakes: _FakeProducer) -> None:
+    fakes.latency = {"stop": 0.3}
+
+    outcome = producer_suite.scenario_budget_mutations(CTX, budget_s=0.1)
+
+    assert outcome.status == "failed"
+    assert "stop" in outcome.detail
+
+
+def test_budget_attempts_passes_with_a_claim(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, fakes)
+
+    outcome = producer_suite.scenario_budget_attempts(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
+
+
+def test_budget_attempts_is_not_run_without_harness_support(
+    fakes: _FakeProducer,
+) -> None:
+    outcome = producer_suite.scenario_budget_attempts(CTX, ["fake-harness"])
+
+    assert outcome.status == "not_run"
+
+
+def test_budget_attempts_fails_when_list_is_slow(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, fakes)
+    fakes.latency = {"attempts-list": 0.3}
+
+    outcome = producer_suite.scenario_budget_attempts(CTX, ["fake-harness"], budget_s=0.1)
+
+    assert outcome.status == "failed"
+    assert "attempts list" in outcome.detail
+
+
+def _export_tar(attempt_id: str) -> bytes:
+    manifest = {"contract": "1.0", "attempt": {"attempt_id": attempt_id}, "files": []}
+    payload = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w") as archive:
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+    return stream.getvalue()
+
+
+class _FakeExportProc:
+    """Stand-in for the streaming export process."""
+
+    def __init__(self, stream: Any) -> None:
+        self.stdout = stream
+        self.stderr = io.BytesIO(b"")
+        self.returncode: int | None = 0
+
+    def kill(self) -> None:
+        return None
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def communicate(self, timeout: float | None = None) -> tuple[bytes, bytes]:
+        return self.stdout.read(), b""
+
+
+class _SlowStream:
+    """First read blocks past the budget, then yields a valid export."""
+
+    def __init__(self, delay_s: float, payload: bytes) -> None:
+        self._delay_s = delay_s
+        self._payload = payload
+
+    def read(self, size: int = -1) -> bytes:
+        delay, self._delay_s = self._delay_s, 0.0
+        if delay:
+            time.sleep(delay)
+        if size < 0:
+            size = len(self._payload)
+        out, self._payload = self._payload[:size], self._payload[size:]
+        return out
+
+
+def test_budget_export_passes_with_a_claim(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, fakes)
+
+    def fake_export(
+        docker: str, container: str, exec_user: str, argv: list[str]
+    ) -> _FakeExportProc:
+        return _FakeExportProc(io.BytesIO(_export_tar(argv[-1])))
+
+    monkeypatch.setattr(producer_suite, "_popen_export", fake_export)
+
+    outcome = producer_suite.scenario_budget_export(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
+
+
+def test_budget_export_is_not_run_without_harness_support(
+    fakes: _FakeProducer,
+) -> None:
+    outcome = producer_suite.scenario_budget_export(CTX, ["fake-harness"])
+
+    assert outcome.status == "not_run"
+
+
+def test_budget_export_fails_on_a_slow_start(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, fakes)
+
+    def slow_export(
+        docker: str, container: str, exec_user: str, argv: list[str]
+    ) -> _FakeExportProc:
+        return _FakeExportProc(_SlowStream(0.4, _export_tar(argv[-1])))
+
+    monkeypatch.setattr(producer_suite, "_popen_export", slow_export)
+
+    outcome = producer_suite.scenario_budget_export(CTX, ["fake-harness"], budget_s=0.1)
+
+    assert outcome.status == "failed"
+    assert "no bytes" in outcome.detail
+
+
+def test_budget_export_fails_when_manifest_is_for_another_attempt(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, fakes)
+
+    def wrong_export(
+        docker: str, container: str, exec_user: str, argv: list[str]
+    ) -> _FakeExportProc:
+        return _FakeExportProc(io.BytesIO(_export_tar("fake-other")))
+
+    monkeypatch.setattr(producer_suite, "_popen_export", wrong_export)
+
+    outcome = producer_suite.scenario_budget_export(CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "not for attempt" in outcome.detail
+
+
+def test_snapshot_bounds_passes(fakes: _FakeProducer) -> None:
+    assert producer_suite.scenario_snapshot_bounds(CTX).status == "passed"
+
+
+def test_snapshot_bounds_fails_when_oversized(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fakes._mutate("stop", "req-big-1", CTX.repository)
+    real_handle = fakes.handle
+
+    def oversized(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        result = real_handle(docker, container, exec_user, argv, timeout)
+        doc = json.loads(result.stdout)
+        for record in doc["result"]["recent_commands"]:
+            record["detail"] = "x" * (300 * 1024)
+        return producer_suite.DockerResult(0, shared.render_document(doc), "")
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", oversized)
+
+    outcome = producer_suite.scenario_snapshot_bounds(CTX)
+
+    assert outcome.status == "failed"
+    assert "bytes" in outcome.detail
+
+
+def test_snapshot_bounds_fails_on_unsorted_capabilities(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_handle = fakes.handle
+
+    def unsorted(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        result = real_handle(docker, container, exec_user, argv, timeout)
+        doc = json.loads(result.stdout)
+        doc["result"]["identity"]["capabilities"] = ["stop-after", "next-issue"]
+        return producer_suite.DockerResult(0, shared.render_document(doc), "")
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", unsorted)
+
+    outcome = producer_suite.scenario_snapshot_bounds(CTX)
+
+    assert outcome.status == "failed"
+    assert "sorted" in outcome.detail
+
+
+def test_snapshot_bounds_fails_when_commands_are_not_oldest_first(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fakes._mutate("stop", "req-order-1", CTX.repository)
+    fakes._mutate("resume", "req-order-2", CTX.repository)
+    real_handle = fakes.handle
+
+    def shuffled(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        result = real_handle(docker, container, exec_user, argv, timeout)
+        doc = json.loads(result.stdout)
+        if argv == ["--contract", "1", "status"]:
+            commands = doc["result"]["recent_commands"]
+            commands[0], commands[1] = commands[1], commands[0]
+            return producer_suite.DockerResult(0, shared.render_document(doc), "")
+        return result
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", shuffled)
+
+    outcome = producer_suite.scenario_snapshot_bounds(CTX)
+
+    assert outcome.status == "failed"
+    assert "oldest-first" in outcome.detail
+
+
+def test_snapshot_bounds_fails_when_truncated_keeps_events(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    fakes.extra_events = [
+        {
+            "at": "2026-11-06T09:12:03Z",
+            "level": "info",
+            "event": "kept",
+            "text": "kept",
+        }
+    ]
+    real_handle = fakes.handle
+
+    def truncated(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        result = real_handle(docker, container, exec_user, argv, timeout)
+        doc = json.loads(result.stdout)
+        if argv == ["--contract", "1", "status"]:
+            doc["result"]["truncated"] = True
+            return producer_suite.DockerResult(0, shared.render_document(doc), "")
+        return result
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", truncated)
+
+    outcome = producer_suite.scenario_snapshot_bounds(CTX)
+
+    assert outcome.status == "failed"
+    assert "recent_events" in outcome.detail

@@ -20,13 +20,19 @@ Standard library only.
 from __future__ import annotations
 
 import argparse
+import contextlib
+import hashlib
+import io
 import json
 import secrets
 import subprocess
 import sys
+import tarfile
+import threading
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from agent_operator_contract import CONTRACT_MAJOR, documents
 
@@ -40,6 +46,27 @@ AGENTCTL = "/usr/local/bin/agentctl"
 
 DEFAULT_REPOSITORY = "example-owner/example-repo"
 DEFAULT_CAPABILITIES = ("next-issue", "stop-after")
+
+READ_BUDGET_S = 3.0
+"""Spec section 3.3 budget for ``identity``, ``status`` and ``command``."""
+
+MUTATION_BUDGET_S = 10.0
+"""Spec section 3.3 budget to commit or reject a mutation."""
+
+ATTEMPTS_BUDGET_S = 5.0
+"""Spec section 3.3 budget for ``attempts list`` and ``attempts show``."""
+
+EXPORT_FIRST_BYTE_BUDGET_S = 5.0
+"""Spec section 3.3 budget for ``attempts export`` to start streaming."""
+
+SNAPSHOT_MAX_BYTES = 256 * 1024
+"""Spec section 9.1 bound for a Status Snapshot in compact JSON bytes."""
+
+LOCK_HOLD_MS = 5000
+"""How long ``status-during-lock`` holds the engine lock."""
+
+LOCK_SETTLE_S = 1.0
+"""How long ``status-during-lock`` waits for the hold to take effect."""
 
 
 @dataclass(frozen=True)
@@ -151,6 +178,98 @@ def _docker_exec(
         timeout=timeout,
     )
     return DockerResult(completed.returncode, completed.stdout, completed.stderr)
+
+
+def _popen_export(
+    docker: str, container: str, exec_user: str, agentctl_argv: list[str]
+) -> subprocess.Popen[bytes]:
+    """Start ``agentctl attempts export`` streaming; the caller times first bytes."""
+    return subprocess.Popen(
+        [docker, "exec", "--user", exec_user, container, AGENTCTL, *agentctl_argv],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _read_first_byte(proc: subprocess.Popen[bytes], budget_s: float) -> tuple[bytes, float]:
+    """Read one byte of a streaming export; empty when nothing arrives in budget."""
+    chunk: list[bytes] = []
+
+    def _read() -> None:
+        try:
+            data = proc.stdout.read(1) if proc.stdout is not None else b""
+        except (OSError, ValueError):
+            data = b""
+        chunk.append(data)
+
+    started = time.monotonic()
+    reader = threading.Thread(target=_read, daemon=True)
+    reader.start()
+    reader.join(budget_s)
+    return (chunk[0] if chunk else b""), time.monotonic() - started
+
+
+def _stop_export(proc: subprocess.Popen[bytes]) -> None:
+    """Terminate a streaming export after its first bytes were measured."""
+    with contextlib.suppress(OSError, ValueError):
+        proc.kill()
+    with contextlib.suppress(OSError, ValueError, subprocess.TimeoutExpired):
+        proc.wait(timeout=10.0)
+
+
+def _check_export_stream(data: bytes, attempt_id: str) -> list[str]:
+    """Check a drained export tar: manifest first, entries matching their hashes."""
+    members: dict[str, bytes] = {}
+    order: list[str] = []
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            for member in archive:
+                extracted = archive.extractfile(member)
+                order.append(member.name)
+                members[member.name] = extracted.read() if extracted is not None else b""
+    except (tarfile.TarError, OSError) as exc:
+        return [f"export is not a readable tar stream: {exc}"]
+    if not order or order[0] != "manifest.json":
+        return [f"export must start with manifest.json, got {order[:1]!r}"]
+    try:
+        manifest = json.loads(members["manifest.json"])
+    except ValueError:
+        return ["export manifest.json is not valid JSON"]
+    if not isinstance(manifest, dict):
+        return ["export manifest.json must be an object"]
+    attempt = manifest.get("attempt")
+    if not isinstance(attempt, dict) or attempt.get("attempt_id") != attempt_id:
+        return [f"export manifest is not for attempt {attempt_id!r}"]
+    entries = manifest.get("files")
+    if not isinstance(entries, list):
+        return ["export manifest files must be an array"]
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return ["export manifest entries must be objects"]
+        for key in ("path", "size", "sha256"):
+            if entry.get(key) is None:
+                return [f"export manifest entry is missing {key!r}"]
+        content = members.get(str(entry["path"]))
+        if content is None:
+            return [f"export manifest lists {entry['path']!r} but the tar lacks it"]
+        if len(content) != entry["size"]:
+            return [f"export file {entry['path']!r} is {len(content)} bytes, not {entry['size']}"]
+        if hashlib.sha256(content).hexdigest() != entry["sha256"]:
+            return [f"export file {entry['path']!r} does not match its manifest sha256"]
+    return []
+
+
+def _check_ok_result(stdout: str, exit_code: int) -> list[str]:
+    """Check a read reply in producer mode: envelope valid, ok:true, object result."""
+    problems = _producer_problems(stdout, exit_code)
+    if problems:
+        return problems
+    doc = json.loads(stdout)
+    if doc.get("ok") is not True:
+        return [f"read answered ok:false: {stdout.strip()}"]
+    if not isinstance(doc.get("result"), dict):
+        return ["read result must be an object"]
+    return []
 
 
 def _exec(
@@ -474,8 +593,9 @@ def scenario_unsupported_capability(ctx: SuiteContext) -> ScenarioOutcome:
 
 
 def scenario_hold_lock(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
-    """The ``hold-lock`` harness verb answers with the time held."""
-    result = _call_harness(harness_cmd, "hold-lock", {"duration_ms": 100}, ctx.timeout)
+    """The ``hold-lock`` harness verb holds the engine lock for the duration."""
+    duration_ms = 100
+    result = _call_harness(harness_cmd, "hold-lock", {"duration_ms": duration_ms}, ctx.timeout)
     if result.status == "unsupported":
         return ScenarioOutcome(
             "hold-lock", "not_run", f"harness verb is not supported ({result.detail})"
@@ -483,9 +603,460 @@ def scenario_hold_lock(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Scenari
     if result.status != "ok" or result.result is None:
         return ScenarioOutcome("hold-lock", "failed", result.detail)
     held_ms = result.result.get("held_ms")
-    if not isinstance(held_ms, int) or held_ms < 1:
+    if not isinstance(held_ms, int) or held_ms < duration_ms:
         return ScenarioOutcome("hold-lock", "failed", f"invalid held_ms: {held_ms!r}")
     return ScenarioOutcome("hold-lock", "passed")
+
+
+def _measure(
+    ctx: SuiteContext, scenario_id: str, agentctl_argv: list[str]
+) -> tuple[float, DockerResult | ScenarioOutcome]:
+    """Run ``agentctl`` in the container and measure its wall-clock seconds."""
+    started = time.monotonic()
+    answered = _exec(scenario_id, agentctl_argv, ctx)
+    return time.monotonic() - started, answered
+
+
+def scenario_status_during_lock(
+    ctx: SuiteContext,
+    harness_cmd: Sequence[str],
+    *,
+    duration_ms: int = LOCK_HOLD_MS,
+    budget_s: float = READ_BUDGET_S,
+    settle_s: float = LOCK_SETTLE_S,
+) -> ScenarioOutcome:
+    """``status`` answers within 3 s with prepared state while the lock is held.
+
+    The harness holds the engine lock for ``duration_ms``; a concurrent
+    ``status`` must answer within ``budget_s`` with the last prepared state
+    (the baseline sections) and section ``observed_at`` values older than a
+    read taken after the hold ends.
+    """
+    scenario_id = "status-during-lock"
+    before, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or before is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no baseline status")
+    held: list[HarnessResult] = []
+
+    def _hold() -> None:
+        held.append(
+            _call_harness(harness_cmd, "hold-lock", {"duration_ms": duration_ms}, ctx.timeout)
+        )
+
+    holder = threading.Thread(target=_hold, daemon=True)
+    holder.start()
+    time.sleep(min(settle_s, duration_ms / 1000.0 / 4))
+    elapsed, answered = _measure(ctx, scenario_id, ["--contract", "1", "status"])
+    still_held = holder.is_alive()
+    holder.join(timeout=max(ctx.timeout, duration_ms / 1000.0 + 5.0))
+    if isinstance(answered, ScenarioOutcome):
+        return answered
+    problems = _check_status(answered.stdout, answered.exit_code, ctx)
+    if not held:
+        return ScenarioOutcome(scenario_id, "failed", "hold-lock never answered")
+    if held[0].status == "unsupported":
+        return ScenarioOutcome(
+            scenario_id, "not_run", f"harness verb is not supported ({held[0].detail})"
+        )
+    if held[0].status != "ok":
+        return ScenarioOutcome(scenario_id, "failed", f"harness hold-lock failed: {held[0].detail}")
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    if elapsed > budget_s:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"status took {elapsed:.2f}s while the engine lock was held (budget {budget_s:.2f}s)",
+        )
+    if not still_held:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            "hold-lock finished before status answered; the lock was not held during the read",
+        )
+    during = json.loads(answered.stdout)["result"]
+    after, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or after is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status after the hold")
+    for section in ("instance", "intake"):
+        if during[section]["state"] != before[section]["state"]:
+            return ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"status during the hold is not the last prepared state: "
+                f"{section} is {during[section]['state']!r}, "
+                f"was {before[section]['state']!r}",
+            )
+        if not during[section]["observed_at"] <= before[section]["observed_at"]:
+            return ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"status during the hold re-read {section} instead of serving "
+                f"prepared state: {during[section]['observed_at']!r} is newer than "
+                f"the baseline {before[section]['observed_at']!r}",
+            )
+        if not during[section]["observed_at"] < after[section]["observed_at"]:
+            return ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"status during the hold has no older {section} observed_at: "
+                f"{during[section]['observed_at']!r} vs {after[section]['observed_at']!r}",
+            )
+    current_before = before.get("current_attempt")
+    current_during = during.get("current_attempt")
+    current_after = after.get("current_attempt")
+    if (
+        isinstance(current_before, dict)
+        and isinstance(current_during, dict)
+        and current_during.get("attempt_id") == current_before.get("attempt_id")
+        and not current_during["observed_at"] <= current_before["observed_at"]
+    ):
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            "status during the hold re-read current_attempt instead of serving prepared state",
+        )
+    if (
+        isinstance(current_during, dict)
+        and isinstance(current_after, dict)
+        and current_during.get("attempt_id") == current_after.get("attempt_id")
+        and not current_during["observed_at"] < current_after["observed_at"]
+    ):
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            "status during the hold has no older current_attempt observed_at",
+        )
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_budget_reads(ctx: SuiteContext, *, budget_s: float = READ_BUDGET_S) -> ScenarioOutcome:
+    """``identity``, ``status`` and ``command`` each answer within 3 s."""
+    scenario_id = "budget-reads"
+    steer = _ensure_intake(ctx, scenario_id, "open")
+    if steer is not None:
+        return steer
+    setup_id = _new_request_id()
+    setup = _exec(
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "stop",
+            "--request-id",
+            setup_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        ctx,
+    )
+    if isinstance(setup, ScenarioOutcome):
+        return setup
+    problems = _check_mutation(setup.stdout, setup.exit_code, replayed=False)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    request_id = json.loads(setup.stdout)["result"]["command"]["request_id"]
+    reads = [
+        ("identity", ["--contract", "1", "identity"], _check_identity),
+        ("status", ["--contract", "1", "status"], _check_status),
+    ]
+    for operation, argv, check in reads:
+        elapsed, answered = _measure(ctx, scenario_id, argv)
+        if isinstance(answered, ScenarioOutcome):
+            return answered
+        problems = check(answered.stdout, answered.exit_code, ctx)
+        if problems:
+            return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+        if elapsed > budget_s:
+            return ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"{operation} took {elapsed:.2f}s (budget {budget_s:.2f}s)",
+            )
+    elapsed, stored = _measure(ctx, scenario_id, ["--contract", "1", "command", request_id])
+    if isinstance(stored, ScenarioOutcome):
+        return stored
+    problems = _check_command(stored.stdout, stored.exit_code, request_id=request_id, kind="stop")
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    if elapsed > budget_s:
+        return ScenarioOutcome(
+            scenario_id, "failed", f"command took {elapsed:.2f}s (budget {budget_s:.2f}s)"
+        )
+    reopened = _exec(
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "resume",
+            "--request-id",
+            _new_request_id(),
+            "--expect-repo",
+            ctx.repository,
+        ],
+        ctx,
+    )
+    if isinstance(reopened, ScenarioOutcome):
+        return reopened
+    problems = _check_mutation(reopened.stdout, reopened.exit_code, replayed=False)
+    if problems:
+        return ScenarioOutcome(
+            scenario_id, "failed", f"could not reopen intake: {'; '.join(problems)}"
+        )
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_budget_mutations(
+    ctx: SuiteContext, *, budget_s: float = MUTATION_BUDGET_S
+) -> ScenarioOutcome:
+    """``stop`` and ``resume`` each commit within 10 s."""
+    scenario_id = "budget-mutations"
+    steer = _ensure_intake(ctx, scenario_id, "open")
+    if steer is not None:
+        return steer
+    for operation in ("stop", "resume"):
+        elapsed, answered = _measure(
+            ctx,
+            scenario_id,
+            [
+                "--contract",
+                "1",
+                operation,
+                "--request-id",
+                _new_request_id(),
+                "--expect-repo",
+                ctx.repository,
+            ],
+        )
+        if isinstance(answered, ScenarioOutcome):
+            return answered
+        problems = _check_mutation(answered.stdout, answered.exit_code, replayed=False)
+        if problems:
+            return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+        if elapsed > budget_s:
+            return ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"{operation} took {elapsed:.2f}s (budget {budget_s:.2f}s)",
+            )
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def _attempt_id_for_reads(
+    ctx: SuiteContext, harness_cmd: Sequence[str], scenario_id: str, issue: int
+) -> tuple[str | None, ScenarioOutcome | None, bool]:
+    """Find an attempt to read: current, last finished, or a fresh harness claim.
+
+    Returns the attempt id, a not-run/failed outcome when there is nothing to
+    read, and whether the caller must mark ``issue`` ineligible afterwards.
+    """
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return None, outcome, False
+    current = snapshot.get("current_attempt")
+    if isinstance(current, dict) and isinstance(current.get("attempt_id"), str):
+        return str(current["attempt_id"]), None, False
+    finished = snapshot.get("last_finished")
+    if isinstance(finished, dict) and isinstance(finished.get("attempt_id"), str):
+        return str(finished["attempt_id"]), None, False
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return None, settled, False
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": issue, "eligible": True}
+    )
+    if outcome is not None:
+        return None, outcome, False
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return None, outcome, False
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return None, outcome, False
+    current = snapshot.get("current_attempt")
+    if not isinstance(current, dict) or not isinstance(current.get("attempt_id"), str):
+        return (
+            None,
+            ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim"),
+            False,
+        )
+    return str(current["attempt_id"]), None, True
+
+
+def _drop_issue(
+    ctx: SuiteContext, harness_cmd: Sequence[str], scenario_id: str, issue: int
+) -> ScenarioOutcome | None:
+    """Mark a scenario-created issue ineligible; best-effort finalization first."""
+    _harness(ctx, harness_cmd, scenario_id, "finish-attempt", {"native_outcome": "complete"})
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": issue, "eligible": False}
+    )
+    return outcome
+
+
+def scenario_budget_attempts(
+    ctx: SuiteContext,
+    harness_cmd: Sequence[str],
+    *,
+    budget_s: float = ATTEMPTS_BUDGET_S,
+) -> ScenarioOutcome:
+    """``attempts list`` and ``attempts show`` each answer within 5 s."""
+    scenario_id = "budget-attempts"
+    issue = 107
+    attempt_id, outcome, created = _attempt_id_for_reads(ctx, harness_cmd, scenario_id, issue)
+    if outcome is not None or attempt_id is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no attempt to read")
+    elapsed, listed = _measure(ctx, scenario_id, ["--contract", "1", "attempts", "list"])
+    if isinstance(listed, ScenarioOutcome):
+        result: ScenarioOutcome = listed
+    else:
+        problems = _check_ok_result(listed.stdout, listed.exit_code)
+        if problems:
+            result = ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+        elif elapsed > budget_s:
+            result = ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"attempts list took {elapsed:.2f}s (budget {budget_s:.2f}s)",
+            )
+        else:
+            elapsed, shown = _measure(
+                ctx, scenario_id, ["--contract", "1", "attempts", "show", attempt_id]
+            )
+            if isinstance(shown, ScenarioOutcome):
+                result = shown
+            else:
+                problems = _check_ok_result(shown.stdout, shown.exit_code)
+                if problems:
+                    result = ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+                elif elapsed > budget_s:
+                    result = ScenarioOutcome(
+                        scenario_id,
+                        "failed",
+                        f"attempts show took {elapsed:.2f}s (budget {budget_s:.2f}s)",
+                    )
+                else:
+                    result = ScenarioOutcome(scenario_id, "passed")
+    if created:
+        cleanup = _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        if result.status == "passed" and cleanup is not None:
+            return cleanup
+    return result
+
+
+def scenario_budget_export(
+    ctx: SuiteContext,
+    harness_cmd: Sequence[str],
+    *,
+    budget_s: float = EXPORT_FIRST_BYTE_BUDGET_S,
+) -> ScenarioOutcome:
+    """``attempts export`` starts streaming within 5 s."""
+    scenario_id = "budget-export"
+    issue = 108
+    attempt_id, outcome, created = _attempt_id_for_reads(ctx, harness_cmd, scenario_id, issue)
+    if outcome is not None or attempt_id is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no attempt to export")
+    argv = ["--contract", "1", "attempts", "export", attempt_id]
+    try:
+        proc = _popen_export(ctx.docker, ctx.container, ctx.exec_user, argv)
+    except OSError as exc:
+        result = ScenarioOutcome(scenario_id, "failed", f"export did not start: {exc}")
+    else:
+        first, elapsed = _read_first_byte(proc, budget_s)
+        if not first:
+            _stop_export(proc)
+            result = ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"export sent no bytes within {budget_s:.2f}s",
+            )
+        elif elapsed > budget_s:
+            _stop_export(proc)
+            result = ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"export started after {elapsed:.2f}s (budget {budget_s:.2f}s)",
+            )
+        else:
+            try:
+                rest, _ = proc.communicate(timeout=ctx.timeout)
+            except subprocess.TimeoutExpired:
+                _stop_export(proc)
+                result = ScenarioOutcome(scenario_id, "failed", "export did not finish")
+            else:
+                if proc.returncode != 0:
+                    result = ScenarioOutcome(
+                        scenario_id,
+                        "failed",
+                        f"export exited {proc.returncode}: {rest[:200]!r}",
+                    )
+                else:
+                    problems = _check_export_stream(first + rest, attempt_id)
+                    if problems:
+                        result = ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+                    else:
+                        result = ScenarioOutcome(scenario_id, "passed")
+    if created:
+        cleanup = _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        if result.status == "passed" and cleanup is not None:
+            return cleanup
+    return result
+
+
+def _snapshot_size_bytes(snapshot: dict[str, Any]) -> int:
+    """Measure a snapshot the way spec section 9.1 bounds it: compact JSON."""
+    return len(json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def scenario_snapshot_bounds(ctx: SuiteContext) -> ScenarioOutcome:
+    """The snapshot fits 256 KiB with oldest-first truncation and sorted order."""
+    scenario_id = "snapshot-bounds"
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status snapshot")
+    size = _snapshot_size_bytes(snapshot)
+    if size > SNAPSHOT_MAX_BYTES:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"snapshot is {size} bytes (bound {SNAPSHOT_MAX_BYTES})",
+        )
+    recent_commands = snapshot.get("recent_commands")
+    if not isinstance(recent_commands, list) or len(recent_commands) > 20:
+        return ScenarioOutcome(scenario_id, "failed", "recent_commands holds at most 20 records")
+    recent_events = snapshot.get("recent_events")
+    if not isinstance(recent_events, list) or len(recent_events) > 50:
+        return ScenarioOutcome(scenario_id, "failed", "recent_events holds at most 50 events")
+    capabilities = snapshot["identity"].get("capabilities")
+    if not isinstance(capabilities, list) or capabilities != sorted(capabilities):
+        return ScenarioOutcome(
+            scenario_id, "failed", f"capabilities {capabilities!r} are not sorted"
+        )
+    sequences = [record.get("sequence") for record in recent_commands if isinstance(record, dict)]
+    if any(not isinstance(sequence, int) for sequence in sequences):
+        return ScenarioOutcome(
+            scenario_id, "failed", "recent_commands are not oldest-first (newest last)"
+        )
+    if sequences != sorted(cast("list[int]", sequences)):
+        return ScenarioOutcome(
+            scenario_id, "failed", "recent_commands are not oldest-first (newest last)"
+        )
+    stamped = [event.get("at") for event in recent_events if isinstance(event, dict)]
+    if any(not isinstance(at, str) for at in stamped):
+        return ScenarioOutcome(
+            scenario_id, "failed", "recent_events are not oldest-first (newest last)"
+        )
+    if stamped != sorted(cast("list[str]", stamped)):
+        return ScenarioOutcome(
+            scenario_id, "failed", "recent_events are not oldest-first (newest last)"
+        )
+    if snapshot.get("truncated") is True and recent_events:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            "a truncated snapshot must drop the oldest recent_events first",
+        )
+    return ScenarioOutcome(scenario_id, "passed")
 
 
 def scenario_command_not_found(ctx: SuiteContext) -> ScenarioOutcome:
@@ -1433,6 +2004,18 @@ SCENARIOS: tuple[Scenario, ...] = (
     ),
     Scenario("hold-lock", "the hold-lock harness verb answers with the time held"),
     Scenario(
+        "status-during-lock",
+        "status answers within 3 s with prepared state while the engine lock is held",
+    ),
+    Scenario("budget-reads", "identity, status and command answer within 3 s"),
+    Scenario("budget-mutations", "stop and resume commit within 10 s"),
+    Scenario("budget-attempts", "attempts list and show answer within 5 s"),
+    Scenario("budget-export", "attempts export starts streaming within 5 s"),
+    Scenario(
+        "snapshot-bounds",
+        "the snapshot fits 256 KiB with oldest-first truncation and sorted order",
+    ),
+    Scenario(
         "stop-before-claim-crash",
         "stop before the claim boundary, then a crash: intake stays closed",
     ),
@@ -1481,6 +2064,12 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_command_found(ctx),
         scenario_crash_between_commit_and_reply(ctx, harness_cmd),
         scenario_hold_lock(ctx, harness_cmd),
+        scenario_status_during_lock(ctx, harness_cmd),
+        scenario_budget_reads(ctx),
+        scenario_budget_mutations(ctx),
+        scenario_budget_attempts(ctx, harness_cmd),
+        scenario_budget_export(ctx, harness_cmd),
+        scenario_snapshot_bounds(ctx),
         scenario_stop_before_claim_crash(ctx, harness_cmd),
         scenario_stop_after_claim_sigterm(ctx, harness_cmd),
         scenario_stop_during_starting(ctx, harness_cmd),

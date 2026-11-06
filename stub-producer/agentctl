@@ -2,29 +2,56 @@
 """Stub producer ``agentctl``: a minimal, test-only engine (never published).
 
 Serves ``identity``, ``status``, ``command`` and ``attempts list`` / ``attempts
-show`` plus the core mutations ``stop`` and ``resume`` (and a minimal ``stop
---after`` plan) with durable Intake, Claims and Attempts on its state volume.
-Recovery runs at start, Halts are recorded durably, and the engine honors the
-harness holds (notably ``before-claim``) and one-shot crashes armed by the
-harness. Grammar, capability and value failures come from the shared part of
-the library; the stub then applies the rest of the section 4.1 order itself:
-``--expect-repo``, ``payload_mismatch`` or replay, then state (``rejected``)
-and commit.
+show`` / ``attempts export`` (a minimal tar stream) plus the core mutations
+``stop`` and ``resume`` (and a minimal ``stop --after`` plan) with durable
+Intake, Claims and Attempts on its state volume. Recovery runs at start, Halts
+are recorded durably, and the engine honors the harness holds (notably
+``before-claim``) and one-shot crashes armed by the harness. Reads never wait
+on the engine lock: while a mutation or a harness ``hold-lock`` holds it,
+``status`` serves the last prepared snapshot. Snapshots are bounded to 256
+KiB with oldest-first truncation. Grammar, capability and value failures come
+from the shared part of the library; the stub then applies the rest of the
+section 4.1 order itself: ``--expect-repo``, ``payload_mismatch`` or replay,
+then state (``rejected``) and commit.
 """
 
 from __future__ import annotations
 
 import datetime
 import hashlib
+import io
 import json
 import os
 import sys
+import tarfile
 from typing import Any
 
 from agent_operator_contract import shared
 
+_FCNTL: Any
+try:
+    import fcntl
+
+    _FCNTL = fcntl
+except ImportError:  # pragma: no cover - POSIX-only lock; without it reads stay lock-free
+    _FCNTL = None
+
 STATE_FILENAME = "agent-operator-contract.json"
 """State file name inside the state directory (durable Intake, command store)."""
+
+LOCK_FILENAME = "agent-operator-contract.lock"
+"""Engine lock file inside the state directory (spec section 3.3 and 9.1).
+
+Mutations hold an exclusive ``flock`` while committing. Reads never wait on
+it: ``status`` serves the last prepared snapshot while it is held. The
+conformance harness ``hold-lock`` verb holds this same lock for a duration.
+"""
+
+PREPARED_FILENAME = "agent-operator-contract.prepared.json"
+"""Last prepared ``status`` snapshot, refreshed on every uncontended read."""
+
+SNAPSHOT_MAX_BYTES = 256 * 1024
+"""Maximum Status Snapshot size in bytes of compact JSON (spec section 9.1)."""
 
 MAX_RECENT_COMMANDS = 20
 MAX_RECENT_EVENTS = 50
@@ -177,6 +204,136 @@ def _save_state(state: dict[str, Any], path: str | None) -> None:
             os.remove(tmp_path)
         except OSError:
             pass
+
+
+def _lock_path() -> str | None:
+    """Return the engine lock file path, or None when locking is unavailable."""
+    if _FCNTL is None:
+        return None
+    directory = os.environ.get("CONTRACT_STATE_DIR", "/data")
+    if not os.path.isdir(directory):
+        return None
+    return os.path.join(directory, LOCK_FILENAME)
+
+
+def _prepared_path() -> str | None:
+    """Return the prepared snapshot path, or None without a state directory."""
+    directory = os.environ.get("CONTRACT_STATE_DIR", "/data")
+    if not os.path.isdir(directory):
+        return None
+    return os.path.join(directory, PREPARED_FILENAME)
+
+
+def _acquire_nonblocking(lock_path: str | None) -> io.TextIO | None:
+    """Take the engine lock without waiting; None when held or unavailable."""
+    if _FCNTL is None or lock_path is None:
+        return None
+    handle = open(lock_path, "a", encoding="utf-8")
+    try:
+        _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_EX | _FCNTL.LOCK_NB)
+    except OSError:
+        handle.close()
+        return None
+    return handle
+
+
+def _acquire_blocking(lock_path: str | None) -> io.TextIO | None:
+    """Take the engine lock, waiting until it is free; None when unavailable."""
+    if _FCNTL is None or lock_path is None:
+        return None
+    handle = open(lock_path, "a", encoding="utf-8")
+    _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_EX)
+    return handle
+
+
+def _release_lock(handle: io.TextIO | None) -> None:
+    """Release a lock taken by ``_acquire_blocking`` or ``_acquire_nonblocking``."""
+    if handle is None:
+        return
+    try:
+        if _FCNTL is not None:
+            _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_UN)
+    finally:
+        handle.close()
+
+
+def _snapshot_size_bytes(snapshot: dict[str, Any]) -> int:
+    """Measure a snapshot the way spec section 9.1 bounds it: compact JSON."""
+    return len(json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+
+
+def _apply_bounds(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Enforce the section 9.1 bounds: size, counts, oldest-first truncation.
+
+    Over 256 KiB of compact JSON the producer drops the oldest
+    ``recent_events`` first, then optional figures, then the oldest
+    ``recent_commands``, and sets ``truncated: true``. Count caps hold always.
+    The input is never mutated.
+    """
+    bounded = dict(snapshot)
+    events = list(bounded.get("recent_events") or [])
+    commands = list(bounded.get("recent_commands") or [])
+    attempt = bounded.get("current_attempt")
+    attempt_doc = dict(attempt) if isinstance(attempt, dict) else None
+    figures: dict[str, Any] = {}
+    had_figures = False
+    if attempt_doc is not None:
+        raw_figures = attempt_doc.get("figures")
+        had_figures = isinstance(raw_figures, dict)
+        figures = dict(raw_figures) if had_figures else {}
+    bounded["recent_events"] = events
+    bounded["recent_commands"] = commands
+    if attempt_doc is not None:
+        if figures or had_figures:
+            attempt_doc["figures"] = figures
+        bounded["current_attempt"] = attempt_doc
+    if len(events) > MAX_RECENT_EVENTS:
+        bounded["recent_events"] = events = events[-MAX_RECENT_EVENTS:]
+    if len(commands) > MAX_RECENT_COMMANDS:
+        bounded["recent_commands"] = commands = commands[-MAX_RECENT_COMMANDS:]
+    truncated = False
+    while _snapshot_size_bytes(bounded) > SNAPSHOT_MAX_BYTES and (
+        events or figures or commands
+    ):
+        if events:
+            del events[0]
+        elif figures:
+            figures.pop(next(iter(figures)))
+        else:
+            del commands[0]
+        truncated = True
+    bounded["truncated"] = bool(bounded.get("truncated")) or truncated
+    return bounded
+
+
+def _write_prepared(snapshot: dict[str, Any]) -> None:
+    """Refresh the prepared snapshot cache; failures stay best-effort."""
+    path = _prepared_path()
+    if path is None:
+        return
+    try:
+        tmp_path = path + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as handle:
+            json.dump(snapshot, handle, sort_keys=True)
+        os.replace(tmp_path, path)
+    except OSError:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+def _read_prepared() -> dict[str, Any] | None:
+    """Return the last prepared snapshot, or None when there is none yet."""
+    path = _prepared_path()
+    if path is None:
+        return None
+    try:
+        with open(path, encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
 
 
 def _append_event(state: dict[str, Any], event: dict[str, Any]) -> None:
@@ -835,6 +992,129 @@ def _unreachable(request_id: str | None) -> int:
     return exit_code
 
 
+def _fresh_status_response() -> int:
+    """Load, tick, save and serve a fresh bounded snapshot (lock must be held)."""
+    state, path = _load_state()
+    if state.get("engine_alive") is not True:
+        return _unreachable(None)
+    crashed = _tick(state)
+    _save_state(state, path)
+    if crashed == "crashed":
+        return _unreachable(None)
+    snapshot = _apply_bounds(_status(False, state))
+    _write_prepared(snapshot)
+    sys.stdout.write(shared.render_success(snapshot))
+    return 0
+
+
+def _run_online_status() -> int:
+    """Serve ``status`` without ever waiting on the engine lock (spec 9.1).
+
+    With the lock free the engine ticks and serves a fresh bounded snapshot.
+    While a mutation or a harness ``hold-lock`` holds it, the engine serves
+    the last prepared snapshot, whose ``observed_at`` predates the hold.
+    """
+    lock_path = _lock_path()
+    if lock_path is not None:
+        handle = _acquire_nonblocking(lock_path)
+        if handle is not None:
+            try:
+                return _fresh_status_response()
+            finally:
+                _release_lock(handle)
+        prepared = _read_prepared()
+        if prepared is not None:
+            sys.stdout.write(shared.render_success(prepared))
+            return 0
+        handle = _acquire_blocking(lock_path)
+        try:
+            return _fresh_status_response()
+        finally:
+            _release_lock(handle)
+    return _fresh_status_response()
+
+
+def _run_locked_mutation(parsed: shared.ParsedCall) -> int:
+    """Commit one mutation while holding the engine lock (spec section 3.3)."""
+    assert parsed.request_id is not None and parsed.expect_repo is not None
+    handle = _acquire_blocking(_lock_path())
+    try:
+        state, path = _load_state()
+        if state.get("engine_alive") is not True:
+            return _unreachable(parsed.request_id)
+        return _do_mutation(state, path, parsed)
+    finally:
+        _release_lock(handle)
+
+
+def _do_attempts_export(state: dict[str, Any], arguments: dict[str, Any]) -> int:
+    """Stream a minimal ``attempts export`` tar (spec section 11.3).
+
+    The stream starts at once with ``manifest.json``; an unknown attempt or
+    path answers ``not_found`` before streaming starts. Sealing semantics
+    beyond the recorded attempt state belong to a later change.
+    """
+    attempt_id = arguments.get("attempt_id")
+    assert isinstance(attempt_id, str)
+    summary: dict[str, Any] | None = None
+    active = state.get("active_attempt")
+    if isinstance(active, dict) and active.get("attempt_id") == attempt_id:
+        summary = _active_summary(state)
+    else:
+        attempts = state.get("attempts")
+        if isinstance(attempts, dict):
+            found = attempts.get(attempt_id)
+            if isinstance(found, dict):
+                summary = found
+    if summary is None:
+        text, exit_code = shared.render_error(
+            "not_found", f"no attempt {attempt_id!r} is recorded"
+        )
+        sys.stdout.write(text)
+        return exit_code
+    lines: list[str] = []
+    events = state.get("recent_events")
+    if isinstance(events, list):
+        for event in events:
+            if isinstance(event, dict) and event.get("attempt_id") == attempt_id:
+                lines.append(json.dumps(event, sort_keys=True))
+    payload = ("".join(line + "\n" for line in lines)).encode("utf-8")
+    files = [
+        {
+            "path": "events.jsonl",
+            "kind": "events",
+            "media_type": "application/x-ndjson",
+            "size": len(payload),
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+    ]
+    wanted = arguments.get("paths")
+    assert isinstance(wanted, list)
+    if wanted:
+        known = {entry["path"] for entry in files}
+        for path in wanted:
+            if path not in known:
+                text, exit_code = shared.render_error(
+                    "not_found", f"no archive path {path!r} in attempt {attempt_id!r}"
+                )
+                sys.stdout.write(text)
+                return exit_code
+        files = [entry for entry in files if entry["path"] in wanted]
+    manifest = {"contract": "1.0", "attempt": summary, "files": files}
+    manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode("utf-8")
+    stream = sys.stdout.buffer
+    with tarfile.open(fileobj=stream, mode="w|") as archive:
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(manifest_bytes)
+        archive.addfile(info, io.BytesIO(manifest_bytes))
+        if any(entry["path"] == "events.jsonl" for entry in files):
+            info = tarfile.TarInfo("events.jsonl")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+    stream.flush()
+    return 0
+
+
 def main(argv: list[str]) -> int:
     parsed = shared.parse_argv(argv, capabilities=_advertised_capabilities())
     if isinstance(parsed, shared.ArgvFailure):
@@ -852,16 +1132,13 @@ def main(argv: list[str]) -> int:
             return _unreachable(None)
         sys.stdout.write(shared.render_success(_identity(parsed.offline, state)))
         return 0
+    if parsed.operation == "status" and not parsed.offline:
+        return _run_online_status()
     state, path = _load_state()
     if not parsed.offline and state.get("engine_alive") is not True:
         return _unreachable(parsed.request_id)
     if parsed.operation == "status":
-        if not parsed.offline:
-            crashed = _tick(state)
-            _save_state(state, path)
-            if crashed == "crashed":
-                return _unreachable(None)
-        sys.stdout.write(shared.render_success(_status(parsed.offline, state)))
+        sys.stdout.write(shared.render_success(_apply_bounds(_status(True, state))))
         return 0
     if parsed.operation == "command":
         request_id = parsed.arguments.get("request_id")
@@ -873,12 +1150,14 @@ def main(argv: list[str]) -> int:
         attempt_id = parsed.arguments.get("attempt_id")
         assert isinstance(attempt_id, str)
         return _do_attempts_show(state, attempt_id)
+    if parsed.operation == "attempts-export":
+        return _do_attempts_export(state, parsed.arguments)
     if parsed.operation in ("stop", "resume"):
         assert parsed.request_id is not None and parsed.expect_repo is not None
-        return _do_mutation(state, path, parsed)
+        return _run_locked_mutation(parsed)
     text, exit_code = shared.render_error(
         "internal",
-        "stub producer implements identity, status, command, attempts list/show, "
+        "stub producer implements identity, status, command, attempts list/show/export, "
         f"stop and resume only (got {parsed.operation})",
         details={"stored": False},
         request_id=parsed.request_id,
