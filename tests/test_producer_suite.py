@@ -408,7 +408,13 @@ class _FakeProducer:
             )
         if argv[:3] == ["--contract", "1", "handoff"]:
             return producer_suite.DockerResult(
-                3, _fail("unsupported", {"capability": "operator-handoff"}), ""
+                3,
+                _fail_with_request(
+                    "unsupported",
+                    _probe_request_id(argv),
+                    {"capability": "operator-handoff"},
+                ),
+                "",
             )
         if (
             len(argv) == 9
