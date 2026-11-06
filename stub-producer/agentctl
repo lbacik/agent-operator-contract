@@ -313,7 +313,11 @@ def _do_stop(state: dict[str, Any], request_id: str, arguments: dict[str, Any]) 
 
 
 def _do_resume(state: dict[str, Any], request_id: str) -> int:
-    if state.get("intake") == "open" and state.get("pending_stop") is None:
+    if (
+        state.get("intake") == "open"
+        and state.get("pending_stop") is None
+        and state.get("stop_plan") is None
+    ):
         text, exit_code = shared.render_error(
             "rejected",
             "intake is already open",

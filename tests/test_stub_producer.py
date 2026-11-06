@@ -285,6 +285,48 @@ def test_stub_resume_reopens_and_second_resume_is_rejected(tmp_path: Path) -> No
     assert _command("req-000000000006", env).returncode == 5
 
 
+def test_stub_resume_supersedes_a_pending_stop_plan(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    planned = _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "stop",
+            "--after",
+            "3",
+            "--request-id",
+            "req-000000000010",
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+
+    assert planned.returncode == 0
+    assert json.loads(planned.stdout)["result"]["command"]["kind"] == "stop_after"
+
+    reopened = _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "resume",
+            "--request-id",
+            "req-000000000011",
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+
+    assert reopened.returncode == 0
+    doc = json.loads(reopened.stdout)
+    assert doc["result"]["command"]["kind"] == "resume"
+    assert (
+        json.loads(_command("req-000000000010", env).stdout)["result"]["command"]["acknowledgement"]
+        == "superseded"
+    )
+
+
 def test_stub_command_found_and_not_found(tmp_path: Path) -> None:
     env = _durable_env(tmp_path)
     assert _stop("example-owner/example-repo", "req-000000000007", env).returncode == 0

@@ -254,6 +254,8 @@ def _check_error(stdout: str, exit_code: int, code: str) -> list[str]:
     if problems:
         return problems
     doc = json.loads(stdout)
+    if doc.get("ok") is not False or not isinstance(doc.get("error"), dict):
+        return [f"expected error {code!r}, got ok:true: {stdout.strip()}"]
     actual = doc["error"]["code"]
     if actual != code:
         return [f"expected error {code!r}, got {actual!r}: {stdout.strip()}"]

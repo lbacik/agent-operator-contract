@@ -78,16 +78,6 @@ def test_error_document_marks_retryable_from_the_table() -> None:
     assert shared.error_document("agent_unreachable", "lost")["error"]["retryable"] is True
 
 
-@pytest.mark.parametrize(
-    ("expected", "actual", "matches"),
-    [
-        ("acme/widgets", "acme/widgets", True),
-        ("acme/widgets", "ACME/WIDGETS", True),
-        ("Acme/Widgets", "aCME/wIDGETS", True),
-        ("acme/widgets", "acme/gadgets", False),
-        ("acme/widgets", "acme/widgets2", False),
-    ],
-)
 def test_required_capability_maps_operations_to_the_spec_table() -> None:
     assert shared.required_capability("stop", {}) is None
     assert shared.required_capability("stop", {"after": "3"}) == "stop-after"
@@ -101,6 +91,16 @@ def test_required_capability_maps_operations_to_the_spec_table() -> None:
     assert shared.required_capability("command", {}) is None
 
 
+@pytest.mark.parametrize(
+    ("expected", "actual", "matches"),
+    [
+        ("acme/widgets", "acme/widgets", True),
+        ("acme/widgets", "ACME/WIDGETS", True),
+        ("Acme/Widgets", "aCME/wIDGETS", True),
+        ("acme/widgets", "acme/gadgets", False),
+        ("acme/widgets", "acme/widgets2", False),
+    ],
+)
 def test_repositories_match_is_case_insensitive(expected: str, actual: str, matches: bool) -> None:
     assert shared.repositories_match(expected, actual) is matches
 

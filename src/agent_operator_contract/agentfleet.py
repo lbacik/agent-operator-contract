@@ -480,6 +480,8 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="durable request ID (generated when omitted)",
     )
+    stop_parser.add_argument("--json", dest="json", action="store_true")
+    stop_parser.add_argument("--docker", dest="docker", default=None)
     resume_parser = sub.add_parser("resume", help="reopen one instance's intake")
     resume_parser.add_argument("instance", help="instance name from the discovery labels")
     resume_parser.add_argument(
@@ -492,11 +494,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="durable request ID (generated when omitted)",
     )
+    resume_parser.add_argument("--json", dest="json", action="store_true")
+    resume_parser.add_argument("--docker", dest="docker", default=None)
     command_parser = sub.add_parser(
         "command", help="read one committed Operator Command by request ID"
     )
     command_parser.add_argument("instance", help="instance name from the discovery labels")
     command_parser.add_argument("request_id", help="durable request ID of the command")
+    command_parser.add_argument("--json", dest="json", action="store_true")
+    command_parser.add_argument("--docker", dest="docker", default=None)
     return parser
 
 

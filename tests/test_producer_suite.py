@@ -126,7 +126,9 @@ class _FakeProducer:
             "truncated": False,
         }
 
-    def _mutate(self, operation: str, request_id: str, expect_repo: str) -> Any:
+    def _mutate(
+        self, operation: str, request_id: str, expect_repo: str
+    ) -> producer_suite.DockerResult:
         if expect_repo.lower() != self._ctx.repository.lower():
             return producer_suite.DockerResult(
                 1,
@@ -197,7 +199,7 @@ class _FakeProducer:
         if len(argv) == 4 and argv[:3] == ["--contract", "1", "command"]:
             stored = self.commands.get(argv[3])
             if stored is None:
-                return producer_suite.DockerResult(1, _fail("not_found"), "")
+                return producer_suite.DockerResult(5, _fail("not_found"), "")
             return producer_suite.DockerResult(0, _ok({"command": stored["record"]}), "")
         raise AssertionError(f"unexpected agentctl argv: {argv!r}")
 
@@ -301,7 +303,7 @@ def test_mutation_scenarios_fail_when_a_rejection_stores(
         docker: str, container: str, exec_user: str, argv: list[str], timeout: float
     ) -> producer_suite.DockerResult:
         result = real_handle(docker, container, exec_user, argv, timeout)
-        if result.exit_code == 1 and len(argv) == 4 and argv[2] == "command":
+        if result.exit_code == 5 and len(argv) == 4 and argv[2] == "command":
             stored = fakes.commands.get(argv[3])
             if stored is None:
                 record = fakes._record(argv[3], "stop", "completed")

@@ -6,9 +6,10 @@ them. It is built as a Docker image in CI and never published.
 
 - [`agentctl`](agentctl): the contract CLI at `/usr/local/bin/agentctl`. It
   uses the shared part of the library (`agent_operator_contract.shared`) to
-  parse argv and render replies. It serves `identity` and the grammar
-  failures; anything else well-formed answers `internal` until later issues
-  implement the full core.
+  parse argv and render replies. It serves `identity`, `status` and the
+  `command` read plus the core mutations `stop` and `resume` (and a minimal
+  `stop --after` plan) with durable Intake and a request ID store on its
+  state volume; anything else well-formed answers `internal`.
 - [`harness`](harness): the Conformance Harness executable. It implements
   `setup` and `teardown` by steering a stub container over the Docker CLI
   and answers `unsupported` for every other verb, so dependent scenarios are
