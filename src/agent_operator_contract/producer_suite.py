@@ -3471,6 +3471,25 @@ def scenario_handoff(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioO
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
+    idle_id = _new_request_id()
+    idle = _expect_rejection(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "handoff",
+            "now",
+            "--request-id",
+            idle_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        "rejected",
+        idle_id,
+    )
+    if idle is not None:
+        return idle
     _, outcome = _harness(
         ctx, harness_cmd, scenario_id, "set-issue", {"issue": 201, "eligible": True}
     )
