@@ -1570,9 +1570,7 @@ def scenario_export_torn_read(ctx: SuiteContext, harness_cmd: Sequence[str]) -> 
         return ScenarioOutcome(scenario_id, "failed", "expected a torn read after the archive grew")
     # A grown file tears the read either by size or by hash: both mean the
     # streamed bytes no longer match the snapshot manifest entry.
-    torn = any(
-        "sha256" in problem or "bytes, not" in problem for problem in problems
-    )
+    torn = any("sha256" in problem or "bytes, not" in problem for problem in problems)
     if not torn:
         _drop_issue(ctx, harness_cmd, scenario_id, issue)
         return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))

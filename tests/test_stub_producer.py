@@ -1206,7 +1206,7 @@ def _harness_verb(harness_env: dict[str, str], verb: str, params: dict[str, Any]
     return doc["result"]
 
 
-def _export_stream(argv: list[str], env: dict[str, str]) -> tuple[int, bytes, str]:
+def _export_stream(argv: list[str], env: dict[str, str]) -> tuple[int, bytes, bytes]:
     completed = _run_agentctl_raw(argv, env)
     return completed.returncode, completed.stdout, completed.stderr
 
@@ -1598,6 +1598,135 @@ def test_stub_attempts_export_unknown_path_is_not_found(tmp_path: Path) -> None:
 
     assert completed.returncode == 5
     assert json.loads(completed.stdout)["error"]["code"] == "not_found"
+
+
+def _stub_claim(agentctl_env: dict[str, str], harness_env: dict[str, str], issue: int) -> str:
+    """Open a claim through the harness and return its attempt id."""
+    _harness_verb(harness_env, "set-issue", {"issue": issue, "eligible": True})
+    snapshot = _status(agentctl_env)
+    current = snapshot["current_attempt"]
+    assert isinstance(current, dict)
+    attempt_id = current["attempt_id"]
+    assert isinstance(attempt_id, str)
+    return attempt_id
+
+
+def _show_attempt(agentctl_env: dict[str, str], attempt_id: str) -> dict[str, Any]:
+    shown = _run_agentctl(["--contract", "1", "attempts", "show", attempt_id], agentctl_env)
+    assert shown.returncode == 0, shown.stdout + shown.stderr
+    doc = json.loads(shown.stdout)
+    assert documents.validate_envelope(doc) == []
+    result = doc["result"]
+    assert documents.validate_attempts_show(result) == []
+    assert isinstance(result, dict)
+    return result
+
+
+def test_stub_sealed_after_outcome_freezes_the_manifest(tmp_path: Path) -> None:
+    """An outcome recorded mid-finalization seals only after the release."""
+    agentctl_env, harness_env = _stub_stack(tmp_path)
+    attempt_id = _stub_claim(agentctl_env, harness_env, 301)
+
+    _harness_verb(harness_env, "hold", {"point": "after-outcome", "scope": "active"})
+    _harness_verb(harness_env, "finish-attempt", {"native_outcome": "complete"})
+
+    held = _show_attempt(agentctl_env, attempt_id)
+    assert held["attempt"]["sealed"] is False
+    assert isinstance(held["attempt"]["outcome"], dict)
+
+    code, data, err = _export_stream(
+        ["--contract", "1", "attempts", "export", attempt_id], agentctl_env
+    )
+    assert code == 0, err
+    manifest, members, _order = _read_export_tar(data)
+    assert documents.validate_export_manifest(manifest) == []
+    assert _mismatches(manifest, members) == []
+
+    code, narrowed, err = _export_stream(
+        ["--contract", "1", "attempts", "export", attempt_id, "--path", "transcript.jsonl"],
+        agentctl_env,
+    )
+    assert code == 0, err
+    narrowed_manifest, narrowed_members, _order = _read_export_tar(narrowed)
+    assert [entry["path"] for entry in narrowed_manifest["files"]] == ["transcript.jsonl"]
+    assert _mismatches(narrowed_manifest, narrowed_members) == []
+
+    _harness_verb(harness_env, "release", {})
+
+    snapshot = _status(agentctl_env)
+    recent_events = snapshot["recent_events"]
+    assert isinstance(recent_events, list)
+    sealed_events = [
+        event
+        for event in recent_events
+        if isinstance(event, dict)
+        and event.get("event") == "sealed"
+        and event.get("attempt_id") == attempt_id
+    ]
+    assert sealed_events, "no sealed event follows the release"
+
+    first_show = _show_attempt(agentctl_env, attempt_id)
+    assert first_show["attempt"]["sealed"] is True
+    assert first_show["attempt"]["sealed_at"] is not None
+    second_show = _show_attempt(agentctl_env, attempt_id)
+    assert second_show["manifest"] == first_show["manifest"]
+
+    first_code, first, first_err = _export_stream(
+        ["--contract", "1", "attempts", "export", attempt_id], agentctl_env
+    )
+    assert first_code == 0, first_err
+    second_code, second, second_err = _export_stream(
+        ["--contract", "1", "attempts", "export", attempt_id], agentctl_env
+    )
+    assert second_code == 0, second_err
+    assert first == second, "the sealed export must be byte-identical"
+    sealed_manifest, sealed_members, _order = _read_export_tar(first)
+    assert documents.validate_export_manifest(sealed_manifest) == []
+    assert _mismatches(sealed_manifest, sealed_members) == []
+    sealed_lines = sealed_members["events.jsonl"].decode("utf-8").splitlines()
+    assert any('"event": "sealed"' in line for line in sealed_lines)
+
+    sealed_grow = _run_harness(
+        [
+            "grow-archive",
+            json.dumps(
+                {
+                    "verb": "grow-archive",
+                    "params": {"attempt_id": attempt_id, "append_bytes": 16},
+                }
+            ),
+        ],
+        harness_env,
+    )
+    assert sealed_grow.returncode == 1
+    assert json.loads(sealed_grow.stdout)["error"]["code"] == "failed"
+
+
+def test_stub_export_torn_read_after_archive_growth(tmp_path: Path) -> None:
+    """A file grown while unsealed tears the next export against its snapshot."""
+    agentctl_env, harness_env = _stub_stack(tmp_path)
+    attempt_id = _stub_claim(agentctl_env, harness_env, 302)
+
+    code, data, err = _export_stream(
+        ["--contract", "1", "attempts", "export", attempt_id], agentctl_env
+    )
+    assert code == 0, err
+    manifest, members, _order = _read_export_tar(data)
+    assert documents.validate_export_manifest(manifest) == []
+    assert _mismatches(manifest, members) == []
+
+    grown = _harness_verb(
+        harness_env, "grow-archive", {"attempt_id": attempt_id, "append_bytes": 64}
+    )
+    assert grown["path"] == "transcript.jsonl"
+
+    torn_code, torn_data, torn_err = _export_stream(
+        ["--contract", "1", "attempts", "export", attempt_id], agentctl_env
+    )
+    assert torn_code == 0, torn_err
+    torn_manifest, torn_members, _order = _read_export_tar(torn_data)
+    assert documents.validate_export_manifest(torn_manifest) == []
+    assert "transcript.jsonl" in _mismatches(torn_manifest, torn_members)
 
 
 def test_harness_hold_lock_holds_the_engine_lock(tmp_path: Path) -> None:

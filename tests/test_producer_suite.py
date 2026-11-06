@@ -974,9 +974,7 @@ def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) ->
                 attempt_id = active["attempt_id"] if isinstance(active, dict) else None
             if not isinstance(attempt_id, str) or not attempt_id:
                 return producer_suite.HarnessResult("error", None, "no active attempt to grow")
-            if any(
-                summary["attempt_id"] == attempt_id for summary in producer.finished_attempts
-            ):
+            if any(summary["attempt_id"] == attempt_id for summary in producer.finished_attempts):
                 return producer_suite.HarnessResult(
                     "error", None, "the archive is sealed and immutable"
                 )

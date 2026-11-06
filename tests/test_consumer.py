@@ -1137,8 +1137,15 @@ def _export_summary(attempt_id: str) -> dict[str, Any]:
     }
 
 
-def _export_tar_bytes(attempt_id: str, files: dict[str, bytes]) -> bytes:
-    """Build a spec section 11.3 export tar: manifest.json first, then files."""
+def _export_tar_bytes(
+    attempt_id: str, files: dict[str, bytes], stream_files: dict[str, bytes] | None = None
+) -> bytes:
+    """Build a spec section 11.3 export tar: manifest.json first, then files.
+
+    ``stream_files`` overrides the streamed member bytes while the manifest
+    still describes ``files`` — a torn read where the bytes no longer match
+    the snapshot manifest entry.
+    """
     entries = [
         {
             "path": name,
@@ -1156,7 +1163,8 @@ def _export_tar_bytes(attempt_id: str, files: dict[str, bytes]) -> bytes:
         info = tarfile.TarInfo("manifest.json")
         info.size = len(payload)
         archive.addfile(info, io.BytesIO(payload))
-        for name, data in files.items():
+        members = stream_files if stream_files is not None else files
+        for name, data in members.items():
             info = tarfile.TarInfo(name)
             info.size = len(data)
             archive.addfile(info, io.BytesIO(data))
@@ -1224,9 +1232,12 @@ def test_attempts_export_torn_stream_refetches_then_fails(
     attempt is torn: ``agentfleet`` refetches exactly three times, writes no
     tar bytes, and exits 7 with ``client.export_torn``.
     """
-    tar_bytes = _export_tar_bytes("#43/1", {"events.jsonl": b"", "transcript.jsonl": b"seed\n"})
-    grown = tar_bytes.replace(b"seed\n", b"seed\n-appended-while-unsealed")
-    assert grown != tar_bytes
+    manifest_files = {"events.jsonl": b"", "transcript.jsonl": b"seed\n"}
+    grown_files = {
+        "events.jsonl": b"",
+        "transcript.jsonl": b"seed\n-appended-while-unsealed",
+    }
+    grown = _export_tar_bytes("#43/1", manifest_files, stream_files=grown_files)
     env = _export_env(
         consumer_env, tmp_path, monkeypatch, {"export-torn": _export_fixture("#43/1", grown)}
     )
@@ -1245,8 +1256,12 @@ def test_attempts_export_torn_stream_refetches_then_fails(
 def test_attempts_export_torn_writes_no_partial_file(
     consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    tar_bytes = _export_tar_bytes("#43/1", {"events.jsonl": b"", "transcript.jsonl": b"seed\n"})
-    grown = tar_bytes.replace(b"seed\n", b"seed\n-appended-while-unsealed")
+    manifest_files = {"events.jsonl": b"", "transcript.jsonl": b"seed\n"}
+    grown_files = {
+        "events.jsonl": b"",
+        "transcript.jsonl": b"seed\n-appended-while-unsealed",
+    }
+    grown = _export_tar_bytes("#43/1", manifest_files, stream_files=grown_files)
     env = _export_env(
         consumer_env, tmp_path, monkeypatch, {"export-torn": _export_fixture("#43/1", grown)}
     )
@@ -1265,9 +1280,7 @@ def test_attempts_export_stalled_stream_trips_the_progress_timeout(
     fixture = _export_fixture("#43/1", tar_bytes)
     fixture["delay_seconds"] = 2.0
     env = _export_env(consumer_env, tmp_path, monkeypatch, {"export-slow": fixture})
-    completed = _run_agentfleet(
-        ["attempts", "export", "web-1", "#43/1", "--timeout", "0.2"], env
-    )
+    completed = _run_agentfleet(["attempts", "export", "web-1", "#43/1", "--timeout", "0.2"], env)
 
     assert completed.returncode == 6
     assert _exec_argvs(_recorded(consumer_env)) == [
