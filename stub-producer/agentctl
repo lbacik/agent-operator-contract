@@ -4,7 +4,9 @@
 Serves ``identity``, ``status``, ``command`` and ``attempts list`` / ``attempts
 show`` / ``attempts export`` (a minimal tar stream) plus the core mutations
 ``stop`` and ``resume`` (a ``stop --after`` plan and a one-shot ``next issue``
-priority) with durable Intake, Claims and Attempts on its state volume. Recovery
+priority) and the optional ``handoff now``, ``recovery retry``,
+``recovery release`` and ``errors reset`` with durable Intake, Claims and
+Attempts on its state volume. Recovery
 runs at start, Halts
 are recorded durably, and the engine honors the harness holds (notably
 ``before-claim``) and one-shot crashes armed by the harness. Reads never wait
@@ -119,6 +121,7 @@ def _fresh_state() -> dict[str, Any]:
         "recovery_pending": False,
         "crash_armed": None,
         "defer_armed": False,
+        "error_guard": False,
         "attempt_counter": 0,
         "process_started_at": _utc_now(),
     }
@@ -190,6 +193,8 @@ def _load_state() -> tuple[dict[str, Any], str | None]:
         state["crash_armed"] = armed
     if type(doc.get("defer_armed")) is bool:
         state["defer_armed"] = doc["defer_armed"]
+    if type(doc.get("error_guard")) is bool:
+        state["error_guard"] = doc["error_guard"]
     if type(doc.get("attempt_counter")) is int and doc["attempt_counter"] >= 0:
         state["attempt_counter"] = doc["attempt_counter"]
     if isinstance(doc.get("process_started_at"), str):
@@ -848,6 +853,20 @@ def _mutation_payload(operation: str, arguments: dict[str, Any]) -> tuple[str, d
         return "stop_after", {"after": int(arguments["after"], 10)}
     if operation == "next-issue":
         return "next_issue", {"issue": int(arguments["issue"], 10)}
+    if operation == "handoff":
+        return "handoff", {}
+    if operation == "recovery-retry":
+        return "recovery_retry", {"attempt_id": str(arguments["attempt_id"])}
+    if operation == "recovery-release":
+        return (
+            "recovery_release",
+            {
+                "attempt_id": str(arguments["attempt_id"]),
+                "saved_at": str(arguments["saved_at"]),
+            },
+        )
+    if operation == "errors-reset":
+        return "errors_reset", {}
     return operation, {}
 
 
@@ -1076,6 +1095,265 @@ def _do_next_issue(
     return 0
 
 
+def _finalize_active(
+    state: dict[str, Any], *, lifecycle_state: str, outcome_native: str | None
+) -> dict[str, Any] | None:
+    """Move the active Attempt to a Sealed finished summary; None when idle."""
+    active = state.get("active_attempt")
+    if not isinstance(active, dict):
+        return None
+    now = _utc_now()
+    attempt_id = str(active.get("attempt_id", ""))
+    native = outcome_native
+    if native is None:
+        raw = active.get("outcome_native")
+        native = raw if isinstance(raw, str) and raw else "handoff"
+    reason = active.get("outcome_reason")
+    if not isinstance(reason, str) and reason is not None:
+        reason = None
+    summary = _attempt_summary_for(
+        attempt_id,
+        int(active.get("issue_number", 1)),
+        active.get("issue_title") if isinstance(active.get("issue_title"), str) else None,
+        str(active.get("started_at", now)),
+        now,
+        lifecycle_state,
+        native,
+        reason,
+        True,
+        now,
+    )
+    attempts = state.setdefault("attempts", {})
+    assert isinstance(attempts, dict)
+    attempts[attempt_id] = summary
+    order = state.setdefault("attempt_order", [])
+    assert isinstance(order, list)
+    order.append(attempt_id)
+    state["last_finished"] = summary
+    state["active_attempt"] = None
+    _append_event(
+        state,
+        {
+            "at": now,
+            "level": "info",
+            "event": "outcome_recorded",
+            "attempt_id": attempt_id,
+            "outcome": native,
+            "reason": reason,
+            "text": f"outcome {native}"[:300],
+        },
+    )
+    _append_event(
+        state,
+        {
+            "at": now,
+            "level": "info",
+            "event": "attempt_finished",
+            "attempt_id": attempt_id,
+            "text": f"finished {attempt_id}"[:300],
+        },
+    )
+    _append_event(
+        state,
+        {
+            "at": now,
+            "level": "info",
+            "event": "sealed",
+            "attempt_id": attempt_id,
+            "text": f"sealed {attempt_id}"[:300],
+        },
+    )
+    return summary
+
+
+def _find_attempt(state: dict[str, Any], attempt_id: str) -> str | None:
+    """Return where an Attempt lives: ``"active"``, ``"finished"`` or None."""
+    active = state.get("active_attempt")
+    if isinstance(active, dict) and active.get("attempt_id") == attempt_id:
+        return "active"
+    attempts = state.get("attempts")
+    if isinstance(attempts, dict) and isinstance(attempts.get(attempt_id), dict):
+        return "finished"
+    return None
+
+
+def _do_handoff(state: dict[str, Any], path: str | None, request_id: str) -> int:
+    """Complete an Operator Handoff of the active Attempt (spec section 8.3).
+
+    With no active Attempt the handoff is ``rejected``. Otherwise the handoff
+    finalizes the Attempt at once (publication, issue release and cleanup) and
+    completes. When a ``during-finalization`` crash is armed the handoff is
+    interrupted instead: the command is ``not_fulfilled`` and the partial work
+    stays retained in the active Attempt.
+    """
+    active = state.get("active_attempt")
+    if not isinstance(active, dict):
+        text, exit_code = shared.render_error(
+            "rejected",
+            "no active attempt to hand off",
+            request_id=request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    armed = state.get("crash_armed")
+    if isinstance(armed, dict) and armed.get("point") == "during-finalization":
+        record = _commit(
+            state,
+            request_id,
+            "handoff",
+            {},
+            "not_fulfilled",
+            "handoff interrupted; partial work retained",
+        )
+        state["crash_armed"] = None
+        state["engine_alive"] = False
+        state["recovery_pending"] = True
+        _save_state(state, path)
+        sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+        return 0
+    record = _commit(
+        state,
+        request_id,
+        "handoff",
+        {},
+        "completed",
+        "handoff completed; publication, issue release and cleanup finished",
+    )
+    _finalize_active(state, lifecycle_state="finished", outcome_native="handoff")
+    _save_state(state, path)
+    armed = state.get("crash_armed")
+    if isinstance(armed, dict) and armed.get("point") == "between-commit-and-reply":
+        return _fire_between_commit_and_reply(state, path, request_id)
+    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+    return 0
+
+
+def _do_recovery_retry(
+    state: dict[str, Any], path: str | None, request_id: str, arguments: dict[str, Any]
+) -> int:
+    """Retry safe finalization from retained evidence (spec section 8.3).
+
+    The recorded verdict is never recomputed: the Attempt is left untouched
+    and only the command is recorded as ``completed``. An unknown Attempt is
+    ``not_found``.
+    """
+    attempt_id = str(arguments["attempt_id"])
+    if _find_attempt(state, attempt_id) is None:
+        text, exit_code = shared.render_error(
+            "not_found",
+            f"no attempt {attempt_id!r} is recorded",
+            request_id=request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    record = _commit(
+        state,
+        request_id,
+        "recovery_retry",
+        {"attempt_id": attempt_id},
+        "completed",
+        f"safe finalization retried for {attempt_id} from retained evidence",
+    )
+    _save_state(state, path)
+    armed = state.get("crash_armed")
+    if isinstance(armed, dict) and armed.get("point") == "between-commit-and-reply":
+        return _fire_between_commit_and_reply(state, path, request_id)
+    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+    return 0
+
+
+def _do_recovery_release(
+    state: dict[str, Any], path: str | None, request_id: str, arguments: dict[str, Any]
+) -> int:
+    """Record ``--saved-at``, release the issue and finalize (spec section 8.3).
+
+    An unknown Attempt is ``not_found``. The recorded verdict is never
+    recomputed: an active Attempt finalizes with its recorded outcome (or
+    ``complete`` when none was recorded) and a finished Attempt keeps its
+    outcome while its lifecycle moves to ``released``. No automatic requeue.
+    """
+    attempt_id = str(arguments["attempt_id"])
+    saved_at = str(arguments["saved_at"])
+    where = _find_attempt(state, attempt_id)
+    if where is None:
+        text, exit_code = shared.render_error(
+            "not_found",
+            f"no attempt {attempt_id!r} is recorded",
+            request_id=request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    record = _commit(
+        state,
+        request_id,
+        "recovery_release",
+        {"attempt_id": attempt_id, "saved_at": saved_at},
+        "completed",
+        f"work for {attempt_id} secured at {saved_at}; issue released",
+    )
+    if where == "active":
+        _finalize_active(state, lifecycle_state="released", outcome_native=None)
+    else:
+        attempts = state.get("attempts")
+        assert isinstance(attempts, dict)
+        summary = attempts.get(attempt_id)
+        assert isinstance(summary, dict)
+        now = _utc_now()
+        summary["lifecycle_state"] = "released"
+        if state.get("last_finished") == summary or (
+            isinstance(state.get("last_finished"), dict)
+            and state["last_finished"].get("attempt_id") == attempt_id
+        ):
+            state["last_finished"] = summary
+        _append_event(
+            state,
+            {
+                "at": now,
+                "level": "info",
+                "event": "attempt_released",
+                "attempt_id": attempt_id,
+                "text": f"released {attempt_id}"[:300],
+            },
+        )
+    _save_state(state, path)
+    armed = state.get("crash_armed")
+    if isinstance(armed, dict) and armed.get("point") == "between-commit-and-reply":
+        return _fire_between_commit_and_reply(state, path, request_id)
+    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+    return 0
+
+
+def _do_errors_reset(state: dict[str, Any], path: str | None, request_id: str) -> int:
+    """Reset the durable infrastructure-error guard (spec section 8.3).
+
+    The guard is set when an Attempt finishes with ``infrastructure_error``;
+    resetting a clear guard is ``rejected``.
+    """
+    if state.get("error_guard") is not True:
+        text, exit_code = shared.render_error(
+            "rejected",
+            "the infrastructure-error guard is already clear",
+            request_id=request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    state["error_guard"] = False
+    record = _commit(
+        state,
+        request_id,
+        "errors_reset",
+        {},
+        "completed",
+        "infrastructure-error guard reset",
+    )
+    _save_state(state, path)
+    armed = state.get("crash_armed")
+    if isinstance(armed, dict) and armed.get("point") == "between-commit-and-reply":
+        return _fire_between_commit_and_reply(state, path, request_id)
+    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+    return 0
+
+
 def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedCall) -> int:
     assert parsed.request_id is not None and parsed.expect_repo is not None
     repository = _repository()
@@ -1111,9 +1389,18 @@ def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedC
         return _do_resume(state, path, parsed.request_id)
     if parsed.operation == "next-issue":
         return _do_next_issue(state, path, parsed.request_id, parsed.arguments)
+    if parsed.operation == "handoff":
+        return _do_handoff(state, path, parsed.request_id)
+    if parsed.operation == "recovery-retry":
+        return _do_recovery_retry(state, path, parsed.request_id, parsed.arguments)
+    if parsed.operation == "recovery-release":
+        return _do_recovery_release(state, path, parsed.request_id, parsed.arguments)
+    if parsed.operation == "errors-reset":
+        return _do_errors_reset(state, path, parsed.request_id)
     text, exit_code = shared.render_error(
         "internal",
-        f"stub producer implements stop, resume and next issue only (got {parsed.operation})",
+        "stub producer implements stop, resume, next issue, handoff, "
+        f"recovery retry/release and errors reset only (got {parsed.operation})",
         details={"stored": False},
         request_id=parsed.request_id,
     )
@@ -1549,13 +1836,22 @@ def main(argv: list[str]) -> int:
         return _do_attempts_show(state, attempt_id, parsed.offline)
     if parsed.operation == "attempts-export":
         return _do_attempts_export(state, parsed.arguments, parsed.offline)
-    if parsed.operation in ("stop", "resume", "next-issue"):
+    if parsed.operation in (
+        "stop",
+        "resume",
+        "next-issue",
+        "handoff",
+        "recovery-retry",
+        "recovery-release",
+        "errors-reset",
+    ):
         assert parsed.request_id is not None and parsed.expect_repo is not None
         return _run_locked_mutation(parsed)
     text, exit_code = shared.render_error(
         "internal",
         "stub producer implements identity, status, command, attempts list/show/export, "
-        f"stop, resume and next issue only (got {parsed.operation})",
+        "stop, resume, next issue, handoff, recovery retry/release and errors reset "
+        f"only (got {parsed.operation})",
         details={"stored": False},
         request_id=parsed.request_id,
     )

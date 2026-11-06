@@ -158,7 +158,8 @@ def _require_instance(verb: str) -> tuple[dict[str, Any] | None, tuple[str, int]
 _FRESH_DOC = (
     '{"active_attempt":null,"attempt_counter":0,"attempt_order":[],"attempts":{},'
     '"commands":{},"crash_armed":null,"defer_armed":false,"engine_alive":true,'
-    '"hold":null,"intake":"open","issues":{},"last_finished":null,"last_halt":null,'
+    '"error_guard":false,"hold":null,"intake":"open","issues":{},'
+    '"last_finished":null,"last_halt":null,'
     '"next_sequence":1,"pending_stop":null,"priority":null,"recent_events":[],'
     '"recovery_pending":false,"startup_hold":false,"stop_plan":null}'
 )
@@ -553,6 +554,8 @@ def _do_finish_attempt(
         "    active['outcome_native']=p['native_outcome']\n"
         "    active['outcome_reason']=p.get('reason')\n"
         "    active['last_activity_at']=now\n"
+        "    if p['native_outcome']=='infrastructure_error':\n"
+        "        doc['error_guard']=True\n"
         "    doc.setdefault('recent_events',[]).append({'at':now,'level':'info',"
         "'event':'outcome_recorded','attempt_id':active.get('attempt_id'),"
         "'outcome':p['native_outcome'],'reason':p.get('reason'),"
