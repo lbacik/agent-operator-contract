@@ -1196,9 +1196,7 @@ def _stub_stack(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
     return agentctl_env, harness_env
 
 
-def _harness_verb(
-    harness_env: dict[str, str], verb: str, params: dict[str, Any]
-) -> dict[str, Any]:
+def _harness_verb(harness_env: dict[str, str], verb: str, params: dict[str, Any]) -> dict[str, Any]:
     completed = _run_harness([verb, json.dumps({"verb": verb, "params": params})], harness_env)
     assert completed.returncode == 0, completed.stdout + completed.stderr
     doc = json.loads(completed.stdout)

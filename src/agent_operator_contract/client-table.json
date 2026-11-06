@@ -38,5 +38,10 @@
     "exit_code": 2,
     "retryable": false,
     "meaning": "Malformed agentfleet argv."
+  },
+  "client.export_torn": {
+    "exit_code": 7,
+    "retryable": true,
+    "meaning": "An attempts export stayed torn after the bounded refetch: streamed bytes did not match the manifest sha256, so the output was discarded and the export may be retried."
   }
 }

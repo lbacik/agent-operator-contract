@@ -237,6 +237,9 @@ def _check_export_stream(data: bytes, attempt_id: str) -> list[str]:
         return ["export manifest.json is not valid JSON"]
     if not isinstance(manifest, dict):
         return ["export manifest.json must be an object"]
+    manifest_problems = documents.validate_export_manifest(manifest)
+    if manifest_problems:
+        return [f"export manifest.json is invalid: {manifest_problems[0]}"]
     attempt = manifest.get("attempt")
     if not isinstance(attempt, dict) or attempt.get("attempt_id") != attempt_id:
         return [f"export manifest is not for attempt {attempt_id!r}"]
@@ -1344,6 +1347,234 @@ def scenario_budget_export(
         if result.status == "passed" and cleanup is not None:
             return cleanup
     return result
+
+
+def _drain_export(
+    ctx: SuiteContext, scenario_id: str, attempt_id: str, paths: Sequence[str] = ()
+) -> tuple[bytes | None, ScenarioOutcome | None]:
+    """Drain one ``attempts export`` tar stream, optionally narrowed by ``paths``."""
+    argv = ["--contract", "1", "attempts", "export", attempt_id]
+    for path in paths:
+        argv += ["--path", path]
+    try:
+        proc = _popen_export(ctx.docker, ctx.container, ctx.exec_user, argv)
+    except OSError as exc:
+        return None, ScenarioOutcome(scenario_id, "failed", f"export did not start: {exc}")
+    try:
+        data, _ = proc.communicate(timeout=ctx.timeout)
+    except subprocess.TimeoutExpired:
+        _stop_export(proc)
+        return None, ScenarioOutcome(scenario_id, "failed", "export did not finish")
+    if proc.returncode != 0:
+        return None, ScenarioOutcome(scenario_id, "failed", f"export exited {proc.returncode}")
+    return data, None
+
+
+def _read_attempts_show(
+    stdout: str, exit_code: int, attempt_id: str
+) -> tuple[dict[str, Any] | None, list[str]]:
+    """Check an ``attempts show`` read in producer mode; return its result."""
+    problems = _check_ok_result(stdout, exit_code)
+    if problems:
+        return None, problems
+    try:
+        doc = json.loads(stdout)
+    except ValueError:
+        return None, ["attempts show is not valid JSON"]
+    result = doc.get("result")
+    if not isinstance(result, dict):
+        return None, ["attempts show result must be an object"]
+    problems = documents.validate_attempts_show(result)
+    if problems:
+        return None, [f"attempts show result is invalid: {problems[0]}"]
+    attempt = result.get("attempt")
+    if not isinstance(attempt, dict) or attempt.get("attempt_id") != attempt_id:
+        return None, [f"attempts show is not for attempt {attempt_id!r}"]
+    return result, []
+
+
+def scenario_sealed_after_outcome(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
+    """Outcome recorded while finalization is still writing (spec section 14).
+
+    The archive reports ``sealed: false`` with its outcome after the hold,
+    then a ``sealed`` event follows the release and the manifest stays
+    immutable across two sealed reads.
+    """
+    scenario_id = "sealed-after-outcome"
+    issue = 113
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return settled
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": issue, "eligible": True}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status snapshot")
+    current = snapshot.get("current_attempt")
+    if not isinstance(current, dict) or not isinstance(current.get("attempt_id"), str):
+        return ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim")
+    attempt_id = str(current["attempt_id"])
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "hold", {"point": "after-outcome", "scope": "active"}
+    )
+    if outcome is not None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return outcome
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "finish-attempt", {"native_outcome": "complete"}
+    )
+    if outcome is not None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return outcome
+    answered = _exec(scenario_id, ["--contract", "1", "attempts", "show", attempt_id], ctx)
+    if isinstance(answered, ScenarioOutcome):
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return answered
+    result, problems = _read_attempts_show(answered.stdout, answered.exit_code, attempt_id)
+    if problems or result is None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    attempt = result["attempt"]
+    assert isinstance(attempt, dict)
+    if attempt.get("sealed") is not False:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "archive must stay unsealed while held")
+    if not isinstance(attempt.get("outcome"), dict):
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "the outcome must be recorded while held")
+    data, outcome = _drain_export(ctx, scenario_id, attempt_id)
+    if outcome is not None or data is None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no export stream")
+    problems = _check_export_stream(data, attempt_id)
+    if problems:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status snapshot")
+    sealed_events = [
+        event
+        for event in snapshot.get("recent_events", [])
+        if isinstance(event, dict)
+        and event.get("event") == "sealed"
+        and event.get("attempt_id") == attempt_id
+    ]
+    if not sealed_events:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "no sealed event follows the release")
+    answered = _exec(scenario_id, ["--contract", "1", "attempts", "show", attempt_id], ctx)
+    if isinstance(answered, ScenarioOutcome):
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return answered
+    sealed_result, problems = _read_attempts_show(answered.stdout, answered.exit_code, attempt_id)
+    if problems or sealed_result is None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    sealed_attempt = sealed_result["attempt"]
+    assert isinstance(sealed_attempt, dict)
+    if sealed_attempt.get("sealed") is not True or sealed_attempt.get("sealed_at") is None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "the archive must be sealed after release")
+    repeat = _exec(scenario_id, ["--contract", "1", "attempts", "show", attempt_id], ctx)
+    if isinstance(repeat, ScenarioOutcome):
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return repeat
+    repeat_result, problems = _read_attempts_show(repeat.stdout, repeat.exit_code, attempt_id)
+    if problems or repeat_result is None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    if repeat_result.get("manifest") != sealed_result.get("manifest"):
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "the sealed manifest must be immutable")
+    first, outcome = _drain_export(ctx, scenario_id, attempt_id)
+    if outcome is not None or first is None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no export stream")
+    second, outcome = _drain_export(ctx, scenario_id, attempt_id)
+    if outcome is not None or second is None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no export stream")
+    if first != second:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "the sealed export must be byte-identical")
+    cleanup = _drop_issue(ctx, harness_cmd, scenario_id, issue)
+    if cleanup is not None:
+        return cleanup
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_export_torn_read(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
+    """Export of an unsealed archive while a file grows (spec section 14).
+
+    The first export validates, then ``grow-archive`` moves the bytes under
+    the snapshot manifest and the second export carries the torn read: a file
+    whose ``sha256`` no longer matches its manifest entry.
+    """
+    scenario_id = "export-torn-read"
+    issue = 114
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return settled
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": issue, "eligible": True}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status snapshot")
+    current = snapshot.get("current_attempt")
+    if not isinstance(current, dict) or not isinstance(current.get("attempt_id"), str):
+        return ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim")
+    attempt_id = str(current["attempt_id"])
+    data, outcome = _drain_export(ctx, scenario_id, attempt_id)
+    if outcome is not None or data is None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no export stream")
+    problems = _check_export_stream(data, attempt_id)
+    if problems:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    _, outcome = _harness(
+        ctx,
+        harness_cmd,
+        scenario_id,
+        "grow-archive",
+        {"attempt_id": attempt_id, "append_bytes": 64},
+    )
+    if outcome is not None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return outcome
+    grown, outcome = _drain_export(ctx, scenario_id, attempt_id)
+    if outcome is not None or grown is None:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no export stream")
+    problems = _check_export_stream(grown, attempt_id)
+    if not problems:
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "expected a torn read after the archive grew")
+    if not any("sha256" in problem for problem in problems):
+        _drop_issue(ctx, harness_cmd, scenario_id, issue)
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    cleanup = _drop_issue(ctx, harness_cmd, scenario_id, issue)
+    if cleanup is not None:
+        return cleanup
+    return ScenarioOutcome(scenario_id, "passed")
 
 
 def _snapshot_size_bytes(snapshot: dict[str, Any]) -> int:
@@ -2795,6 +3026,14 @@ SCENARIOS: tuple[Scenario, ...] = (
         "next issue N committed, restart before Claim: priority survives and applies",
     ),
     Scenario(
+        "sealed-after-outcome",
+        "outcome recorded, finalization still writing: unsealed, then the sealed event",
+    ),
+    Scenario(
+        "export-torn-read",
+        "export of an unsealed archive while a file grows: torn read detected",
+    ),
+    Scenario(
         "halt-records-last-halt",
         "halt: a halted event is recorded and the next start reports it",
     ),
@@ -2832,6 +3071,8 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_budget_mutations(ctx),
         scenario_budget_attempts(ctx, harness_cmd),
         scenario_budget_export(ctx, harness_cmd),
+        scenario_sealed_after_outcome(ctx, harness_cmd),
+        scenario_export_torn_read(ctx, harness_cmd),
         scenario_attempts_list_paging(ctx, harness_cmd),
         scenario_attempts_show(ctx, harness_cmd),
         scenario_attempts_not_found(ctx),

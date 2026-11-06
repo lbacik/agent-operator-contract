@@ -546,6 +546,62 @@ def _human_attempts_show(result: object) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _run_attempts_export(
+    docker: str,
+    name: str,
+    attempt_id: str,
+    paths: Sequence[str] | None,
+    output: str | None,
+    timeout: float | None,
+) -> int:
+    """Stream one ``attempts export`` tar to a file or stdout (spec section 11.3).
+
+    The verified tar bytes are written only after the client's size and
+    ``sha256`` verification passes, so a torn read never leaves a partial
+    file behind. A producer envelope answered before streaming starts (for
+    example ``not_found``) is relayed with its own exit code; a torn export
+    that stays torn after the bounded refetch exits 7.
+    """
+    try:
+        fleet = client.discover(docker)
+    except client.ClientError as exc:
+        return _print_client_error(exc, False)
+    try:
+        instance = client.resolve(fleet, name)
+    except client.UnknownInstanceError as exc:
+        return _print_client_error(exc, False, {"instance": name})
+    except client.DuplicateInstanceError as exc:
+        return _print_client_error(exc, False, {"instance": name})
+    delivered: list[bytes] = []
+    try:
+        client.export_attempt(
+            docker,
+            instance,
+            attempt_id,
+            paths=paths,
+            sink=delivered.append,
+            timeout=timeout,
+        )
+    except client.ExportProducerError as exc:
+        return _print_producer_failure(exc.envelope, exc.exit_code, False, b"")
+    except client.ClientError as exc:
+        return _print_client_error(exc, False, {"attempt_id": attempt_id})
+    assert len(delivered) == 1
+    payload = delivered[0]
+    if output is None:
+        sys.stdout.flush()
+        sys.stdout.buffer.write(payload)
+        sys.stdout.buffer.flush()
+        return 0
+    try:
+        with open(output, "wb") as handle:
+            handle.write(payload)
+    except OSError as exc:
+        error = client.ClientError("client.exec_failed", f"cannot write {output!r}: {exc}")
+        return _print_client_error(error, False, {"attempt_id": attempt_id})
+    return 0
+
+
 def _run_command(docker: str, name: str, request_id: str, use_json: bool) -> int:
     """Relay one ``command <request-id>`` read (spec section 6.1)."""
     try:
@@ -835,7 +891,9 @@ def _build_parser() -> argparse.ArgumentParser:
     command_parser.add_argument("request_id", help="durable request ID of the command")
     command_parser.add_argument("--json", dest="json", action="store_true")
     command_parser.add_argument("--docker", dest="docker", default=None)
-    attempts_parser = sub.add_parser("attempts", help="browse Attempt Archives (list, show)")
+    attempts_parser = sub.add_parser(
+        "attempts", help="browse Attempt Archives (list, show, export)"
+    )
     attempts_sub = attempts_parser.add_subparsers(
         dest="attempts_operation", required=True, metavar="<attempts-operation>"
     )
@@ -851,6 +909,32 @@ def _build_parser() -> argparse.ArgumentParser:
     show_parser.add_argument("attempt_id", help="attempt ID of the archive")
     show_parser.add_argument("--json", dest="json", action="store_true")
     show_parser.add_argument("--docker", dest="docker", default=None)
+    export_parser = attempts_sub.add_parser(
+        "export", help="stream one Attempt Archive as a tar (spec section 11.3)"
+    )
+    export_parser.add_argument("instance", help="instance name from the discovery labels")
+    export_parser.add_argument("attempt_id", help="attempt ID of the archive")
+    export_parser.add_argument(
+        "--path",
+        dest="paths",
+        action="append",
+        default=[],
+        help="archive path to export (repeatable; defaults to the whole archive)",
+    )
+    export_parser.add_argument(
+        "--output",
+        dest="output",
+        default=None,
+        help="write the tar to FILE instead of stdout",
+    )
+    export_parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=float,
+        default=None,
+        help="progress timeout in seconds without bytes (default: 30 s)",
+    )
+    export_parser.add_argument("--docker", dest="docker", default=None)
     return parser
 
 
@@ -919,6 +1003,19 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _run_attempts_list(docker, str(args.instance), use_json, limit, before)
         if attempts_op == "show":
             return _run_attempts_show(docker, str(args.instance), str(args.attempt_id), use_json)
+        if attempts_op == "export":
+            paths = list(getattr(args, "paths", []) or [])
+            output = getattr(args, "output", None)
+            raw_timeout = getattr(args, "timeout", None)
+            timeout = float(raw_timeout) if isinstance(raw_timeout, (int, float)) else None
+            return _run_attempts_export(
+                docker,
+                str(args.instance),
+                str(args.attempt_id),
+                paths,
+                str(output) if isinstance(output, str) else None,
+                timeout,
+            )
     doc = client.ClientError("client.usage", f"unknown operation {args.operation!r}").document()
     sys.stdout.write(json.dumps(doc, sort_keys=True) + "\n")
     return 2
