@@ -874,3 +874,127 @@ def test_fake_and_fixtures_usable_from_checkout_without_imports(
     assert inspect.returncode == 0
     entry = json.loads(inspect.stdout)[0]
     assert entry["Config"]["Labels"]["io.github.lbacik.agent-operator.instance"]
+
+
+def _attempts_env(
+    consumer_env: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> dict[str, str]:
+    """A fixture dir with a single attempts recording for argv-exact replay.
+
+    Unlike status, attempts fixtures do not share one argv (list takes
+    ``--limit``/``--before`` and show takes the attempt ID), so each test
+    isolates the one recording it replays.
+    """
+    isolated = tmp_path / "attempts-fixtures"
+    isolated.mkdir(exist_ok=True)
+    (isolated / f"{name}.json").write_text(
+        (FIXTURES_DIR / f"{name}.json").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    env = dict(consumer_env["env"])
+    env["FAKE_DOCKER_FIXTURES"] = str(isolated)
+    monkeypatch.setenv("FAKE_DOCKER_FIXTURES", str(isolated))
+    return env
+
+
+def test_attempts_list_json_passthrough_is_byte_for_byte(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _attempts_env(consumer_env, tmp_path, monkeypatch, "attempts-list")
+    fixture = json.loads((FIXTURES_DIR / "attempts-list.json").read_text(encoding="utf-8"))
+    completed = _run_agentfleet(["attempts", "ls", "web-1", "--json"], env)
+
+    assert completed.returncode == fixture["exit_code"]
+    assert completed.stdout.decode("utf-8") == fixture["stdout"]
+    assert _exec_argvs(_recorded(consumer_env)) == [fixture["argv"]]
+
+
+def test_attempts_list_human_output_states_sealed_entries(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _attempts_env(consumer_env, tmp_path, monkeypatch, "attempts-list")
+    completed = _run_agentfleet(["attempts", "ls", "web-1"], env)
+
+    assert completed.returncode == 0
+    out = completed.stdout.decode("utf-8")
+    assert "#42/1 issue #42 finished Sealed" in out
+    assert "next_cursor: none" in out
+
+
+def test_attempts_list_paged_reports_opaque_cursor(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _attempts_env(consumer_env, tmp_path, monkeypatch, "attempts-list-paged")
+    completed = _run_agentfleet(["attempts", "list", "web-1", "--limit", "1"], env)
+
+    assert completed.returncode == 0
+    out = completed.stdout.decode("utf-8")
+    assert "#42/1 issue #42 finished Sealed" in out
+    assert "next_cursor: eyJvZmZzZXQiOjF9" in out
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "attempts", "list", "--limit", "1"]
+    ]
+
+
+def test_attempts_show_sealed_human_output_states_sealed(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _attempts_env(consumer_env, tmp_path, monkeypatch, "attempts-show-sealed")
+    completed = _run_agentfleet(["attempts", "show", "web-1", "#41/1"], env)
+
+    assert completed.returncode == 0
+    out = completed.stdout.decode("utf-8")
+    assert "attempt_id: #41/1" in out
+    assert "archive: Sealed" in out
+    assert "sealed_at: 2026-11-06T08:45:01Z" in out
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "attempts", "show", "#41/1"]
+    ]
+
+
+def test_attempts_show_unsealed_human_output_states_not_sealed(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _attempts_env(consumer_env, tmp_path, monkeypatch, "attempts-show-unsealed")
+    completed = _run_agentfleet(["attempts", "show", "web-1", "#42/1"], env)
+
+    assert completed.returncode == 0
+    out = completed.stdout.decode("utf-8")
+    assert "attempt_id: #42/1" in out
+    assert "archive: not Sealed" in out
+    assert "outcome: none" in out
+
+
+def test_attempts_show_json_passthrough_is_byte_for_byte(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _attempts_env(consumer_env, tmp_path, monkeypatch, "attempts-show-sealed")
+    fixture = json.loads((FIXTURES_DIR / "attempts-show-sealed.json").read_text(encoding="utf-8"))
+    completed = _run_agentfleet(["attempts", "show", "web-1", "#41/1", "--json"], env)
+
+    assert completed.returncode == fixture["exit_code"]
+    assert completed.stdout.decode("utf-8") == fixture["stdout"]
+
+
+def test_attempts_show_unknown_id_reports_not_found(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _attempts_env(consumer_env, tmp_path, monkeypatch, "attempts-not-found")
+    completed = _run_agentfleet(["attempts", "show", "web-1", "#99/9"], env)
+
+    assert completed.returncode == 5
+    assert "not_found" in completed.stderr.decode("utf-8")
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "attempts", "show", "#99/9"]
+    ]
+
+
+def test_attempts_fixture_classifications_cover_list_show_and_not_found() -> None:
+    index = documents.load_fixture_index()["fixtures"]
+    assert index["attempts-list"]["classification"] == "success"
+    assert index["attempts-list-paged"]["classification"] == "success"
+    assert index["attempts-show-sealed"]["classification"] == "success"
+    assert index["attempts-show-unsealed"]["classification"] == "success"
+    assert index["attempts-not-found"]["classification"] == "not_found"

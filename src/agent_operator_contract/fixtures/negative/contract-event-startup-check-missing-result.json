@@ -1,0 +1,7 @@
+{
+  "at": "2026-11-06T08:00:00Z",
+  "level": "info",
+  "event": "startup_check",
+  "check": "load-volumes",
+  "text": "startup check started"
+}

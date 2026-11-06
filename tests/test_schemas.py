@@ -81,6 +81,16 @@ def _negative_schema(name: str) -> Draft202012Validator:
         return STATUS_VALIDATOR
     if name.startswith("figure-"):
         return FIGURE_VALIDATOR
+    if name.startswith("attempt-summary-"):
+        return Draft202012Validator(documents.load_schema("attempt-summary"))
+    if name.startswith("attempts-list-"):
+        return Draft202012Validator(documents.load_schema("attempts-list"))
+    if name.startswith("attempts-show-"):
+        return Draft202012Validator(documents.load_schema("attempts-show"))
+    if name.startswith("manifest-entry-"):
+        return Draft202012Validator(documents.load_schema("manifest-entry"))
+    if name.startswith("contract-event-"):
+        return Draft202012Validator(documents.load_schema("contract-event"))
     raise AssertionError(f"negative example without a schema: {name}")
 
 
@@ -103,6 +113,16 @@ def _negative_library_errors(name: str, doc: Any) -> list[str]:
         return documents.validate_status(doc)
     if name.startswith("figure-"):
         return documents.validate_figure(doc)
+    if name.startswith("attempt-summary-"):
+        return documents.validate_attempt_summary(doc)
+    if name.startswith("attempts-list-"):
+        return documents.validate_attempts_list(doc)
+    if name.startswith("attempts-show-"):
+        return documents.validate_attempts_show(doc)
+    if name.startswith("manifest-entry-"):
+        return documents.validate_manifest_entry(doc)
+    if name.startswith("contract-event-"):
+        return documents.validate_contract_event(doc)
     raise AssertionError(f"negative example without a schema: {name}")
 
 
@@ -528,3 +548,131 @@ def test_status_schema_covers_every_instance_state() -> None:
     seen = {snapshot["instance"]["state"] for _, snapshot in _status_snapshots()}
 
     assert set(documents.STATUS_STATES) <= seen
+
+
+ATTEMPT_SUMMARY_SCHEMA: dict[str, Any] = documents.load_schema("attempt-summary")
+MANIFEST_ENTRY_SCHEMA: dict[str, Any] = documents.load_schema("manifest-entry")
+ATTEMPTS_LIST_SCHEMA: dict[str, Any] = documents.load_schema("attempts-list")
+ATTEMPTS_SHOW_SCHEMA: dict[str, Any] = documents.load_schema("attempts-show")
+CONTRACT_EVENT_SCHEMA: dict[str, Any] = documents.load_schema("contract-event")
+ATTEMPT_SUMMARY_VALIDATOR = Draft202012Validator(ATTEMPT_SUMMARY_SCHEMA)
+MANIFEST_ENTRY_VALIDATOR = Draft202012Validator(MANIFEST_ENTRY_SCHEMA)
+ATTEMPTS_LIST_VALIDATOR = Draft202012Validator(ATTEMPTS_LIST_SCHEMA)
+ATTEMPTS_SHOW_VALIDATOR = Draft202012Validator(ATTEMPTS_SHOW_SCHEMA)
+CONTRACT_EVENT_VALIDATOR = Draft202012Validator(CONTRACT_EVENT_SCHEMA)
+
+
+def _attempts_results() -> list[tuple[str, Any, Any]]:
+    pairs = []
+    for name in FIXTURE_NAMES:
+        if _fixture_classification(name) == "malformed_stdout":
+            continue
+        fixture = documents.load_fixture(name)
+        argv = fixture.get("argv", [])
+        if not (
+            (len(argv) >= 3 and argv[1:3] == ["1", "attempts"]) or argv[:2] == ["--contract", "1"]
+        ):
+            continue
+        doc = json.loads(fixture["stdout"])
+        if doc.get("ok") is not True or not isinstance(doc.get("result"), dict):
+            continue
+        result = doc["result"]
+        if "attempts" in result or "attempt" in result:
+            pairs.append((name, result, argv))
+    return pairs
+
+
+def test_attempts_results_validate_against_schemas() -> None:
+    assert _attempts_results()
+    for name, result, argv in _attempts_results():
+        if "attempts" in result:
+            assert ATTEMPTS_LIST_VALIDATOR.is_valid(result), name
+        else:
+            assert ATTEMPTS_SHOW_VALIDATOR.is_valid(result), name
+        assert "attempts" in argv, name
+
+
+def test_attempts_results_validate_against_library() -> None:
+    for name, result, _ in _attempts_results():
+        if "attempts" in result:
+            assert documents.validate_attempts_list(result) == [], name
+        else:
+            assert documents.validate_attempts_show(result) == [], name
+
+
+def test_library_agrees_with_schema_on_attempts_results() -> None:
+    for name, result, _ in _attempts_results():
+        if "attempts" in result:
+            assert (documents.validate_attempts_list(result) == []) == (
+                ATTEMPTS_LIST_VALIDATOR.is_valid(result)
+            ), name
+        else:
+            assert (documents.validate_attempts_show(result) == []) == (
+                ATTEMPTS_SHOW_VALIDATOR.is_valid(result)
+            ), name
+
+
+def test_attempts_fixture_ids_cover_backend_shapes() -> None:
+    ids = set()
+    for _, result, _ in _attempts_results():
+        if "attempts" in result:
+            for summary in result["attempts"]:
+                ids.add(summary["attempt_id"])
+        else:
+            ids.add(result["attempt"]["attempt_id"])
+    assert any(str(attempt_id).startswith("#") for attempt_id in ids)
+    assert any(not str(attempt_id).startswith("#") for attempt_id in ids)
+
+
+def test_attempts_list_paging_cursor_shapes() -> None:
+    paged = json.loads(documents.load_fixture("attempts-list")["stdout"])["result"]
+    assert paged["next_cursor"] is None
+    first = json.loads(documents.load_fixture("attempts-list-paged")["stdout"])["result"]
+    assert isinstance(first["next_cursor"], str)
+    assert first["next_cursor"]
+
+
+def test_manifest_entry_kind_enum_matches_library() -> None:
+    assert MANIFEST_ENTRY_SCHEMA["properties"]["kind"]["enum"] == list(documents.MANIFEST_KINDS)
+    assert ATTEMPTS_SHOW_SCHEMA["$defs"]["manifest_entry"]["properties"]["kind"]["enum"] == list(
+        documents.MANIFEST_KINDS
+    )
+
+
+def test_manifest_entry_schema_patterns_match_library() -> None:
+    assert MANIFEST_ENTRY_SCHEMA["properties"]["path"]["pattern"] == documents.MANIFEST_PATH_PATTERN
+    assert MANIFEST_ENTRY_SCHEMA["properties"]["sha256"]["pattern"] == documents.SHA256_PATTERN
+
+
+def test_attempt_summary_sealed_rule_matches_library() -> None:
+    sealed_rule = ATTEMPT_SUMMARY_SCHEMA["allOf"]
+    assert any("sealed_at" in json.dumps(rule) for rule in sealed_rule)
+    for doc_name in ("attempts-list", "attempts-list-paged"):
+        result = json.loads(documents.load_fixture(doc_name)["stdout"])["result"]
+        for summary in result["attempts"]:
+            assert documents.validate_attempt_summary(summary) == [], doc_name
+
+
+def test_contract_event_enums_match_library() -> None:
+    assert CONTRACT_EVENT_SCHEMA["properties"]["level"]["enum"] == list(documents.EVENT_LEVELS)
+    assert CONTRACT_EVENT_SCHEMA["properties"]["kind"]["enum"] == list(documents.COMMAND_KINDS)
+    assert CONTRACT_EVENT_SCHEMA["properties"]["acknowledgement"]["enum"] == list(
+        documents.ACKNOWLEDGEMENTS
+    )
+    assert CONTRACT_EVENT_SCHEMA["properties"]["result"]["enum"] == list(
+        documents.STARTUP_CHECK_RESULTS
+    )
+
+
+def test_contract_event_schema_patterns_match_library() -> None:
+    assert CONTRACT_EVENT_SCHEMA["properties"]["at"]["pattern"] == documents.TIMESTAMP_PATTERN
+    assert (
+        CONTRACT_EVENT_SCHEMA["properties"]["request_id"]["pattern"] == documents.REQUEST_ID_PATTERN
+    )
+
+
+def test_status_recent_events_validate_as_contract_events() -> None:
+    for name, snapshot in _status_snapshots():
+        for event in snapshot.get("recent_events", []):
+            assert CONTRACT_EVENT_VALIDATOR.is_valid(event), (name, event)
+            assert documents.validate_contract_event(event) == [], (name, event)

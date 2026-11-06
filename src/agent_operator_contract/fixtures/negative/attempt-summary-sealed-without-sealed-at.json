@@ -1,0 +1,19 @@
+{
+  "attempt_id": "#42/1",
+  "issue": {
+    "number": 42,
+    "title": "Add CSV export"
+  },
+  "started_at": "2026-11-06T08:50:00Z",
+  "finished_at": "2026-11-06T09:10:00Z",
+  "lifecycle_state": "finished",
+  "outcome": {
+    "native": "delivered",
+    "reason": null,
+    "label": "Delivered"
+  },
+  "delivery": null,
+  "attention_required": false,
+  "sealed": true,
+  "sealed_at": null
+}

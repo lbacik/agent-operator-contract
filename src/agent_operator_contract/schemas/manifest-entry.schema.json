@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent operator contract ManifestEntry",
+  "description": "One file in an attempt manifest (spec section 7.6): relative POSIX path, exact kind enum, media type, size and sha256.",
+  "type": "object",
+  "required": ["path", "kind", "media_type", "size", "sha256"],
+  "properties": {
+    "path": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*\\.\\.).+$",
+      "description": "Relative POSIX path: no leading slash, no '..' segment."
+    },
+    "kind": {
+      "type": "string",
+      "enum": [
+        "events",
+        "transcript",
+        "tool_call",
+        "tool_result",
+        "model_output",
+        "command_output",
+        "record",
+        "other"
+      ]
+    },
+    "media_type": {"type": "string", "minLength": 1},
+    "size": {"type": "integer", "minimum": 0},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

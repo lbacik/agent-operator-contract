@@ -1,0 +1,7 @@
+{
+  "path": "/etc/passwd",
+  "kind": "events",
+  "media_type": "application/x-ndjson",
+  "size": 10,
+  "sha256": "9f2c000000000000000000000000000000000000000000000000000000000000"
+}

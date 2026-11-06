@@ -930,6 +930,94 @@ def test_stub_attempts_list_and_show_validate(tmp_path: Path) -> None:
     assert json.loads(missing.stdout)["error"]["code"] == "not_found"
 
 
+def test_stub_attempts_list_pages_newest_first_with_opaque_cursor(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _patch_state(
+        env,
+        "doc.setdefault('attempts', {})\n"
+        "doc.setdefault('attempt_order', [])\n"
+        "for i in range(1, 26):\n"
+        "    started = '2026-11-06T07:' + ('%02d' % i) + ':00Z'\n"
+        "    summary = {'attempt_id': 'seeded-' + str(i), "
+        "'issue': {'number': 40 + i, 'title': 'Issue ' + str(40 + i)}, "
+        "'started_at': started, 'finished_at': '2026-11-06T09:00:00Z', "
+        "'lifecycle_state': 'finished', "
+        "'outcome': {'native': 'complete', 'reason': None, 'label': 'Complete'}, "
+        "'delivery': None, 'attention_required': False, "
+        "'sealed': True, 'sealed_at': '2026-11-06T09:00:00Z'}\n"
+        "    doc['attempts'][summary['attempt_id']] = summary\n"
+        "    doc['attempt_order'].append(summary['attempt_id'])\n"
+        "doc['last_finished'] = doc['attempts']['seeded-25']",
+    )
+
+    listed = _run_agentctl(["--contract", "1", "attempts", "list"], env)
+    assert listed.returncode == 0, listed.stderr
+    result = json.loads(listed.stdout)["result"]
+    assert documents.validate_attempts_list(result) == []
+    assert next(entry["attempt_id"] for entry in result["attempts"]) == "seeded-25"
+    assert len(result["attempts"]) == 20
+    assert result["next_cursor"] is None or isinstance(result["next_cursor"], str)
+
+    first = _run_agentctl(["--contract", "1", "attempts", "list", "--limit", "1"], env)
+    assert first.returncode == 0, first.stderr
+    first_doc = json.loads(first.stdout)["result"]
+    assert [entry["attempt_id"] for entry in first_doc["attempts"]] == ["seeded-25"]
+    cursor = first_doc["next_cursor"]
+    assert isinstance(cursor, str)
+    assert cursor
+    assert cursor not in ("0", "1")
+
+    second = _run_agentctl(
+        ["--contract", "1", "attempts", "list", "--limit", "1", "--before", cursor], env
+    )
+    assert second.returncode == 0, second.stderr
+    second_doc = json.loads(second.stdout)["result"]
+    assert [entry["attempt_id"] for entry in second_doc["attempts"]] == ["seeded-24"]
+
+    over = _run_agentctl(["--contract", "1", "attempts", "list", "--limit", "101"], env)
+    assert over.returncode == 1
+    assert json.loads(over.stdout)["error"]["code"] == "invalid_argument"
+
+    bad = _run_agentctl(["--contract", "1", "attempts", "list", "--before", "not-a-cursor"], env)
+    assert bad.returncode == 1
+    assert json.loads(bad.stdout)["error"]["code"] == "invalid_argument"
+
+
+def test_stub_attempt_archives_carry_valid_contract_events(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 109, True)
+    snapshot = _status(env)
+    current = snapshot["current_attempt"]
+    assert isinstance(current, dict)
+    assert isinstance(current["attempt_id"], str)
+    attempt_id: str = current["attempt_id"]
+
+    events = snapshot["recent_events"]
+    assert isinstance(events, list)
+    assert events
+    for entry in events:
+        assert documents.validate_contract_event(entry) == []
+
+    shown = _run_agentctl(["--contract", "1", "attempts", "show", attempt_id], env)
+    assert shown.returncode == 0, shown.stderr
+    manifest = json.loads(shown.stdout)["result"]["manifest"]
+    events_entries = [entry for entry in manifest if entry["path"] == "events.jsonl"]
+    assert events_entries
+    assert all(entry["kind"] == "events" for entry in events_entries)
+
+    completed = _run_agentctl_raw(["--contract", "1", "attempts", "export", attempt_id], env)
+    assert completed.returncode == 0, completed.stderr
+    with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
+        assert archive.getnames()[0] == "manifest.json"
+        member = archive.extractfile("events.jsonl")
+        assert member is not None
+        payload = member.read()
+    lines = [line for line in payload.decode("utf-8").splitlines() if line.strip()]
+    assert lines
+    for line in lines:
+        assert documents.validate_contract_event(json.loads(line)) == []
+
+
 def test_stub_crash_between_commit_and_reply_replays(tmp_path: Path) -> None:
     env = _durable_env(tmp_path)
     _patch_state(env, "doc['crash_armed'] = {'point': 'between-commit-and-reply'}")

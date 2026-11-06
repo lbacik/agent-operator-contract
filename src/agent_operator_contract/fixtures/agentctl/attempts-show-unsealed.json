@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "attempts",
+    "show",
+    "#42/1"
+  ],
+  "exit_code": 0,
+  "stdout": "{\"contract\":\"1.0\",\"ok\":true,\"result\":{\"attempt\":{\"attempt_id\":\"#42/1\",\"attention_required\":false,\"delivery\":null,\"finished_at\":null,\"issue\":{\"number\":42,\"title\":\"Add CSV export\"},\"lifecycle_state\":\"open\",\"outcome\":null,\"sealed\":false,\"sealed_at\":null,\"started_at\":\"2026-11-06T08:50:00Z\"},\"manifest\":[{\"kind\":\"events\",\"media_type\":\"application/x-ndjson\",\"path\":\"events.jsonl\",\"sha256\":\"9f2c000000000000000000000000000000000000000000000000000000000000\",\"size\":412}]}}\n",
+  "stderr": ""
+}

@@ -51,6 +51,30 @@ def _fail(code: str, details: Any = None) -> str:
     return shared.render_document(doc)
 
 
+def _fake_encode_cursor(offset: int) -> str:
+    import base64
+
+    raw = json.dumps({"offset": offset}, sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _fake_decode_cursor(cursor: str) -> int | None:
+    import base64
+
+    try:
+        padded = cursor + "=" * (-len(cursor) % 4)
+        raw = base64.urlsafe_b64decode(padded.encode("ascii"))
+        doc = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(doc, dict) or set(doc) != {"offset"}:
+        return None
+    offset = doc.get("offset")
+    if type(offset) is not int or offset < 0:
+        return None
+    return offset
+
+
 def _fail_with_request(code: str, request_id: str, details: Any = None) -> str:
     doc: dict[str, Any] = {
         "contract": "1.0",
@@ -286,13 +310,40 @@ class _FakeProducer:
             return producer_suite.DockerResult(0, _ok(IDENTITY), "")
         if argv == ["--contract", "1", "status"]:
             return self._status_reply()
-        if argv == ["--contract", "1", "attempts", "list"]:
+        if len(argv) >= 4 and argv[:3] == ["--contract", "1", "attempts"] and argv[3] == "list":
             summaries: list[dict[str, Any]] = []
             if self.active_attempt is not None:
                 summaries.append(self._summary_doc(self.active_attempt, None))
             summaries.extend(reversed(self.finished_attempts))
+            rest = argv[4:]
+            limit = 20
+            offset = 0
+            index = 0
+            while index < len(rest):
+                flag = rest[index]
+                if flag == "--limit" and index + 1 < len(rest):
+                    try:
+                        limit = int(rest[index + 1], 10)
+                    except ValueError:
+                        return producer_suite.DockerResult(1, _fail("invalid_argument"), "")
+                    if limit < 1 or limit > 100:
+                        return producer_suite.DockerResult(1, _fail("invalid_argument"), "")
+                    index += 2
+                elif flag == "--before" and index + 1 < len(rest):
+                    decoded = _fake_decode_cursor(rest[index + 1])
+                    if decoded is None:
+                        return producer_suite.DockerResult(1, _fail("invalid_argument"), "")
+                    offset = decoded
+                    index += 2
+                else:
+                    return producer_suite.DockerResult(2, _fail("usage"), "")
+            page = summaries[offset : offset + limit]
+            if offset + limit < len(summaries):
+                next_cursor: str | None = _fake_encode_cursor(offset + limit)
+            else:
+                next_cursor = None
             return producer_suite.DockerResult(
-                0, _ok({"attempts": summaries, "next_cursor": None}), ""
+                0, _ok({"attempts": page, "next_cursor": next_cursor}), ""
             )
         if len(argv) == 5 and argv[:4] == ["--contract", "1", "attempts", "show"]:
             summaries = []
@@ -301,8 +352,18 @@ class _FakeProducer:
             summaries.extend(self.finished_attempts)
             for summary in summaries:
                 if summary["attempt_id"] == argv[4]:
+                    manifest = [
+                        {
+                            "path": "events.jsonl",
+                            "kind": "events",
+                            "media_type": "application/x-ndjson",
+                            "size": 0,
+                            "sha256": "e3b0c44298fc1c149afbf4c8996fb924"
+                            "27ae41e4649b934ca495991b7852b855",
+                        }
+                    ]
                     return producer_suite.DockerResult(
-                        0, _ok({"attempt": summary, "manifest": []}), ""
+                        0, _ok({"attempt": summary, "manifest": manifest}), ""
                     )
             return producer_suite.DockerResult(5, _fail("not_found"), "")
         if argv == ["--contract", "1", "stop", "--after"]:
@@ -400,6 +461,10 @@ def test_scenario_ids_are_stable() -> None:
         "budget-mutations",
         "budget-attempts",
         "budget-export",
+        "attempts-list-paging",
+        "attempts-show",
+        "attempts-not-found",
+        "contract-events",
         "snapshot-bounds",
         "stop-before-claim-crash",
         "stop-after-claim-sigterm",
@@ -435,6 +500,10 @@ def test_run_all_passes_with_hold_lock_not_run(fakes: _FakeProducer) -> None:
     assert by_id["budget-mutations"].status == "passed"
     assert by_id["budget-attempts"].status == "not_run"
     assert by_id["budget-export"].status == "not_run"
+    assert by_id["attempts-list-paging"].status == "not_run"
+    assert by_id["attempts-show"].status == "not_run"
+    assert by_id["attempts-not-found"].status == "passed"
+    assert by_id["contract-events"].status == "not_run"
     assert by_id["snapshot-bounds"].status == "passed"
     assert by_id["stop-before-claim-crash"].status == "not_run"
     assert by_id["stop-after-claim-sigterm"].status == "not_run"
@@ -832,6 +901,94 @@ def test_budget_attempts_fails_when_list_is_slow(
 
     assert outcome.status == "failed"
     assert "attempts list" in outcome.detail
+
+
+def _seed_finished_attempt(
+    producer: _FakeProducer, attempt_id: str, issue: int, started_at: str
+) -> None:
+    producer.finished_attempts.append(
+        producer._summary_doc(
+            {
+                "attempt_id": attempt_id,
+                "issue_number": issue,
+                "issue_title": f"Issue {issue}",
+                "started_at": started_at,
+            },
+            "2026-11-06T09:13:00Z",
+        )
+    )
+
+
+def test_attempts_list_paging_passes_with_finished_attempts(fakes: _FakeProducer) -> None:
+    _seed_finished_attempt(fakes, "fake-old", 109, "2026-11-06T08:50:00Z")
+    _seed_finished_attempt(fakes, "fake-new", 110, "2026-11-06T08:51:00Z")
+
+    outcome = producer_suite.scenario_attempts_list_paging(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
+
+
+def test_attempts_show_passes_with_a_finished_attempt(fakes: _FakeProducer) -> None:
+    _seed_finished_attempt(fakes, "fake-1", 110, "2026-11-06T08:51:00Z")
+
+    outcome = producer_suite.scenario_attempts_show(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
+
+
+def test_contract_events_passes_with_a_finished_attempt(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _seed_finished_attempt(fakes, "fake-1", 111, "2026-11-06T08:51:00Z")
+    fakes.extra_events.append(
+        {
+            "at": "2026-11-06T08:51:00Z",
+            "level": "info",
+            "event": "claim_opened",
+            "text": "claimed issue #111",
+            "attempt_id": "fake-1",
+            "issue": 111,
+        }
+    )
+
+    def fake_export(
+        docker: str, container: str, exec_user: str, argv: list[str]
+    ) -> _FakeExportProc:
+        attempt_id = argv[-1]
+        line = (
+            json.dumps(
+                {
+                    "at": "2026-11-06T08:51:00Z",
+                    "level": "info",
+                    "event": "claim_opened",
+                    "text": "claimed issue #111",
+                    "attempt_id": attempt_id,
+                    "issue": 111,
+                },
+                sort_keys=True,
+            ).encode()
+            + b"\n"
+        )
+        stream = io.BytesIO()
+        with tarfile.open(fileobj=stream, mode="w") as archive:
+            manifest = {"contract": "1.0", "attempt": {"attempt_id": attempt_id}, "files": []}
+            payload = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+            info = tarfile.TarInfo("events.jsonl")
+            info.size = len(line)
+            archive.addfile(info, io.BytesIO(line))
+        return _FakeExportProc(io.BytesIO(stream.getvalue()))
+
+    monkeypatch.setattr(producer_suite, "_popen_export", fake_export)
+
+    outcome = producer_suite.scenario_contract_events(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
 
 
 def _export_tar(attempt_id: str) -> bytes:

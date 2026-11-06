@@ -465,6 +465,70 @@ def _human_command(command: object) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _sealed_label(sealed: object) -> str:
+    return "Sealed" if sealed is True else "not Sealed"
+
+
+def _human_attempts_list(result: object) -> str:
+    if not isinstance(result, dict):
+        return "attempts: <unreadable>\n"
+    lines: list[str] = []
+    attempts = result.get("attempts")
+    if isinstance(attempts, list):
+        for entry in attempts:
+            if not isinstance(entry, dict):
+                continue
+            attempt_id = entry.get("attempt_id", "")
+            issue = entry.get("issue")
+            issue_text = ""
+            if isinstance(issue, dict):
+                issue_text = f" issue #{issue.get('number', '')}"
+            lines.append(
+                f"{attempt_id}{issue_text} "
+                f"{entry.get('lifecycle_state', '')} {_sealed_label(entry.get('sealed'))}"
+            )
+    next_cursor = result.get("next_cursor")
+    if next_cursor is None:
+        lines.append("next_cursor: none")
+    elif isinstance(next_cursor, str):
+        lines.append(f"next_cursor: {next_cursor}")
+    return "\n".join(lines) + "\n" if lines else "attempts: none\n"
+
+
+def _human_attempts_show(result: object) -> str:
+    if not isinstance(result, dict):
+        return "attempt: <unreadable>\n"
+    attempt = result.get("attempt")
+    lines: list[str] = []
+    if isinstance(attempt, dict):
+        lines.append(f"attempt_id: {attempt.get('attempt_id', '')}")
+        issue = attempt.get("issue")
+        if isinstance(issue, dict):
+            lines.append(f"issue: #{issue.get('number', '')} {issue.get('title', '')}")
+        lines.append(f"lifecycle_state: {attempt.get('lifecycle_state', '')}")
+        sealed = attempt.get("sealed")
+        lines.append(f"archive: {_sealed_label(sealed)}")
+        lines.append(
+            f"sealed: {sealed!s}".lower() if isinstance(sealed, bool) else f"sealed: {sealed}"
+        )
+        lines.append(f"sealed_at: {attempt.get('sealed_at', '')}")
+        outcome = attempt.get("outcome")
+        if outcome is None:
+            lines.append("outcome: none")
+        elif isinstance(outcome, dict):
+            lines.append(f"outcome: {outcome.get('native', '')} ({outcome.get('label', '')})")
+    manifest = result.get("manifest")
+    if isinstance(manifest, list):
+        lines.append(f"manifest: {len(manifest)} file(s)")
+        for entry in manifest:
+            if isinstance(entry, dict):
+                lines.append(
+                    f"  {entry.get('path', '')} {entry.get('kind', '')} "
+                    f"{entry.get('size', '')} {entry.get('sha256', '')}"
+                )
+    return "\n".join(lines) + "\n"
+
+
 def _run_command(docker: str, name: str, request_id: str, use_json: bool) -> int:
     """Relay one ``command <request-id>`` read (spec section 6.1)."""
     try:
@@ -493,6 +557,92 @@ def _run_command(docker: str, name: str, request_id: str, use_json: bool) -> int
         result_doc = envelope["result"]
         assert isinstance(result_doc, dict)
         sys.stdout.write(_human_command(result_doc.get("command")))
+        return 0
+    error = envelope["error"]
+    assert isinstance(error, dict)
+    sys.stderr.write(f"agentfleet: {error.get('code')}: {error.get('message')}\n")
+    return result.exit_code
+
+
+def _run_attempts_list(
+    docker: str,
+    name: str,
+    use_json: bool,
+    limit: str | None = None,
+    before: str | None = None,
+) -> int:
+    """Relay ``attempts list`` (spec section 6.1)."""
+    try:
+        fleet = client.discover(docker)
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    try:
+        instance = client.resolve(fleet, name)
+    except client.UnknownInstanceError as exc:
+        return _print_client_error(exc, use_json, {"instance": name})
+    except client.DuplicateInstanceError as exc:
+        return _print_client_error(exc, use_json, {"instance": name})
+    argv = ["attempts", "list"]
+    if limit is not None:
+        argv += ["--limit", limit]
+    if before is not None:
+        argv += ["--before", before]
+    try:
+        result = client.invoke(docker, instance, argv, timeout=client.timeout_for("attempts-list"))
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    try:
+        envelope = client.interpret(result)
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    if use_json:
+        sys.stdout.buffer.write(result.stdout)
+        sys.stdout.buffer.flush()
+        return result.exit_code
+    if envelope["ok"] is True:
+        result_doc = envelope["result"]
+        assert isinstance(result_doc, dict)
+        sys.stdout.write(_human_attempts_list(result_doc))
+        return 0
+    error = envelope["error"]
+    assert isinstance(error, dict)
+    sys.stderr.write(f"agentfleet: {error.get('code')}: {error.get('message')}\n")
+    return result.exit_code
+
+
+def _run_attempts_show(docker: str, name: str, attempt_id: str, use_json: bool) -> int:
+    """Relay ``attempts show`` (spec section 6.1)."""
+    try:
+        fleet = client.discover(docker)
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    try:
+        instance = client.resolve(fleet, name)
+    except client.UnknownInstanceError as exc:
+        return _print_client_error(exc, use_json, {"instance": name})
+    except client.DuplicateInstanceError as exc:
+        return _print_client_error(exc, use_json, {"instance": name})
+    try:
+        result = client.invoke(
+            docker,
+            instance,
+            ["attempts", "show", attempt_id],
+            timeout=client.timeout_for("attempts-show"),
+        )
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    try:
+        envelope = client.interpret(result)
+    except client.ClientError as exc:
+        return _print_client_error(exc, use_json)
+    if use_json:
+        sys.stdout.buffer.write(result.stdout)
+        sys.stdout.buffer.flush()
+        return result.exit_code
+    if envelope["ok"] is True:
+        result_doc = envelope["result"]
+        assert isinstance(result_doc, dict)
+        sys.stdout.write(_human_attempts_show(result_doc))
         return 0
     error = envelope["error"]
     assert isinstance(error, dict)
@@ -606,6 +756,22 @@ def _build_parser() -> argparse.ArgumentParser:
     command_parser.add_argument("request_id", help="durable request ID of the command")
     command_parser.add_argument("--json", dest="json", action="store_true")
     command_parser.add_argument("--docker", dest="docker", default=None)
+    attempts_parser = sub.add_parser("attempts", help="browse Attempt Archives (list, show)")
+    attempts_sub = attempts_parser.add_subparsers(
+        dest="attempts_operation", required=True, metavar="<attempts-operation>"
+    )
+    for alias in ("ls", "list"):
+        list_parser = attempts_sub.add_parser(alias, help="list Attempt Archives, newest first")
+        list_parser.add_argument("instance", help="instance name from the discovery labels")
+        list_parser.add_argument("--limit", dest="limit", default=None)
+        list_parser.add_argument("--before", dest="before", default=None)
+        list_parser.add_argument("--json", dest="json", action="store_true")
+        list_parser.add_argument("--docker", dest="docker", default=None)
+    show_parser = attempts_sub.add_parser("show", help="show one Attempt Archive")
+    show_parser.add_argument("instance", help="instance name from the discovery labels")
+    show_parser.add_argument("attempt_id", help="attempt ID of the archive")
+    show_parser.add_argument("--json", dest="json", action="store_true")
+    show_parser.add_argument("--docker", dest="docker", default=None)
     return parser
 
 
@@ -636,6 +802,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     if args.operation == "command":
         return _run_command(docker, str(args.instance), str(args.request_id), use_json)
+    if args.operation == "attempts":
+        attempts_op = str(getattr(args, "attempts_operation", ""))
+        if attempts_op in ("ls", "list"):
+            limit = args.limit if isinstance(getattr(args, "limit", None), str) else None
+            before = args.before if isinstance(getattr(args, "before", None), str) else None
+            return _run_attempts_list(docker, str(args.instance), use_json, limit, before)
+        if attempts_op == "show":
+            return _run_attempts_show(docker, str(args.instance), str(args.attempt_id), use_json)
     doc = client.ClientError("client.usage", f"unknown operation {args.operation!r}").document()
     sys.stdout.write(json.dumps(doc, sort_keys=True) + "\n")
     return 2
