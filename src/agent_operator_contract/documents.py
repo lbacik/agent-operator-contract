@@ -449,9 +449,7 @@ def validate_figure(doc: object, prefix: str = "figure") -> list[str]:
     if "value" in doc and "basis" in doc and basis in FIGURE_BASES:
         if basis in NULL_BASES:
             if value is not None:
-                errors.append(
-                    f"{prefix}.value must be null when basis is {basis!r}"
-                )
+                errors.append(f"{prefix}.value must be null when basis is {basis!r}")
         elif not isinstance(value, (int, float)) or isinstance(value, bool):
             errors.append(f"{prefix}.value must be a number when basis is {basis!r}")
     return errors
@@ -470,9 +468,7 @@ def _validate_halt(doc: object, prefix: str) -> list[str]:
     for key in ("reason", "detail", "at"):
         if key not in doc:
             errors.append(f"{prefix} is missing required property: {key!r}")
-    if "reason" in doc and (
-        not isinstance(doc["reason"], str) or not doc["reason"]
-    ):
+    if "reason" in doc and (not isinstance(doc["reason"], str) or not doc["reason"]):
         errors.append(f"{prefix}.reason must be a non-empty string")
     if "detail" in doc and not isinstance(doc["detail"], str):
         errors.append(f"{prefix}.detail must be a string")
@@ -491,13 +487,9 @@ def _validate_budget(doc: object, prefix: str = "budget") -> list[str]:
     if "raw_tokens" in doc:
         errors.extend(validate_figure(doc["raw_tokens"], f"{prefix}.raw_tokens"))
     if "effective_tokens" in doc:
-        errors.extend(
-            validate_figure(doc["effective_tokens"], f"{prefix}.effective_tokens")
-        )
+        errors.extend(validate_figure(doc["effective_tokens"], f"{prefix}.effective_tokens"))
     if "enforced_tokens" in doc and doc["enforced_tokens"] not in ENFORCED_TOKENS:
-        errors.append(
-            f"{prefix}.enforced_tokens {doc['enforced_tokens']!r} is not known"
-        )
+        errors.append(f"{prefix}.enforced_tokens {doc['enforced_tokens']!r} is not known")
     if "limits" in doc:
         limits = doc["limits"]
         if not isinstance(limits, list):
@@ -510,9 +502,7 @@ def _validate_budget(doc: object, prefix: str = "budget") -> list[str]:
                     continue
                 for key in ("name", "used", "limit"):
                     if key not in entry:
-                        errors.append(
-                            f"{item_prefix} is missing required property: {key!r}"
-                        )
+                        errors.append(f"{item_prefix} is missing required property: {key!r}")
                 name = entry.get("name")
                 if "name" in entry:
                     if not isinstance(name, str) or not name:
@@ -520,15 +510,11 @@ def _validate_budget(doc: object, prefix: str = "budget") -> list[str]:
                     elif name not in LIMIT_NAMES and not (
                         name.startswith("native.") and len(name) > len("native.")
                     ):
-                        errors.append(
-                            f"{item_prefix}.name {name!r} is not a known 1.0 limit"
-                        )
+                        errors.append(f"{item_prefix}.name {name!r} is not a known 1.0 limit")
                 if "used" in entry:
                     errors.extend(validate_figure(entry["used"], f"{item_prefix}.used"))
                 if "limit" in entry:
-                    errors.extend(
-                        validate_figure(entry["limit"], f"{item_prefix}.limit")
-                    )
+                    errors.extend(validate_figure(entry["limit"], f"{item_prefix}.limit"))
     return errors
 
 
@@ -550,9 +536,7 @@ def _validate_current_attempt(doc: object) -> list[str]:
     ):
         if key not in doc:
             errors.append(f"current_attempt is missing required property: {key!r}")
-    if "attempt_id" in doc and (
-        not isinstance(doc["attempt_id"], str) or not doc["attempt_id"]
-    ):
+    if "attempt_id" in doc and (not isinstance(doc["attempt_id"], str) or not doc["attempt_id"]):
         errors.append("current_attempt.attempt_id must be a non-empty string")
     if "issue" in doc:
         issue = doc["issue"]
@@ -589,9 +573,7 @@ def _validate_current_attempt(doc: object) -> list[str]:
             errors.append("current_attempt.figures must be an object")
         else:
             for name, figure in figures.items():
-                errors.extend(
-                    validate_figure(figure, f"current_attempt.figures.{name}")
-                )
+                errors.extend(validate_figure(figure, f"current_attempt.figures.{name}"))
     return errors
 
 
@@ -615,9 +597,7 @@ def _validate_attempt_summary(doc: object, prefix: str) -> list[str]:
     ):
         if key not in doc:
             errors.append(f"{prefix} is missing required property: {key!r}")
-    if "attempt_id" in doc and (
-        not isinstance(doc["attempt_id"], str) or not doc["attempt_id"]
-    ):
+    if "attempt_id" in doc and (not isinstance(doc["attempt_id"], str) or not doc["attempt_id"]):
         errors.append(f"{prefix}.attempt_id must be a non-empty string")
     if "issue" in doc:
         issue = doc["issue"]
@@ -637,9 +617,7 @@ def _validate_attempt_summary(doc: object, prefix: str) -> list[str]:
     if "finished_at" in doc:
         finished = doc["finished_at"]
         if finished is not None and not _validate_timestamp(finished):
-            errors.append(
-                f"{prefix}.finished_at must be an RFC 3339 UTC timestamp or null"
-            )
+            errors.append(f"{prefix}.finished_at must be an RFC 3339 UTC timestamp or null")
     if "lifecycle_state" in doc and (
         not isinstance(doc["lifecycle_state"], str) or not doc["lifecycle_state"]
     ):
@@ -652,16 +630,17 @@ def _validate_attempt_summary(doc: object, prefix: str) -> list[str]:
             else:
                 for key in ("native", "reason", "label"):
                     if key not in outcome:
-                        errors.append(
-                            f"{prefix}.outcome is missing required property: {key!r}"
-                        )
+                        errors.append(f"{prefix}.outcome is missing required property: {key!r}")
                 if "native" in outcome and (
                     not isinstance(outcome["native"], str) or not outcome["native"]
                 ):
                     errors.append(f"{prefix}.outcome.native must be a non-empty string")
-                if "reason" in outcome and outcome["reason"] is not None:
-                    if not isinstance(outcome["reason"], str):
-                        errors.append(f"{prefix}.outcome.reason must be a string or null")
+                if (
+                    "reason" in outcome
+                    and outcome["reason"] is not None
+                    and not isinstance(outcome["reason"], str)
+                ):
+                    errors.append(f"{prefix}.outcome.reason must be a string or null")
                 if "label" in outcome and (
                     not isinstance(outcome["label"], str) or not outcome["label"]
                 ):
@@ -677,9 +656,7 @@ def _validate_attempt_summary(doc: object, prefix: str) -> list[str]:
     if "sealed_at" in doc:
         sealed_at = doc["sealed_at"]
         if sealed_at is not None and not _validate_timestamp(sealed_at):
-            errors.append(
-                f"{prefix}.sealed_at must be an RFC 3339 UTC timestamp or null"
-            )
+            errors.append(f"{prefix}.sealed_at must be an RFC 3339 UTC timestamp or null")
     return errors
 
 
@@ -702,9 +679,7 @@ def _validate_command_record(doc: object, prefix: str) -> list[str]:
             errors.append(f"{prefix} is missing required property: {key!r}")
     if "request_id" in doc and not _matches(REQUEST_ID_PATTERN, doc["request_id"]):
         errors.append(f"{prefix}.request_id must match the request ID pattern")
-    if "sequence" in doc and (
-        type(doc["sequence"]) is not int or doc["sequence"] < 0
-    ):
+    if "sequence" in doc and (type(doc["sequence"]) is not int or doc["sequence"] < 0):
         errors.append(f"{prefix}.sequence must be an integer >= 0")
     if "kind" in doc and doc["kind"] not in COMMAND_KINDS:
         errors.append(f"{prefix}.kind {doc['kind']!r} is not a known 1.0 kind")
@@ -713,9 +688,7 @@ def _validate_command_record(doc: object, prefix: str) -> list[str]:
     if "repository" in doc and not _matches(REPOSITORY_PATTERN, doc["repository"]):
         errors.append(f"{prefix}.repository must be written owner/name")
     if "acknowledgement" in doc and doc["acknowledgement"] not in ACKNOWLEDGEMENTS:
-        errors.append(
-            f"{prefix}.acknowledgement {doc['acknowledgement']!r} is not known"
-        )
+        errors.append(f"{prefix}.acknowledgement {doc['acknowledgement']!r} is not known")
     if "detail" in doc and not isinstance(doc["detail"], str):
         errors.append(f"{prefix}.detail must be a string")
     if "created_at" in doc and not _validate_timestamp(doc["created_at"]):
@@ -736,9 +709,7 @@ def _validate_contract_event(doc: object, prefix: str) -> list[str]:
         errors.append(f"{prefix}.at must be an RFC 3339 UTC timestamp")
     if "level" in doc and doc["level"] not in EVENT_LEVELS:
         errors.append(f"{prefix}.level {doc['level']!r} is not a known 1.0 level")
-    if "event" in doc and (
-        not isinstance(doc["event"], str) or not doc["event"]
-    ):
+    if "event" in doc and (not isinstance(doc["event"], str) or not doc["event"]):
         errors.append(f"{prefix}.event must be a non-empty string")
     if "text" in doc:
         text = doc["text"]
@@ -784,9 +755,7 @@ def validate_status(doc: object) -> list[str]:
         else:
             for key in ("state", "startup_check", "last_halt", "observed_at"):
                 if key not in instance:
-                    errors.append(
-                        f"status.instance is missing required property: {key!r}"
-                    )
+                    errors.append(f"status.instance is missing required property: {key!r}")
             state = instance.get("state")
             if "state" in instance and state not in STATUS_STATES:
                 errors.append(f"status.instance.state {state!r} is not known")
@@ -799,17 +768,11 @@ def validate_status(doc: object) -> list[str]:
                             "string while starting"
                         )
                 elif check is not None and not isinstance(check, str):
-                    errors.append(
-                        "status.instance.startup_check must be a string or null"
-                    )
+                    errors.append("status.instance.startup_check must be a string or null")
             if "last_halt" in instance:
                 errors.extend(_validate_halt(instance["last_halt"], "status.instance.last_halt"))
-            if "observed_at" in instance and not _validate_timestamp(
-                instance["observed_at"]
-            ):
-                errors.append(
-                    "status.instance.observed_at must be an RFC 3339 UTC timestamp"
-                )
+            if "observed_at" in instance and not _validate_timestamp(instance["observed_at"]):
+                errors.append("status.instance.observed_at must be an RFC 3339 UTC timestamp")
     if "intake" in doc:
         intake = doc["intake"]
         if not isinstance(intake, dict):
@@ -817,9 +780,7 @@ def validate_status(doc: object) -> list[str]:
         else:
             for key in ("state", "pending_stop", "stop_plan", "priority", "observed_at"):
                 if key not in intake:
-                    errors.append(
-                        f"status.intake is missing required property: {key!r}"
-                    )
+                    errors.append(f"status.intake is missing required property: {key!r}")
             if "state" in intake and intake["state"] not in INTAKE_STATES:
                 errors.append(f"status.intake.state {intake['state']!r} is not known")
             if "pending_stop" in intake:
@@ -842,12 +803,10 @@ def validate_status(doc: object) -> list[str]:
                                 "the request ID pattern"
                             )
                         if "sequence" in pending and (
-                            type(pending["sequence"]) is not int
-                            or pending["sequence"] < 0
+                            type(pending["sequence"]) is not int or pending["sequence"] < 0
                         ):
                             errors.append(
-                                "status.intake.pending_stop.sequence must be "
-                                "an integer >= 0"
+                                "status.intake.pending_stop.sequence must be an integer >= 0"
                             )
             if "stop_plan" in intake:
                 plan = intake["stop_plan"]
@@ -858,8 +817,7 @@ def validate_status(doc: object) -> list[str]:
                         for key in ("request_id", "remaining", "counted"):
                             if key not in plan:
                                 errors.append(
-                                    "status.intake.stop_plan is missing required "
-                                    f"property: {key!r}"
+                                    f"status.intake.stop_plan is missing required property: {key!r}"
                                 )
                         if "request_id" in plan and not _matches(
                             REQUEST_ID_PATTERN, plan["request_id"]
@@ -869,9 +827,7 @@ def validate_status(doc: object) -> list[str]:
                                 "the request ID pattern"
                             )
                         for key in ("remaining", "counted"):
-                            if key in plan and (
-                                type(plan[key]) is not int or plan[key] < 0
-                            ):
+                            if key in plan and (type(plan[key]) is not int or plan[key] < 0):
                                 errors.append(
                                     f"status.intake.stop_plan.{key} must be an integer >= 0"
                                 )
@@ -884,8 +840,7 @@ def validate_status(doc: object) -> list[str]:
                         for key in ("request_id", "issue"):
                             if key not in priority:
                                 errors.append(
-                                    "status.intake.priority is missing required "
-                                    f"property: {key!r}"
+                                    f"status.intake.priority is missing required property: {key!r}"
                                 )
                         if "request_id" in priority and not _matches(
                             REQUEST_ID_PATTERN, priority["request_id"]
@@ -897,13 +852,9 @@ def validate_status(doc: object) -> list[str]:
                         if "issue" in priority and (
                             type(priority["issue"]) is not int or priority["issue"] < 1
                         ):
-                            errors.append(
-                                "status.intake.priority.issue must be an integer >= 1"
-                            )
+                            errors.append("status.intake.priority.issue must be an integer >= 1")
             if "observed_at" in intake and not _validate_timestamp(intake["observed_at"]):
-                errors.append(
-                    "status.intake.observed_at must be an RFC 3339 UTC timestamp"
-                )
+                errors.append("status.intake.observed_at must be an RFC 3339 UTC timestamp")
     if "current_attempt" in doc:
         errors.extend(_validate_current_attempt(doc["current_attempt"]))
     if "last_finished" in doc:
@@ -916,9 +867,7 @@ def validate_status(doc: object) -> list[str]:
             errors.append("status.recent_commands must contain at most 20 entries")
         else:
             for index, entry in enumerate(commands):
-                errors.extend(
-                    _validate_command_record(entry, f"status.recent_commands[{index}]")
-                )
+                errors.extend(_validate_command_record(entry, f"status.recent_commands[{index}]"))
     if "recent_events" in doc:
         events = doc["recent_events"]
         if not isinstance(events, list):
@@ -927,9 +876,7 @@ def validate_status(doc: object) -> list[str]:
             errors.append("status.recent_events must contain at most 50 entries")
         else:
             for index, entry in enumerate(events):
-                errors.extend(
-                    _validate_contract_event(entry, f"status.recent_events[{index}]")
-                )
+                errors.extend(_validate_contract_event(entry, f"status.recent_events[{index}]"))
     if "truncated" in doc and type(doc["truncated"]) is not bool:
         errors.append("status.truncated must be a boolean")
     return errors

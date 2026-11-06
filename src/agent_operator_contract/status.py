@@ -8,6 +8,7 @@ unknown enum values in optional positions are kept as the explicit string
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -209,9 +210,7 @@ def _required(doc: dict[str, Any], key: str, prefix: str) -> Any:
     return doc[key]
 
 
-def _check_unknown(
-    doc: dict[str, Any], allowed: frozenset[str], prefix: str, strict: bool
-) -> None:
+def _check_unknown(doc: dict[str, Any], allowed: frozenset[str], prefix: str, strict: bool) -> None:
     if strict:
         for key in doc:
             if key not in allowed:
@@ -242,8 +241,6 @@ def _parse_limit_name(value: object, prefix: str, strict: bool) -> str:
 def _parse_timestamp(value: object, prefix: str, field_name: str) -> str:
     if not isinstance(value, str) or not documents.TIMESTAMP_PATTERN:
         raise _fail(prefix, f"{field_name} must be an RFC 3339 UTC timestamp")
-    import re
-
     if re.search(documents.TIMESTAMP_PATTERN, value) is None:
         raise _fail(prefix, f"{field_name} must be an RFC 3339 UTC timestamp")
     return value
@@ -260,7 +257,9 @@ def parse_figure(doc: object, *, strict: bool, prefix: str = "figure") -> Figure
     data = _require_object(doc, prefix)
     _check_unknown(data, frozenset({"value", "unit", "basis", "reason"}), prefix, strict)
     value = _required(data, "value", prefix)
-    unit = _parse_enum(_required(data, "unit", prefix), documents.FIGURE_UNITS, prefix, "unit", strict)
+    unit = _parse_enum(
+        _required(data, "unit", prefix), documents.FIGURE_UNITS, prefix, "unit", strict
+    )
     basis = _parse_enum(
         _required(data, "basis", prefix), documents.FIGURE_BASES, prefix, "basis", strict
     )
@@ -271,9 +270,7 @@ def parse_figure(doc: object, *, strict: bool, prefix: str = "figure") -> Figure
         if value is not None:
             raise _fail(prefix, f"value must be null when basis is {basis!r}")
     elif basis == UNKNOWN:
-        if value is not None and (
-            not isinstance(value, (int, float)) or isinstance(value, bool)
-        ):
+        if value is not None and (not isinstance(value, (int, float)) or isinstance(value, bool)):
             raise _fail(prefix, "value must be a number or null")
     elif not isinstance(value, (int, float)) or isinstance(value, bool):
         raise _fail(prefix, f"value must be a number when basis is {basis!r}")
@@ -303,7 +300,9 @@ def _parse_budget(doc: object, prefix: str, strict: bool) -> Budget:
         prefix,
         strict,
     )
-    raw = parse_figure(_required(data, "raw_tokens", prefix), strict=strict, prefix=f"{prefix}.raw_tokens")
+    raw = parse_figure(
+        _required(data, "raw_tokens", prefix), strict=strict, prefix=f"{prefix}.raw_tokens"
+    )
     effective = parse_figure(
         _required(data, "effective_tokens", prefix),
         strict=strict,
@@ -382,18 +381,14 @@ def _parse_current_attempt(doc: object, prefix: str, strict: bool) -> CurrentAtt
     last_activity_at = _parse_nullable_timestamp(
         _required(data, "last_activity_at", prefix), prefix, "last_activity_at"
     )
-    observed_at = _parse_timestamp(
-        _required(data, "observed_at", prefix), prefix, "observed_at"
-    )
+    observed_at = _parse_timestamp(_required(data, "observed_at", prefix), prefix, "observed_at")
     budget = _parse_budget(_required(data, "budget", prefix), f"{prefix}.budget", strict)
     figures_raw = _required(data, "figures", prefix)
     if not isinstance(figures_raw, dict):
         raise _fail(prefix, "figures must be an object")
     figures: dict[str, Figure] = {}
     for name, figure_doc in figures_raw.items():
-        figures[name] = parse_figure(
-            figure_doc, strict=strict, prefix=f"{prefix}.figures.{name}"
-        )
+        figures[name] = parse_figure(figure_doc, strict=strict, prefix=f"{prefix}.figures.{name}")
     return CurrentAttempt(
         attempt_id=attempt_id,
         issue_number=number,
@@ -473,9 +468,7 @@ def _parse_attempt_summary(doc: object, prefix: str, strict: bool) -> AttemptSum
     sealed = _required(data, "sealed", prefix)
     if type(sealed) is not bool:
         raise _fail(prefix, "sealed must be a boolean")
-    sealed_at = _parse_nullable_timestamp(
-        _required(data, "sealed_at", prefix), prefix, "sealed_at"
-    )
+    sealed_at = _parse_nullable_timestamp(_required(data, "sealed_at", prefix), prefix, "sealed_at")
     return AttemptSummary(
         attempt_id=attempt_id,
         issue_number=number,
@@ -512,10 +505,11 @@ def _parse_command_record(doc: object, prefix: str, strict: bool) -> CommandReco
         prefix,
         strict,
     )
-    import re
-
     request_id = _required(data, "request_id", prefix)
-    if not isinstance(request_id, str) or re.search(documents.REQUEST_ID_PATTERN, request_id) is None:
+    if (
+        not isinstance(request_id, str)
+        or re.search(documents.REQUEST_ID_PATTERN, request_id) is None
+    ):
         raise _fail(prefix, "request_id must match the request ID pattern")
     sequence = _required(data, "sequence", prefix)
     if type(sequence) is not int or sequence < 0:
@@ -527,7 +521,10 @@ def _parse_command_record(doc: object, prefix: str, strict: bool) -> CommandReco
     if not isinstance(arguments, dict):
         raise _fail(prefix, "arguments must be an object")
     repository = _required(data, "repository", prefix)
-    if not isinstance(repository, str) or re.search(documents.REPOSITORY_PATTERN, repository) is None:
+    if (
+        not isinstance(repository, str)
+        or re.search(documents.REPOSITORY_PATTERN, repository) is None
+    ):
         raise _fail(prefix, "repository must be written owner/name")
     acknowledgement = _parse_enum(
         _required(data, "acknowledgement", prefix),
@@ -624,9 +621,10 @@ def _parse_identity(doc: object, prefix: str, strict: bool) -> Identity:
     if type(minor) is not int or minor < 0:
         raise _fail(prefix, "contract.minor must be an integer >= 0")
     repository = _required(data, "repository", prefix)
-    import re
-
-    if not isinstance(repository, str) or re.search(documents.REPOSITORY_PATTERN, repository) is None:
+    if (
+        not isinstance(repository, str)
+        or re.search(documents.REPOSITORY_PATTERN, repository) is None
+    ):
         raise _fail(prefix, "repository must be written owner/name")
     mode = _parse_enum(
         _required(data, "mode", prefix), ("online", "offline"), prefix, "mode", strict
@@ -641,9 +639,8 @@ def _parse_identity(doc: object, prefix: str, strict: bool) -> Identity:
         if not isinstance(started_at, str):
             raise _fail(prefix, "process_started_at must be a string online")
         _parse_timestamp(started_at, prefix, "process_started_at")
-    elif mode == UNKNOWN:
-        if started_at is not None and not isinstance(started_at, str):
-            raise _fail(prefix, "process_started_at must be a string or null")
+    elif mode == UNKNOWN and started_at is not None and not isinstance(started_at, str):
+        raise _fail(prefix, "process_started_at must be a string or null")
     capabilities_raw = _required(data, "capabilities", prefix)
     if not isinstance(capabilities_raw, list) or any(
         not isinstance(item, str) or not item for item in capabilities_raw
@@ -683,9 +680,7 @@ def parse_status(doc: object, *, strict: bool) -> StatusSnapshot:
         prefix,
         strict,
     )
-    generated_at = _parse_timestamp(
-        _required(data, "generated_at", prefix), prefix, "generated_at"
-    )
+    generated_at = _parse_timestamp(_required(data, "generated_at", prefix), prefix, "generated_at")
     identity = _parse_identity(_required(data, "identity", prefix), f"{prefix}.identity", strict)
     instance_raw = _require_object(_required(data, "instance", prefix), f"{prefix}.instance")
     _check_unknown(
@@ -779,9 +774,7 @@ def parse_status(doc: object, *, strict: bool) -> StatusSnapshot:
             strict,
         )
         priority = Priority(
-            request_id=str(
-                _required(priority_data, "request_id", f"{prefix}.intake.priority")
-            ),
+            request_id=str(_required(priority_data, "request_id", f"{prefix}.intake.priority")),
             issue=int(_required(priority_data, "issue", f"{prefix}.intake.priority")),
         )
     intake_observed = _parse_timestamp(

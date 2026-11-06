@@ -157,9 +157,7 @@ def _format_figure_value(figure: object) -> str:
     value = figure.get("value")
     unit = _display_enum(figure.get("unit"), _KNOWN_FIGURE_UNITS)
     basis = _display_enum(figure.get("basis"), _KNOWN_FIGURE_BASES)
-    if value is None:
-        text = f"unknown {unit} ({basis})"
-    elif isinstance(value, bool):
+    if value is None or isinstance(value, bool):
         text = f"unknown {unit} ({basis})"
     else:
         text = f"{value} {unit} ({basis})"
@@ -181,8 +179,7 @@ def _human_status(snapshot: object) -> str:
     instance = snapshot.get("instance")
     if isinstance(instance, dict):
         lines.append(
-            f"instance: {instance.get('state', '')} "
-            f"(observed {instance.get('observed_at', '')})"
+            f"instance: {instance.get('state', '')} (observed {instance.get('observed_at', '')})"
         )
         halt = instance.get("last_halt")
         if isinstance(halt, dict):
@@ -193,8 +190,7 @@ def _human_status(snapshot: object) -> str:
     intake = snapshot.get("intake")
     if isinstance(intake, dict):
         lines.append(
-            f"intake: {intake.get('state', '')} "
-            f"(observed {intake.get('observed_at', '')})"
+            f"intake: {intake.get('state', '')} (observed {intake.get('observed_at', '')})"
         )
     current = snapshot.get("current_attempt")
     if current is None:
@@ -216,9 +212,7 @@ def _human_status(snapshot: object) -> str:
             enforced = budget.get("enforced_tokens", "")
             if enforced not in ("raw", "effective", "none"):
                 enforced = "unknown"
-            lines.append(
-                f"budget: raw {raw}, effective {effective}, enforced: {enforced}"
-            )
+            lines.append(f"budget: raw {raw}, effective {effective}, enforced: {enforced}")
             limits = budget.get("limits")
             if isinstance(limits, list) and limits:
                 lines.append("limits:")
@@ -303,10 +297,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json",
         dest="global_json",
         action="store_true",
-        help=(
-            "print the producer envelope verbatim (identity, status) "
-            "or the ls document as JSON"
-        ),
+        help=("print the producer envelope verbatim (identity, status) or the ls document as JSON"),
     )
     parser.add_argument(
         "--docker",

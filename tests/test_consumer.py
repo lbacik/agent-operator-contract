@@ -216,6 +216,116 @@ def test_identity_human_output(consumer_env: dict[str, Any]) -> None:
     assert "example-owner/example-repo" in out
 
 
+STATUS_FIXTURES = [
+    "status-starting",
+    "status-recovering",
+    "status-idle",
+    "status-active",
+    "status-draining",
+    "status-paused",
+    "status-simple-coding-agent",
+    "offline-status-halted",
+]
+
+
+def _status_env(
+    consumer_env: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+) -> dict[str, str]:
+    """A fixture dir with one status recording: every status argv collides.
+
+    All online status fixtures share ``argv == ["--contract", "1", "status"]``
+    and the fake replays the first match, so ``--json`` verbatim and human
+    output are tested against an isolated dir with a single recording.
+    """
+    isolated = tmp_path / "status-fixtures"
+    isolated.mkdir(exist_ok=True)
+    (isolated / f"{name}.json").write_text(
+        (FIXTURES_DIR / f"{name}.json").read_text(encoding="utf-8"), encoding="utf-8"
+    )
+    env = dict(consumer_env["env"])
+    env["FAKE_DOCKER_FIXTURES"] = str(isolated)
+    monkeypatch.setenv("FAKE_DOCKER_FIXTURES", str(isolated))
+    return env
+
+
+def test_status_json_passthrough_is_byte_for_byte(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _status_env(consumer_env, tmp_path, monkeypatch, "status-active")
+    fixture = json.loads((FIXTURES_DIR / "status-active.json").read_text(encoding="utf-8"))
+    expected_stdout: str = fixture["stdout"]
+    completed = _run_agentfleet(["status", "web-1", "--json"], env)
+
+    assert completed.returncode == fixture["exit_code"]
+    assert completed.stdout.decode("utf-8") == expected_stdout
+
+
+def test_status_exec_argv_has_contract_first_and_no_tty(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _status_env(consumer_env, tmp_path, monkeypatch, "status-active")
+    completed = _run_agentfleet(["status", "web-1", "--json"], env)
+
+    assert completed.returncode == 0
+    recorded = _recorded(consumer_env)
+    execs = [entry for entry in recorded if entry["argv"][0] == "exec"]
+    assert len(execs) == 1
+    argv: list[str] = execs[0]["argv"]
+    assert "-t" not in argv
+    assert "--tty" not in argv
+    assert "-i" not in argv
+    assert "-it" not in argv
+    assert "--user" in argv
+    user_index = argv.index("--user")
+    assert argv[user_index + 1] == "agent"
+    agentctl_index = argv.index("/usr/local/bin/agentctl")
+    agentctl_argv = argv[agentctl_index + 1 :]
+    assert agentctl_argv == ["--contract", "1", "status"]
+
+
+def test_status_human_output_shows_units_bases_and_freshness(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _status_env(consumer_env, tmp_path, monkeypatch, "status-active")
+    completed = _run_agentfleet(["status", "web-1"], env)
+
+    assert completed.returncode == 0
+    out = completed.stdout.decode("utf-8")
+    assert "118 count (measured)" in out
+    assert "tokens (measured)" in out
+    assert "cache_hit_rate: unknown ratio (unavailable)" in out
+    assert "unknown" in out
+    assert "cache_hit_rate: 0" not in out
+    assert "observed 2026-11-06T09:12:05Z" in out
+    assert "observed 2026-11-06T09:12:04Z" in out
+
+
+def test_status_human_output_for_idle_shows_no_attempt(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _status_env(consumer_env, tmp_path, monkeypatch, "status-idle")
+    completed = _run_agentfleet(["status", "web-1"], env)
+
+    assert completed.returncode == 0
+    out = completed.stdout.decode("utf-8")
+    assert "instance: idle" in out
+    assert "current_attempt: none" in out
+
+
+@pytest.mark.parametrize("name", STATUS_FIXTURES)
+def test_status_fixtures_are_success_snapshots(name: str) -> None:
+    fixture = documents.load_fixture(name)
+    doc = json.loads(fixture["stdout"])
+
+    assert documents.validate_envelope(doc) == []
+    assert documents.validate_status(doc["result"]) == []
+    assert documents.classify_fixture(fixture) == "success"
+    assert documents.load_fixture_index()["fixtures"][name]["classification"] == "success"
+
+
 def test_identity_duplicate_fails_with_client_error_and_no_exec(
     consumer_env: dict[str, Any],
 ) -> None:

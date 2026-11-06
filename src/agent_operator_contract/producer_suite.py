@@ -235,9 +235,7 @@ def _check_status(stdout: str, exit_code: int, ctx: SuiteContext) -> list[str]:
     if not isinstance(identity, dict):
         return ["status identity must be an object"]
     if identity.get("repository") != ctx.repository:
-        mismatches.append(
-            f"repository {identity.get('repository')!r} != {ctx.repository!r}"
-        )
+        mismatches.append(f"repository {identity.get('repository')!r} != {ctx.repository!r}")
     if identity.get("mode") != "online":
         mismatches.append(f"mode {identity.get('mode')!r} != 'online'")
     contract = identity.get("contract")
@@ -247,9 +245,7 @@ def _check_status(stdout: str, exit_code: int, ctx: SuiteContext) -> list[str]:
     if not isinstance(capabilities, list) or capabilities != sorted(capabilities):
         mismatches.append(f"capabilities {capabilities!r} are not sorted")
     elif capabilities != sorted(ctx.capabilities):
-        mismatches.append(
-            f"capabilities {capabilities!r} != {sorted(ctx.capabilities)!r}"
-        )
+        mismatches.append(f"capabilities {capabilities!r} != {sorted(ctx.capabilities)!r}")
     return mismatches
 
 

@@ -29,6 +29,29 @@ IDENTITY = {
     "capabilities": ["next-issue", "stop-after"],
 }
 
+STATUS: dict[str, Any] = {
+    "generated_at": "2026-11-06T09:12:05Z",
+    "identity": IDENTITY,
+    "instance": {
+        "state": "idle",
+        "startup_check": None,
+        "last_halt": None,
+        "observed_at": "2026-11-06T09:12:05Z",
+    },
+    "intake": {
+        "state": "open",
+        "pending_stop": None,
+        "stop_plan": None,
+        "priority": None,
+        "observed_at": "2026-11-06T09:12:05Z",
+    },
+    "current_attempt": None,
+    "last_finished": None,
+    "recent_commands": [],
+    "recent_events": [],
+    "truncated": False,
+}
+
 
 def _ok(result: dict[str, Any]) -> str:
     return shared.render_success(result)
@@ -50,6 +73,8 @@ def _fake_docker(
 ) -> producer_suite.DockerResult:
     if argv == ["--contract", "1", "identity"]:
         return producer_suite.DockerResult(0, _ok(IDENTITY), "")
+    if argv == ["--contract", "1", "status"]:
+        return producer_suite.DockerResult(0, _ok(STATUS), "")
     if argv == ["--contract", "1", "stop", "--after"]:
         return producer_suite.DockerResult(2, _fail("usage"), "")
     if argv == ["--contract", "2", "status"]:
@@ -93,6 +118,7 @@ def fakes(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_scenario_ids_are_stable() -> None:
     assert producer_suite.scenario_ids() == [
         "identity",
+        "status",
         "argv-usage",
         "contract-mismatch",
         "unsupported-capability",
@@ -105,6 +131,7 @@ def test_run_all_passes_with_hold_lock_not_run(fakes: None) -> None:
     by_id = {outcome.scenario_id: outcome for outcome in outcomes}
 
     assert by_id["identity"].status == "passed"
+    assert by_id["status"].status == "passed"
     assert by_id["argv-usage"].status == "passed"
     assert by_id["contract-mismatch"].status == "passed"
     assert by_id["unsupported-capability"].status == "passed"
@@ -135,6 +162,19 @@ def test_supported_but_broken_producer_fails_identity(
     monkeypatch.setattr(producer_suite, "_docker_exec", broken)
 
     assert producer_suite.scenario_identity(CTX).status == "failed"
+
+
+def test_supported_but_broken_producer_fails_status(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        return producer_suite.DockerResult(0, "not json\n", "")
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", broken)
+
+    assert producer_suite.scenario_status(CTX).status == "failed"
 
 
 def test_apply_expect_fail_listing_a_failure_keeps_the_run_green() -> None:
@@ -183,6 +223,7 @@ def test_main_reports_per_scenario_and_exits_zero(
 
     out = capsys.readouterr().out
     assert "PASS identity" in out
+    assert "PASS status" in out
     assert "PASS argv-usage" in out
     assert "PASS contract-mismatch" in out
     assert "PASS unsupported-capability" in out

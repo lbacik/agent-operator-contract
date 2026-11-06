@@ -373,23 +373,20 @@ def test_status_snapshots_validate_against_library() -> None:
 
 def test_library_agrees_with_schema_on_status_snapshots() -> None:
     for name, snapshot in _status_snapshots():
-        assert (documents.validate_status(snapshot) == []) == STATUS_VALIDATOR.is_valid(
-            snapshot
-        ), name
+        assert (documents.validate_status(snapshot) == []) == STATUS_VALIDATOR.is_valid(snapshot), (
+            name
+        )
 
 
 def test_status_schema_enums_match_library() -> None:
-    assert (
-        STATUS_SCHEMA["properties"]["instance"]["properties"]["state"]["enum"]
-        == list(documents.STATUS_STATES)
+    assert STATUS_SCHEMA["properties"]["instance"]["properties"]["state"]["enum"] == list(
+        documents.STATUS_STATES
     )
-    assert (
-        STATUS_SCHEMA["properties"]["intake"]["properties"]["state"]["enum"]
-        == list(documents.INTAKE_STATES)
+    assert STATUS_SCHEMA["properties"]["intake"]["properties"]["state"]["enum"] == list(
+        documents.INTAKE_STATES
     )
-    assert (
-        STATUS_SCHEMA["$defs"]["budget"]["properties"]["enforced_tokens"]["enum"]
-        == list(documents.ENFORCED_TOKENS)
+    assert STATUS_SCHEMA["$defs"]["budget"]["properties"]["enforced_tokens"]["enum"] == list(
+        documents.ENFORCED_TOKENS
     )
     figure = STATUS_SCHEMA["$defs"]["figure"]
     assert figure["properties"]["unit"]["enum"] == list(documents.FIGURE_UNITS)
@@ -402,12 +399,10 @@ def test_figure_schema_enums_match_library() -> None:
 
 
 def test_status_limit_name_enum_matches_library() -> None:
-    name_schema = STATUS_SCHEMA["$defs"]["budget"]["properties"]["limits"]["items"][
-        "properties"
-    ]["name"]
-    enum_option = next(
-        option for option in name_schema["anyOf"] if "enum" in option
-    )
+    name_schema = STATUS_SCHEMA["$defs"]["budget"]["properties"]["limits"]["items"]["properties"][
+        "name"
+    ]
+    enum_option = next(option for option in name_schema["anyOf"] if "enum" in option)
 
     assert enum_option["enum"] == list(documents.LIMIT_NAMES)
 
