@@ -462,14 +462,16 @@ def test_harness_verb_mismatch_answers_usage() -> None:
     assert completed.returncode == 2
 
 
-def test_harness_unimplemented_verb_answers_unsupported() -> None:
-    completed = _run_harness(["hold", json.dumps({"verb": "hold", "params": {}})])
+def test_harness_hold_without_instance_answers_failed(tmp_path: Path) -> None:
+    env = dict(os.environ)
+    env["STUB_HARNESS_STATE"] = str(tmp_path / "state.json")
 
-    assert completed.returncode == 3
+    completed = _run_harness(["hold", json.dumps({"verb": "hold", "params": {}})], env)
+
+    assert completed.returncode == 1
     doc = json.loads(completed.stdout)
     assert documents.validate_harness_reply(doc) == []
-    assert doc["error"]["code"] == "unsupported"
-    assert doc["error"]["details"] == {"what": "verb", "name": "hold"}
+    assert doc["error"]["code"] == "failed"
 
 
 def test_harness_crash_points_match_library() -> None:
@@ -577,3 +579,423 @@ def test_harness_setup_without_docker_answers_failed(tmp_path: Path) -> None:
     doc = json.loads(completed.stdout)
     assert documents.validate_harness_reply(doc) == []
     assert doc["error"]["code"] == "failed"
+
+
+def _state_file(env: dict[str, str]) -> Path:
+    return Path(env["CONTRACT_STATE_DIR"]) / "agent-operator-contract.json"
+
+
+def _patch_state(env: dict[str, str], mutator: str) -> None:
+    import textwrap
+
+    path = _state_file(env)
+    script = textwrap.dedent(
+        f"""\
+        import json
+        path = {str(path)!r}
+        try:
+            doc = json.load(open(path))
+            assert isinstance(doc, dict)
+        except Exception:
+            doc = {{}}
+        {mutator}
+        tmp = path + ".tmp"
+        json.dump(doc, open(tmp, "w"), sort_keys=True)
+        import os
+        os.replace(tmp, path)
+        """
+    )
+    subprocess.run([sys.executable, "-c", script], check=True, timeout=60)
+
+
+def _status(env: dict[str, str]) -> dict[str, object]:
+    completed = _run_agentctl(["--contract", "1", "status"], env)
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    doc = json.loads(completed.stdout)
+    assert documents.validate_envelope(doc) == []
+    snapshot = doc["result"]
+    assert documents.validate_status(snapshot) == []
+    assert isinstance(snapshot, dict)
+    return snapshot
+
+
+def _set_issue(env: dict[str, str], issue: int, eligible: bool) -> None:
+    _patch_state(
+        env,
+        f"doc.setdefault('issues', {{}})[str({issue})]"
+        f" = {{'eligible': {eligible!r}, 'title': 'Issue {issue}'}}",
+    )
+
+
+def test_stub_claim_opens_for_an_eligible_issue(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 101, True)
+
+    snapshot = _status(env)
+
+    assert snapshot["current_attempt"] is not None
+    assert snapshot["instance"]["state"] == "active"  # type: ignore[index]
+
+
+def test_stub_hold_before_claim_blocks_the_claim(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 101, True)
+    _patch_state(env, "doc['hold'] = {'point': 'before-claim', 'scope': 'next'}")
+
+    snapshot = _status(env)
+
+    assert snapshot["current_attempt"] is None
+    assert snapshot["instance"]["state"] == "idle"  # type: ignore[index]
+
+
+def test_stub_stop_before_claim_then_crash_stays_closed(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 101, True)
+    _patch_state(env, "doc['hold'] = {'point': 'before-claim', 'scope': 'next'}")
+    assert _stop("example-owner/example-repo", "req-before-claim-1", env).returncode == 0
+
+    _patch_state(env, "doc['engine_alive'] = False\ndoc['recovery_pending'] = False")
+    crashed = _run_agentctl(["--contract", "1", "status"], env)
+    assert crashed.returncode == 6
+    assert json.loads(crashed.stdout)["error"]["code"] == "agent_unreachable"
+
+    _patch_state(env, "doc['engine_alive'] = True\ndoc['startup_hold'] = True")
+    starting = _status(env)
+    assert starting["instance"]["state"] == "starting"  # type: ignore[index]
+    assert starting["current_attempt"] is None
+
+    _patch_state(env, "doc['startup_hold'] = False\ndoc['hold'] = None")
+    snapshot = _status(env)
+
+    assert snapshot["intake"]["state"] == "closed"  # type: ignore[index]
+    assert snapshot["current_attempt"] is None
+    stored = _command("req-before-claim-1", env)
+    assert json.loads(stored.stdout)["result"]["command"]["acknowledgement"] == "completed"
+
+
+def test_stub_stop_after_claim_is_accepted_until_the_attempt_finishes(
+    tmp_path: Path,
+) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 102, True)
+    claimed = _status(env)
+    assert claimed["current_attempt"] is not None
+    attempt_id = claimed["current_attempt"]["attempt_id"]  # type: ignore[index]
+
+    stopped = _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "stop",
+            "--request-id",
+            "req-after-claim-1",
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+    assert stopped.returncode == 0
+    record = json.loads(stopped.stdout)["result"]["command"]
+    assert record["acknowledgement"] == "accepted"
+
+    draining = _status(env)
+    assert draining["instance"]["state"] == "draining"  # type: ignore[index]
+    assert draining["intake"]["pending_stop"] is not None  # type: ignore[index]
+
+    _patch_state(
+        env,
+        "active = doc.pop('active_attempt')\n"
+        "import datetime\n"
+        "now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)"
+        ".isoformat().replace('+00:00', 'Z')\n"
+        "summary = {'attempt_id': active['attempt_id'], "
+        "'issue': {'number': active['issue_number'], 'title': active['issue_title']}, "
+        "'started_at': active['started_at'], 'finished_at': now, "
+        "'lifecycle_state': 'finished', "
+        "'outcome': {'native': 'complete', 'reason': None, 'label': 'Complete'}, "
+        "'delivery': None, 'attention_required': False, 'sealed': True, "
+        "'sealed_at': now}\n"
+        "doc.setdefault('attempts', {})[summary['attempt_id']] = summary\n"
+        "doc.setdefault('attempt_order', []).append(summary['attempt_id'])\n"
+        "doc['last_finished'] = summary",
+    )
+    finished = _status(env)
+
+    assert finished["current_attempt"] is None
+    assert finished["last_finished"]["attempt_id"] == attempt_id  # type: ignore[index]
+    stored = _command("req-after-claim-1", env)
+    assert json.loads(stored.stdout)["result"]["command"]["acknowledgement"] == "completed"
+
+
+def test_stub_stop_during_starting_never_opens_a_claim(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 103, True)
+    _patch_state(env, "doc['startup_hold'] = True")
+
+    starting = _status(env)
+    assert starting["instance"]["state"] == "starting"  # type: ignore[index]
+
+    stopped = _stop("example-owner/example-repo", "req-starting-1", env)
+    assert stopped.returncode == 0
+    assert json.loads(stopped.stdout)["result"]["command"]["acknowledgement"] == "completed"
+
+    _patch_state(env, "doc['startup_hold'] = False")
+    snapshot = _status(env)
+
+    assert snapshot["current_attempt"] is None
+    assert snapshot["intake"]["state"] == "closed"  # type: ignore[index]
+    assert snapshot["instance"]["state"] == "paused"  # type: ignore[index]
+
+
+def test_stub_resume_supersedes_an_accepted_stop(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 104, True)
+    assert _status(env)["current_attempt"] is not None
+
+    assert _stop("example-owner/example-repo", "req-supersede-stop", env).returncode == 0
+    reopened = _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "resume",
+            "--request-id",
+            "req-supersede-resume",
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+    assert reopened.returncode == 0
+
+    assert (
+        json.loads(_command("req-supersede-stop", env).stdout)["result"]["command"][
+            "acknowledgement"
+        ]
+        == "superseded"
+    )
+    snapshot = _status(env)
+    assert snapshot["intake"]["state"] == "open"  # type: ignore[index]
+    assert snapshot["instance"]["state"] == "active"  # type: ignore[index]
+
+
+def test_stub_halt_is_reported_after_restart_and_offline(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _patch_state(
+        env,
+        "import datetime\n"
+        "now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)"
+        ".isoformat().replace('+00:00', 'Z')\n"
+        "doc['last_halt'] = {'reason': 'stub-halt', 'detail': '', 'at': now}\n"
+        "doc.setdefault('recent_events', []).append({'at': now, 'level': 'error', "
+        "'event': 'halted', 'reason': 'stub-halt', 'text': 'halted stub-halt'})\n"
+        "doc['engine_alive'] = False",
+    )
+    dead = _run_agentctl(["--contract", "1", "status"], env)
+    assert dead.returncode == 6
+
+    _patch_state(env, "doc['engine_alive'] = True\ndoc['startup_hold'] = True")
+    starting = _status(env)
+    assert starting["instance"]["last_halt"]["reason"] == "stub-halt"  # type: ignore[index]
+
+    _patch_state(env, "doc['startup_hold'] = False")
+    snapshot = _status(env)
+    assert snapshot["instance"]["last_halt"]["reason"] == "stub-halt"  # type: ignore[index]
+    events = [event for event in snapshot["recent_events"] if event["event"] == "halted"]  # type: ignore[index]
+    assert events
+    assert events[-1]["reason"] == "stub-halt"
+
+    offline = _run_agentctl(["--contract", "1", "--offline", "status"], env)
+    assert offline.returncode == 0
+    offline_snapshot = json.loads(offline.stdout)["result"]
+    assert documents.validate_status(offline_snapshot) == []
+    assert offline_snapshot["instance"]["state"] == "stopped"
+    assert offline_snapshot["instance"]["last_halt"]["reason"] == "stub-halt"
+
+
+def test_stub_publication_pending_recovers_without_changing_the_verdict(
+    tmp_path: Path,
+) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 106, True)
+    claimed = _status(env)
+    assert claimed["current_attempt"] is not None
+    attempt_id = claimed["current_attempt"]["attempt_id"]  # type: ignore[index]
+
+    _patch_state(
+        env,
+        "doc['active_attempt']['outcome_native'] = 'complete'\n"
+        "doc['active_attempt']['publication_pending'] = True\n"
+        "doc['defer_armed'] = False\n"
+        "doc['recovery_pending'] = True",
+    )
+    recovering = _status(env)
+    assert recovering["instance"]["state"] == "recovering"  # type: ignore[index]
+    assert recovering["current_attempt"]["attempt_id"] == attempt_id  # type: ignore[index]
+
+    _patch_state(
+        env,
+        "import datetime\n"
+        "now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)"
+        ".isoformat().replace('+00:00', 'Z')\n"
+        "active = doc['active_attempt']\n"
+        "summary = {'attempt_id': active['attempt_id'], "
+        "'issue': {'number': active['issue_number'], 'title': active['issue_title']}, "
+        "'started_at': active['started_at'], 'finished_at': now, "
+        "'lifecycle_state': 'finished', "
+        "'outcome': {'native': active['outcome_native'], 'reason': None, "
+        "'label': 'Complete'}, 'delivery': None, 'attention_required': False, "
+        "'sealed': True, 'sealed_at': now}\n"
+        "doc.setdefault('attempts', {})[summary['attempt_id']] = summary\n"
+        "doc.setdefault('attempt_order', []).append(summary['attempt_id'])\n"
+        "doc['last_finished'] = summary\n"
+        "doc['active_attempt'] = None\n"
+        "doc['recovery_pending'] = False",
+    )
+    done = _status(env)
+    assert done["last_finished"]["outcome"]["native"] == "complete"  # type: ignore[index]
+
+    assert _stop("example-owner/example-repo", "req-verdict-stop", env).returncode == 0
+    resumed = _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "resume",
+            "--request-id",
+            "req-verdict-resume",
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+    assert resumed.returncode == 0
+    again = _status(env)
+    assert again["last_finished"]["outcome"]["native"] == "complete"  # type: ignore[index]
+
+
+def test_stub_attempts_list_and_show_validate(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 107, True)
+    claimed = _status(env)
+    assert claimed["current_attempt"] is not None
+    attempt_id = claimed["current_attempt"]["attempt_id"]  # type: ignore[index]
+
+    listed = _run_agentctl(["--contract", "1", "attempts", "list"], env)
+    assert listed.returncode == 0
+    assert json.loads(listed.stdout)["result"]["attempts"]
+
+    shown = _run_agentctl(["--contract", "1", "attempts", "show", attempt_id], env)
+    assert shown.returncode == 0
+    doc = json.loads(shown.stdout)
+    assert doc["result"]["attempt"]["attempt_id"] == attempt_id
+
+    missing = _run_agentctl(["--contract", "1", "attempts", "show", "no-such-attempt"], env)
+    assert missing.returncode == 5
+    assert json.loads(missing.stdout)["error"]["code"] == "not_found"
+
+
+def test_stub_crash_between_commit_and_reply_replays(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _patch_state(env, "doc['crash_armed'] = {'point': 'between-commit-and-reply'}")
+
+    crashed = _stop("example-owner/example-repo", "req-armed-1", env)
+    assert crashed.returncode == 6
+    assert json.loads(crashed.stdout)["error"]["code"] == "agent_unreachable"
+
+    _patch_state(env, "doc['engine_alive'] = True")
+    replayed = _stop("example-owner/example-repo", "req-armed-1", env)
+    assert replayed.returncode == 0
+    assert json.loads(replayed.stdout)["result"]["replayed"] is True
+
+
+def _harness_env(tmp_path: Path, container: str = "stub-test-container") -> dict[str, str]:
+    env = dict(os.environ)
+    state_file = tmp_path / "harness-state.json"
+    state_file.write_text(json.dumps({"container": container, "volume": "stub-test-data"}))
+    env["STUB_HARNESS_STATE"] = str(state_file)
+    env["DOCKER"] = "nonexistent-docker-binary-for-tests"
+    return env
+
+
+def test_harness_verbs_without_a_container_answer_failed(tmp_path: Path) -> None:
+    env = dict(os.environ)
+    env["STUB_HARNESS_STATE"] = str(tmp_path / "missing-state.json")
+    for verb in (
+        "set-issue",
+        "hold",
+        "release",
+        "finish-attempt",
+        "crash",
+        "terminate",
+        "stop-container",
+        "start-container",
+        "halt",
+        "grow-archive",
+        "defer-publication",
+    ):
+        completed = _run_harness([verb, json.dumps({"verb": verb, "params": {}})], env)
+        assert completed.returncode == 1, verb
+        assert json.loads(completed.stdout)["error"]["code"] == "failed"
+
+
+def test_harness_hold_lock_validates_duration(tmp_path: Path) -> None:
+    env = _harness_env(tmp_path)
+    completed = _run_harness(
+        ["hold-lock", json.dumps({"verb": "hold-lock", "params": {"duration_ms": 0}})],
+        env,
+    )
+
+    assert completed.returncode == 2
+    assert json.loads(completed.stdout)["error"]["code"] == "usage"
+
+
+def test_harness_set_issue_validates_params(tmp_path: Path) -> None:
+    env = _harness_env(tmp_path)
+    completed = _run_harness(
+        ["set-issue", json.dumps({"verb": "set-issue", "params": {"issue": 0, "eligible": True}})],
+        env,
+    )
+
+    assert completed.returncode == 2
+    assert json.loads(completed.stdout)["error"]["code"] == "usage"
+
+
+def test_harness_finish_unknown_outcome_is_unsupported(tmp_path: Path) -> None:
+    env = _harness_env(tmp_path)
+    completed = _run_harness(
+        [
+            "finish-attempt",
+            json.dumps({"verb": "finish-attempt", "params": {"native_outcome": "bogus"}}),
+        ],
+        env,
+    )
+
+    assert completed.returncode == 3
+    doc = json.loads(completed.stdout)
+    assert documents.validate_harness_reply(doc) == []
+    assert doc["error"]["code"] == "unsupported"
+    assert doc["error"]["details"] == {"what": "native-outcome", "name": "bogus"}
+
+
+def test_harness_setup_unknown_capability_is_unsupported(tmp_path: Path) -> None:
+    env = dict(os.environ)
+    env["STUB_HARNESS_STATE"] = str(tmp_path / "state.json")
+    env["DOCKER"] = "nonexistent-docker-binary-for-tests"
+    completed = _run_harness(
+        [
+            "setup",
+            json.dumps(
+                {
+                    "verb": "setup",
+                    "params": {
+                        "repository": "example-owner/example-repo",
+                        "capabilities": ["time-travel"],
+                    },
+                }
+            ),
+        ],
+        env,
+    )
+
+    assert completed.returncode == 3
+    doc = json.loads(completed.stdout)
+    assert doc["error"]["details"] == {"what": "capability", "name": "time-travel"}

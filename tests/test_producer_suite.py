@@ -230,7 +230,7 @@ def _fake_harness(
         return producer_suite.HarnessResult("ok", {"removed": True}, "")
     if verb == "hold-lock":
         return producer_suite.HarnessResult("unsupported", None, "verb:hold-lock")
-    raise AssertionError(f"unexpected harness verb: {verb!r}")
+    return producer_suite.HarnessResult("unsupported", None, f"verb:{verb}")
 
 
 @pytest.fixture
@@ -269,6 +269,12 @@ def test_scenario_ids_are_stable() -> None:
         "command-found",
         "crash-between-commit-and-reply",
         "hold-lock",
+        "stop-before-claim-crash",
+        "stop-after-claim-sigterm",
+        "stop-during-starting",
+        "resume-supersedes-stop",
+        "halt-records-last-halt",
+        "publication-pending-recovery",
     ]
 
 
@@ -292,6 +298,12 @@ def test_run_all_passes_with_hold_lock_not_run(fakes: _FakeProducer) -> None:
     assert by_id["command-found"].status == "passed"
     assert by_id["crash-between-commit-and-reply"].status == "passed"
     assert by_id["hold-lock"].status == "not_run"
+    assert by_id["stop-before-claim-crash"].status == "not_run"
+    assert by_id["stop-after-claim-sigterm"].status == "not_run"
+    assert by_id["stop-during-starting"].status == "not_run"
+    assert by_id["resume-supersedes-stop"].status == "not_run"
+    assert by_id["halt-records-last-halt"].status == "not_run"
+    assert by_id["publication-pending-recovery"].status == "not_run"
 
 
 def test_mutation_scenarios_fail_when_replay_changes_the_record(

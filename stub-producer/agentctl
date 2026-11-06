@@ -1,26 +1,23 @@
 #!/usr/bin/env python3
 """Stub producer ``agentctl``: a minimal, test-only engine (never published).
 
-Serves ``identity``, ``status`` and ``command`` plus the core mutations
-``stop`` and ``resume`` (and a minimal ``stop --after`` plan) with durable
-Intake and a request ID store on its state volume. Grammar, capability and
-value failures come from the shared part of the library; the stub then applies
-the rest of the section 4.1 order itself: ``--expect-repo``,
-``payload_mismatch`` or replay, then state (``rejected``) and commit.
-
-A one-shot crash flag supports the producer suite's crash scenario: when a
-file named ``crash-between-commit-and-reply`` exists in the state directory,
-the next committed mutation is saved durably, the flag is removed, and the
-process kills itself before replying, so a retry with the same request ID
-replays the stored record.
+Serves ``identity``, ``status``, ``command`` and ``attempts list`` / ``attempts
+show`` plus the core mutations ``stop`` and ``resume`` (and a minimal ``stop
+--after`` plan) with durable Intake, Claims and Attempts on its state volume.
+Recovery runs at start, Halts are recorded durably, and the engine honors the
+harness holds (notably ``before-claim``) and one-shot crashes armed by the
+harness. Grammar, capability and value failures come from the shared part of
+the library; the stub then applies the rest of the section 4.1 order itself:
+``--expect-repo``, ``payload_mismatch`` or replay, then state (``rejected``)
+and commit.
 """
 
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
-import signal
 import sys
 from typing import Any
 
@@ -29,11 +26,14 @@ from agent_operator_contract import shared
 STATE_FILENAME = "agent-operator-contract.json"
 """State file name inside the state directory (durable Intake, command store)."""
 
-CRASH_FLAG_FILENAME = "crash-between-commit-and-reply"
-"""One-shot flag arming a crash between commit and reply (spec section 14)."""
-
 MAX_RECENT_COMMANDS = 20
 MAX_RECENT_EVENTS = 50
+
+NATIVE_OUTCOMES = ("complete", "incomplete", "infrastructure_error", "no_changes", "handoff")
+"""Native outcomes the stub engine understands (spec section 16 mapping)."""
+
+NATIVE_PHASES = ("claimed", "setup", "model_running", "pushing", "publishing")
+"""Native phases the stub Attempt passes through (displayed as-is)."""
 
 
 def _utc_now() -> str:
@@ -77,6 +77,20 @@ def _fresh_state() -> dict[str, Any]:
         "next_sequence": 1,
         "commands": {},
         "recent_events": [],
+        "issues": {},
+        "hold": None,
+        "active_attempt": None,
+        "attempts": {},
+        "attempt_order": [],
+        "last_finished": None,
+        "last_halt": None,
+        "engine_alive": True,
+        "startup_hold": False,
+        "recovery_pending": False,
+        "crash_armed": None,
+        "defer_armed": False,
+        "attempt_counter": 0,
+        "process_started_at": _utc_now(),
     }
 
 
@@ -106,6 +120,47 @@ def _load_state() -> tuple[dict[str, Any], str | None]:
         state["commands"] = doc["commands"]
     if isinstance(doc.get("recent_events"), list):
         state["recent_events"] = doc["recent_events"][-MAX_RECENT_EVENTS:]
+    if isinstance(doc.get("issues"), dict):
+        state["issues"] = {
+            key: value
+            for key, value in doc["issues"].items()
+            if isinstance(value, dict)
+        }
+    hold = doc.get("hold")
+    if isinstance(hold, dict) or hold is None:
+        state["hold"] = hold
+    active = doc.get("active_attempt")
+    if isinstance(active, dict) or active is None:
+        state["active_attempt"] = active
+    if isinstance(doc.get("attempts"), dict):
+        state["attempts"] = {
+            key: value for key, value in doc["attempts"].items() if isinstance(value, dict)
+        }
+    if isinstance(doc.get("attempt_order"), list):
+        state["attempt_order"] = [
+            item for item in doc["attempt_order"] if isinstance(item, str)
+        ]
+    finished = doc.get("last_finished")
+    if isinstance(finished, dict) or finished is None:
+        state["last_finished"] = finished
+    halt = doc.get("last_halt")
+    if isinstance(halt, dict) or halt is None:
+        state["last_halt"] = halt
+    if type(doc.get("engine_alive")) is bool:
+        state["engine_alive"] = doc["engine_alive"]
+    if type(doc.get("startup_hold")) is bool:
+        state["startup_hold"] = doc["startup_hold"]
+    if type(doc.get("recovery_pending")) is bool:
+        state["recovery_pending"] = doc["recovery_pending"]
+    armed = doc.get("crash_armed")
+    if isinstance(armed, dict) or armed is None:
+        state["crash_armed"] = armed
+    if type(doc.get("defer_armed")) is bool:
+        state["defer_armed"] = doc["defer_armed"]
+    if type(doc.get("attempt_counter")) is int and doc["attempt_counter"] >= 0:
+        state["attempt_counter"] = doc["attempt_counter"]
+    if isinstance(doc.get("process_started_at"), str):
+        state["process_started_at"] = doc["process_started_at"]
     return state, path
 
 
@@ -131,17 +186,21 @@ def _append_event(state: dict[str, Any], event: dict[str, Any]) -> None:
     del events[: max(0, len(events) - MAX_RECENT_EVENTS)]
 
 
-def _identity(offline: bool) -> dict[str, object]:
+def _identity(offline: bool, state: dict[str, Any] | None = None) -> dict[str, object]:
     capabilities = sorted(_advertised_capabilities())
+    if offline:
+        started_at: str | None = None
+    elif state is not None and isinstance(state.get("process_started_at"), str):
+        started_at = str(state["process_started_at"])
+    else:
+        started_at = os.environ.get("CONTRACT_STARTED_AT", _utc_now())
     return {
         "backend": os.environ.get("CONTRACT_BACKEND", "stub"),
         "agent_version": os.environ.get("CONTRACT_AGENT_VERSION", "0.0.0"),
         "contract": {"major": 1, "minor": 0},
         "repository": _repository(),
         "mode": "offline" if offline else "online",
-        "process_started_at": None
-        if offline
-        else os.environ.get("CONTRACT_STARTED_AT", _utc_now()),
+        "process_started_at": started_at,
         "capabilities": capabilities,
     }
 
@@ -159,25 +218,64 @@ def _recent_commands(state: dict[str, Any]) -> list[dict[str, Any]]:
     return records[-MAX_RECENT_COMMANDS:]
 
 
+def _stub_budget() -> dict[str, Any]:
+    unknown = {"value": None, "unit": "tokens", "basis": "unavailable",
+               "reason": "stub has no telemetry"}
+    return {
+        "raw_tokens": dict(unknown),
+        "effective_tokens": dict(unknown),
+        "enforced_tokens": "none",
+        "limits": [],
+    }
+
+
+def _current_attempt_doc(state: dict[str, Any], now: str) -> dict[str, Any] | None:
+    active = state.get("active_attempt")
+    if not isinstance(active, dict):
+        return None
+    return {
+        "attempt_id": active.get("attempt_id", ""),
+        "issue": {
+            "number": active.get("issue_number", 1),
+            "title": active.get("issue_title"),
+        },
+        "native_phase": active.get("native_phase", "claimed"),
+        "started_at": active.get("started_at", now),
+        "last_activity_at": active.get("last_activity_at"),
+        "observed_at": now,
+        "budget": _stub_budget(),
+        "figures": {},
+    }
+
+
+def _instance_state(state: dict[str, Any], offline: bool) -> tuple[str, str | None]:
+    if offline:
+        return "stopped", None
+    if state.get("startup_hold") is True:
+        return "starting", "stub_startup"
+    if state.get("recovery_pending") is True:
+        return "recovering", None
+    if isinstance(state.get("active_attempt"), dict):
+        if state.get("intake") == "open":
+            return "active", None
+        return "draining", None
+    if state.get("intake") == "open":
+        return "idle", None
+    return "paused", None
+
+
 def _status(offline: bool, state: dict[str, Any]) -> dict[str, object]:
     now = _utc_now()
-    identity = _identity(offline)
-    if offline:
-        instance: dict[str, object] = {
-            "last_halt": None,
-            "observed_at": now,
-            "startup_check": None,
-            "state": "stopped",
-        }
-    else:
-        instance = {
-            "last_halt": None,
-            "observed_at": now,
-            "startup_check": None,
-            "state": "idle" if state.get("intake") == "open" else "paused",
-        }
+    identity = _identity(offline, state)
+    instance_state, startup_check = _instance_state(state, offline)
+    instance: dict[str, object] = {
+        "last_halt": state.get("last_halt"),
+        "observed_at": now,
+        "startup_check": startup_check,
+        "state": instance_state,
+    }
     return {
-        "current_attempt": None,
+        "current_attempt": None if offline else _current_attempt_doc(state, now),
         "generated_at": now,
         "identity": identity,
         "instance": instance,
@@ -188,11 +286,173 @@ def _status(offline: bool, state: dict[str, Any]) -> dict[str, object]:
             "state": state.get("intake", "open"),
             "stop_plan": state.get("stop_plan"),
         },
-        "last_finished": None,
+        "last_finished": state.get("last_finished"),
         "recent_commands": _recent_commands(state),
         "recent_events": state.get("recent_events", []),
         "truncated": False,
     }
+
+
+def _eligible_issue(state: dict[str, Any]) -> tuple[int, str | None] | None:
+    issues = state.get("issues")
+    if not isinstance(issues, dict):
+        return None
+    for key in sorted(issues, key=lambda k: int(k) if k.isdigit() else 0):
+        try:
+            number = int(key)
+        except ValueError:
+            continue
+        entry = issues[key]
+        if isinstance(entry, dict) and entry.get("eligible") is True and number >= 1:
+            title = entry.get("title")
+            return number, title if isinstance(title, str) else None
+    return None
+
+
+def _held_before_claim(state: dict[str, Any]) -> bool:
+    hold = state.get("hold")
+    return isinstance(hold, dict) and hold.get("point") == "before-claim"
+
+
+def _maybe_complete_pending_stop(state: dict[str, Any]) -> None:
+    pending = state.get("pending_stop")
+    if not isinstance(pending, dict):
+        return
+    if isinstance(state.get("active_attempt"), dict):
+        return
+    now = _utc_now()
+    commands = state.get("commands")
+    request_id = pending.get("request_id")
+    if isinstance(commands, dict) and isinstance(request_id, str):
+        entry = commands.get(request_id)
+        if (
+            isinstance(entry, dict)
+            and isinstance(entry.get("record"), dict)
+            and entry["record"].get("acknowledgement") == "accepted"
+        ):
+            entry["record"]["acknowledgement"] = "completed"
+            entry["record"]["updated_at"] = now
+            entry["record"]["detail"] = "active attempt finished; intake drained"
+    state["pending_stop"] = None
+    _append_event(
+        state,
+        {
+            "at": now,
+            "level": "info",
+            "event": "command_resolved",
+            "request_id": request_id,
+            "acknowledgement": "completed",
+            "text": f"command {request_id} completed",
+        },
+    )
+
+
+def _maybe_count_stop_plan(state: dict[str, Any]) -> None:
+    plan = state.get("stop_plan")
+    if not isinstance(plan, dict):
+        return
+    if isinstance(state.get("active_attempt"), dict):
+        return
+    last = state.get("last_finished")
+    if not isinstance(last, dict):
+        return
+    last_id = last.get("attempt_id")
+    if not isinstance(last_id, str) or plan.get("last_counted") == last_id:
+        return
+    remaining = plan.get("remaining", 0)
+    counted = plan.get("counted", 0)
+    if not isinstance(remaining, int) or not isinstance(counted, int):
+        return
+    now = _utc_now()
+    plan["counted"] = counted + 1
+    plan["last_counted"] = last_id
+    if plan["counted"] >= remaining:
+        commands = state.get("commands")
+        request_id = plan.get("request_id")
+        if isinstance(commands, dict) and isinstance(request_id, str):
+            entry = commands.get(request_id)
+            if (
+                isinstance(entry, dict)
+                and isinstance(entry.get("record"), dict)
+                and entry["record"].get("acknowledgement") == "accepted"
+            ):
+                entry["record"]["acknowledgement"] = "completed"
+                entry["record"]["updated_at"] = now
+                entry["record"]["detail"] = "intake closed after planned attempts"
+        state["intake"] = "closed"
+        state["stop_plan"] = None
+        _append_event(
+            state,
+            {
+                "at": now,
+                "level": "info",
+                "event": "command_resolved",
+                "request_id": request_id,
+                "acknowledgement": "completed",
+                "text": f"command {request_id} completed",
+            },
+        )
+
+
+def _maybe_open_claim(state: dict[str, Any]) -> str | None:
+    """Try to open a Claim; return ``"crashed"`` when a one-shot crash fires."""
+    if state.get("engine_alive") is not True:
+        return None
+    if state.get("startup_hold") is True:
+        return None
+    if state.get("recovery_pending") is True:
+        return None
+    if isinstance(state.get("active_attempt"), dict):
+        return None
+    if state.get("intake") != "open":
+        return None
+    armed = state.get("crash_armed")
+    if isinstance(armed, dict) and armed.get("point") == "before-claim":
+        state["crash_armed"] = None
+        state["engine_alive"] = False
+        return "crashed"
+    if _held_before_claim(state):
+        return None
+    found = _eligible_issue(state)
+    if found is None:
+        return None
+    number, title = found
+    if isinstance(armed, dict) and armed.get("point") == "after-claim":
+        state["crash_armed"] = None
+        state["engine_alive"] = False
+        state["recovery_pending"] = True
+    now = _utc_now()
+    state["attempt_counter"] = int(state.get("attempt_counter", 0)) + 1
+    attempt_id = f"stub-{state['attempt_counter']}"
+    state["active_attempt"] = {
+        "attempt_id": attempt_id,
+        "issue_number": number,
+        "issue_title": title,
+        "native_phase": "claimed",
+        "started_at": now,
+        "last_activity_at": now,
+    }
+    _append_event(
+        state,
+        {
+            "at": now,
+            "level": "info",
+            "event": "claim_opened",
+            "attempt_id": attempt_id,
+            "issue": number,
+            "text": f"claimed issue #{number}",
+        },
+    )
+    if isinstance(armed, dict) and armed.get("point") == "after-claim":
+        return "crashed"
+    return "opened"
+
+
+def _tick(state: dict[str, Any]) -> str | None:
+    """Advance the engine one step; return ``"crashed"`` when a crash fires."""
+    _maybe_complete_pending_stop(state)
+    _maybe_count_stop_plan(state)
+    return _maybe_open_claim(state)
 
 
 def _mutation_payload(operation: str, arguments: dict[str, Any]) -> tuple[str, dict[str, Any]]:
@@ -283,37 +543,33 @@ def _supersede(state: dict[str, Any], ref: dict[str, Any] | None) -> None:
     )
 
 
-def _crash_flag_path() -> str | None:
-    """Return the crash flag path, or None when there is no state directory."""
-    directory = os.environ.get("CONTRACT_STATE_DIR", "/data")
-    if not os.path.isdir(directory):
-        return None
-    return os.path.join(directory, CRASH_FLAG_FILENAME)
-
-
-def _consume_crash_flag() -> bool:
-    """Remove a one-shot crash flag; True when a crash was armed."""
-    path = _crash_flag_path()
-    if path is None:
-        return False
-    try:
-        os.remove(path)
-    except OSError:
-        return False
-    return True
+def _fire_between_commit_and_reply(
+    state: dict[str, Any], path: str | None, request_id: str
+) -> int:
+    state["crash_armed"] = None
+    state["engine_alive"] = False
+    _save_state(state, path)
+    text, exit_code = shared.render_error(
+        "agent_unreachable",
+        "the engine died between commit and reply; retry with the same request ID",
+        request_id=request_id,
+    )
+    sys.stdout.write(text)
+    return exit_code
 
 
 def _do_stop(
-    state: dict[str, Any], request_id: str, arguments: dict[str, Any]
-) -> tuple[int, str]:
+    state: dict[str, Any], path: str | None, request_id: str, arguments: dict[str, Any]
+) -> int:
     kind, payload = _mutation_payload("stop", arguments)
-    if state.get("intake") == "closed":
+    if state.get("intake") == "closed" and state.get("pending_stop") is None:
         text, exit_code = shared.render_error(
             "rejected",
             "intake is already closed",
             request_id=request_id,
         )
-        return exit_code, text
+        sys.stdout.write(text)
+        return exit_code
     if kind == "stop_after":
         _supersede(state, state.get("pending_stop"))
         _supersede(state, state.get("stop_plan"))
@@ -329,9 +585,29 @@ def _do_stop(
         )
         state["stop_plan"] = {
             "request_id": request_id,
+            "sequence": record["sequence"],
             "remaining": remaining,
             "counted": 0,
         }
+        _save_state(state, path)
+    elif isinstance(state.get("active_attempt"), dict):
+        _supersede(state, state.get("pending_stop"))
+        _supersede(state, state.get("stop_plan"))
+        state["stop_plan"] = None
+        record = _commit(
+            state,
+            request_id,
+            kind,
+            payload,
+            "accepted",
+            "intake closing; finishes with the active attempt",
+        )
+        state["intake"] = "closed"
+        state["pending_stop"] = {
+            "request_id": request_id,
+            "sequence": record["sequence"],
+        }
+        _save_state(state, path)
     else:
         _supersede(state, state.get("pending_stop"))
         _supersede(state, state.get("stop_plan"))
@@ -339,10 +615,15 @@ def _do_stop(
         state["stop_plan"] = None
         state["intake"] = "closed"
         record = _commit(state, request_id, kind, payload, "completed", "intake closed by operator")
-    return 0, shared.render_success({"command": record, "replayed": False})
+        _save_state(state, path)
+    armed = state.get("crash_armed")
+    if isinstance(armed, dict) and armed.get("point") == "between-commit-and-reply":
+        return _fire_between_commit_and_reply(state, path, request_id)
+    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+    return 0
 
 
-def _do_resume(state: dict[str, Any], request_id: str) -> tuple[int, str]:
+def _do_resume(state: dict[str, Any], path: str | None, request_id: str) -> int:
     if (
         state.get("intake") == "open"
         and state.get("pending_stop") is None
@@ -353,14 +634,20 @@ def _do_resume(state: dict[str, Any], request_id: str) -> tuple[int, str]:
             "intake is already open",
             request_id=request_id,
         )
-        return exit_code, text
+        sys.stdout.write(text)
+        return exit_code
     _supersede(state, state.get("pending_stop"))
     _supersede(state, state.get("stop_plan"))
     state["pending_stop"] = None
     state["stop_plan"] = None
     state["intake"] = "open"
     record = _commit(state, request_id, "resume", {}, "completed", "intake reopened by operator")
-    return 0, shared.render_success({"command": record, "replayed": False})
+    _save_state(state, path)
+    armed = state.get("crash_armed")
+    if isinstance(armed, dict) and armed.get("point") == "between-commit-and-reply":
+        return _fire_between_commit_and_reply(state, path, request_id)
+    sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+    return 0
 
 
 def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedCall) -> int:
@@ -383,9 +670,7 @@ def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedC
         if stored.get("kind") == kind and stored.get("arguments") == payload:
             record = stored.get("record")
             assert isinstance(record, dict)
-            sys.stdout.write(
-                shared.render_success({"command": record, "replayed": True})
-            )
+            sys.stdout.write(shared.render_success({"command": record, "replayed": True}))
             return 0
         text, exit_code = shared.render_error(
             "payload_mismatch",
@@ -395,23 +680,15 @@ def _do_mutation(state: dict[str, Any], path: str | None, parsed: shared.ParsedC
         sys.stdout.write(text)
         return exit_code
     if parsed.operation == "stop":
-        exit_code, text = _do_stop(state, parsed.request_id, parsed.arguments)
-    elif parsed.operation == "resume":
-        exit_code, text = _do_resume(state, parsed.request_id)
-    else:  # pragma: no cover - guarded by the advertised capabilities in practice.
-        text, exit_code = shared.render_error(
-            "internal",
-            f"stub producer implements stop and resume only (got {parsed.operation})",
-            details={"stored": False},
-            request_id=parsed.request_id,
-        )
-        sys.stdout.write(text)
-        return exit_code
-    if exit_code == 0:
-        _save_state(state, path)
-        if _consume_crash_flag():
-            # The commit is durable; die before replying so the retry replays it.
-            os.kill(os.getpid(), signal.SIGKILL)
+        return _do_stop(state, path, parsed.request_id, parsed.arguments)
+    if parsed.operation == "resume":
+        return _do_resume(state, path, parsed.request_id)
+    text, exit_code = shared.render_error(
+        "internal",
+        f"stub producer implements stop and resume only (got {parsed.operation})",
+        details={"stored": False},
+        request_id=parsed.request_id,
+    )
     sys.stdout.write(text)
     return exit_code
 
@@ -433,33 +710,176 @@ def _do_command(state: dict[str, Any], request_id: str) -> int:
     return 0
 
 
+def _attempt_summary_for(
+    attempt_id: str,
+    issue_number: int,
+    issue_title: str | None,
+    started_at: str,
+    finished_at: str | None,
+    lifecycle_state: str,
+    outcome_native: str | None,
+    outcome_reason: str | None,
+    sealed: bool,
+    sealed_at: str | None,
+) -> dict[str, Any]:
+    if outcome_native is None:
+        outcome: dict[str, Any] | None = None
+    else:
+        outcome = {
+            "native": outcome_native,
+            "reason": outcome_reason,
+            "label": outcome_native.replace("_", " ").title(),
+        }
+    return {
+        "attempt_id": attempt_id,
+        "issue": {"number": issue_number, "title": issue_title},
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "lifecycle_state": lifecycle_state,
+        "outcome": outcome,
+        "delivery": None,
+        "attention_required": False,
+        "sealed": sealed,
+        "sealed_at": sealed_at,
+    }
+
+
+def _active_summary(state: dict[str, Any]) -> dict[str, Any] | None:
+    active = state.get("active_attempt")
+    if not isinstance(active, dict):
+        return None
+    return _attempt_summary_for(
+        str(active.get("attempt_id", "")),
+        int(active.get("issue_number", 1)),
+        active.get("issue_title") if isinstance(active.get("issue_title"), str) else None,
+        str(active.get("started_at", _utc_now())),
+        None,
+        "open",
+        active.get("outcome_native") if isinstance(active.get("outcome_native"), str) else None,
+        active.get("outcome_reason") if isinstance(active.get("outcome_reason"), str) else None,
+        False,
+        None,
+    )
+
+
+def _do_attempts_list(state: dict[str, Any], arguments: dict[str, Any]) -> int:
+    limit_raw = arguments.get("limit", "20")
+    try:
+        limit = int(str(limit_raw), 10)
+    except ValueError:
+        limit = 20
+    limit = max(1, min(100, limit))
+    summaries: list[dict[str, Any]] = []
+    active_summary = _active_summary(state)
+    if active_summary is not None:
+        summaries.append(active_summary)
+    attempts = state.get("attempts")
+    order = state.get("attempt_order")
+    if isinstance(attempts, dict) and isinstance(order, list):
+        for attempt_id in reversed(order):
+            summary = attempts.get(attempt_id)
+            if isinstance(summary, dict):
+                summaries.append(summary)
+    sys.stdout.write(
+        shared.render_success({"attempts": summaries[:limit], "next_cursor": None})
+    )
+    return 0
+
+
+def _manifest_for(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    line = json.dumps(
+        {"attempt_id": summary.get("attempt_id"), "event": "claim_opened"},
+        sort_keys=True,
+    ).encode() + b"\n"
+    digest = hashlib.sha256(line).hexdigest()
+    return [
+        {
+            "path": "events.jsonl",
+            "kind": "events",
+            "media_type": "application/x-ndjson",
+            "size": len(line),
+            "sha256": digest,
+        }
+    ]
+
+
+def _do_attempts_show(state: dict[str, Any], attempt_id: str) -> int:
+    active = state.get("active_attempt")
+    if isinstance(active, dict) and active.get("attempt_id") == attempt_id:
+        summary = _active_summary(state)
+        assert summary is not None
+        sys.stdout.write(
+            shared.render_success({"attempt": summary, "manifest": _manifest_for(summary)})
+        )
+        return 0
+    attempts = state.get("attempts")
+    if isinstance(attempts, dict):
+        summary = attempts.get(attempt_id)
+        if isinstance(summary, dict):
+            sys.stdout.write(
+                shared.render_success({"attempt": summary, "manifest": _manifest_for(summary)})
+            )
+            return 0
+    text, exit_code = shared.render_error("not_found", f"no attempt {attempt_id!r} is recorded")
+    sys.stdout.write(text)
+    return exit_code
+
+
+def _unreachable(request_id: str | None) -> int:
+    text, exit_code = shared.render_error(
+        "agent_unreachable",
+        "the stub engine is not running; start the container and retry",
+        request_id=request_id,
+    )
+    sys.stdout.write(text)
+    return exit_code
+
+
 def main(argv: list[str]) -> int:
     parsed = shared.parse_argv(argv, capabilities=_advertised_capabilities())
     if isinstance(parsed, shared.ArgvFailure):
         text, exit_code = shared.render_error(
-            parsed.code, parsed.message, details=parsed.details or None,
+            parsed.code,
+            parsed.message,
+            details=parsed.details or None,
             request_id=parsed.request_id,
         )
         sys.stdout.write(text)
         return exit_code
     if parsed.operation == "identity":
-        sys.stdout.write(shared.render_success(_identity(parsed.offline)))
+        state, _ = _load_state()
+        if not parsed.offline and state.get("engine_alive") is not True:
+            return _unreachable(None)
+        sys.stdout.write(shared.render_success(_identity(parsed.offline, state)))
         return 0
     state, path = _load_state()
+    if not parsed.offline and state.get("engine_alive") is not True:
+        return _unreachable(parsed.request_id)
     if parsed.operation == "status":
+        if not parsed.offline:
+            crashed = _tick(state)
+            _save_state(state, path)
+            if crashed == "crashed":
+                return _unreachable(None)
         sys.stdout.write(shared.render_success(_status(parsed.offline, state)))
         return 0
     if parsed.operation == "command":
         request_id = parsed.arguments.get("request_id")
         assert isinstance(request_id, str)
         return _do_command(state, request_id)
+    if parsed.operation == "attempts-list":
+        return _do_attempts_list(state, parsed.arguments)
+    if parsed.operation == "attempts-show":
+        attempt_id = parsed.arguments.get("attempt_id")
+        assert isinstance(attempt_id, str)
+        return _do_attempts_show(state, attempt_id)
     if parsed.operation in ("stop", "resume"):
         assert parsed.request_id is not None and parsed.expect_repo is not None
         return _do_mutation(state, path, parsed)
     text, exit_code = shared.render_error(
         "internal",
-        f"stub producer implements identity, status, command, stop and resume only "
-        f"(got {parsed.operation})",
+        "stub producer implements identity, status, command, attempts list/show, "
+        f"stop and resume only (got {parsed.operation})",
         details={"stored": False},
         request_id=parsed.request_id,
     )
