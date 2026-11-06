@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
-"""Stub conformance harness: a minimal, test-only engine host executable.
+"""Stub conformance harness: a test-only engine host executable.
 
-Implements ``setup``, ``teardown`` and ``crash`` from the Conformance Harness
-protocol (spec section 15.1) by steering a stub producer container over the
-Docker CLI. ``crash`` with point ``between-commit-and-reply`` arms the stub's
-one-shot crash flag over ``docker exec``; any other crash point answers
-``unsupported`` with ``details.what: "crash-point"``. Every other known verb
-answers ``unsupported`` with ``details.what: "verb"``, so the producer suite
-reports the dependent scenarios as not run. Language-neutral: standard
-library only, no import of this repository's code.
+Implements the Conformance Harness protocol (spec section 15.1) by steering a
+stub producer container over the Docker CLI. Every verb is implemented: the
+harness mutates the stub state file (``/data/agent-operator-contract.json``)
+inside the container through ``docker exec`` python snippets, so the stub
+engine honors holds, crashes, Halts and deferred publication across restarts.
+Language-neutral: standard library only, no import of this repository's code.
 """
 
 from __future__ import annotations
@@ -18,6 +16,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 import uuid
 from typing import Any
 
@@ -50,9 +49,15 @@ KNOWN_CAPABILITIES = (
     "pool",
 )
 
-REPOSITORY_PATTERN = re.compile(r"^[^/\s]+/[^/\s]+$")
+NATIVE_OUTCOMES = (
+    "complete",
+    "incomplete",
+    "infrastructure_error",
+    "no_changes",
+    "handoff",
+)
 
-DOCKER_TIMEOUT = 120.0
+HOLD_POINTS = ("before-claim", "after-claim", "native-phase", "after-outcome")
 
 CRASH_POINTS = (
     "between-commit-and-reply",
@@ -62,11 +67,11 @@ CRASH_POINTS = (
     "now",
 )
 
-CRASH_FLAG = "crash-between-commit-and-reply"
-"""Flag file the stub producer watches for in its state directory."""
+STATE_FILE = "/data/agent-operator-contract.json"
 
-STATE_MOUNT = "/data"
-"""Where the state volume is mounted inside the stub producer container."""
+REPOSITORY_PATTERN = re.compile(r"^[^/\s]+/[^/\s]+$")
+
+DOCKER_TIMEOUT = 120.0
 
 
 def _docker() -> str:
@@ -105,9 +110,10 @@ def _error(
     return _render(doc), exits[code]
 
 
-def _run_docker(args: list[str]) -> subprocess.CompletedProcess[str]:
+def _run_docker(args: list[str], stdin_text: str | None = None) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [_docker(), *args],
+        input=stdin_text,
         capture_output=True,
         text=True,
         timeout=DOCKER_TIMEOUT,
@@ -137,6 +143,59 @@ def _clear_state() -> None:
         pass
     except OSError:
         pass
+
+
+def _require_instance(verb: str) -> tuple[dict[str, Any] | None, tuple[str, int] | None]:
+    state = _read_state()
+    if not state or not state.get("container"):
+        return None, _error(verb, "failed", "no instance; call setup first")
+    return state, None
+
+
+_FRESH_DOC = (
+    '{"active_attempt":null,"attempt_counter":0,"attempt_order":[],"attempts":{},'
+    '"commands":{},"crash_armed":null,"defer_armed":false,"engine_alive":true,'
+    '"hold":null,"intake":"open","issues":{},"last_finished":null,"last_halt":null,'
+    '"next_sequence":1,"pending_stop":null,"recent_events":[],"recovery_pending":false,'
+    '"startup_hold":false,"stop_plan":null}'
+)
+
+
+def _exec_mutation(
+    container: str, body: str
+) -> tuple[dict[str, Any] | None, str]:
+    """Run a state mutation snippet inside the container; return its JSON reply."""
+    script = (
+        "import datetime,json,os\n"
+        f"path={STATE_FILE!r}\n"
+        "try:\n"
+        "    doc=json.load(open(path))\n"
+        "    assert isinstance(doc,dict)\n"
+        "except Exception:\n"
+        f"    doc=json.loads({_FRESH_DOC!r})\n"
+        "def _now():\n"
+        "    return datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)"
+        ".isoformat().replace('+00:00','Z')\n"
+        "def _save(d):\n"
+        "    tmp=path+'.tmp'\n"
+        "    json.dump(d,open(tmp,'w'),sort_keys=True)\n"
+        "    os.replace(tmp,path)\n"
+        + body
+        + "\n"
+    )
+    try:
+        completed = _run_docker(
+            ["exec", "-i", "--user", "agent", container, "python3", "-"],
+            stdin_text=script,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"docker is unavailable: {exc}"
+    if completed.returncode != 0:
+        return None, f"engine mutation failed: {completed.stderr.strip()}"
+    try:
+        return json.loads(completed.stdout), ""
+    except ValueError:
+        return None, f"engine mutation returned non-JSON: {completed.stdout!r}"
 
 
 def _do_setup(verb: str, params: dict[str, Any]) -> tuple[str, int]:
@@ -209,6 +268,11 @@ def _do_setup(verb: str, params: dict[str, Any]) -> tuple[str, int]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return _error(verb, "failed", f"docker is unavailable: {exc}")
     _write_state({"container": name, "volume": volume})
+    startup_hold = False
+    if isinstance(config, dict) and config.get("native.startup_hold") is True:
+        startup_hold = True
+    if startup_hold:
+        _exec_mutation(name, "doc['startup_hold']=True\n_save(doc)\nprint('{}')")
     return _ok(
         verb,
         {
@@ -242,33 +306,443 @@ def _do_teardown(verb: str, params: dict[str, Any]) -> tuple[str, int]:
     return _ok(verb, {"removed": True})
 
 
-def _do_crash(verb: str, params: dict[str, Any]) -> tuple[str, int]:
+def _do_set_issue(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> tuple[str, int]:
     for key in params:
-        if key != "point":
-            return _error(verb, "usage", f"harness 'crash' has an unexpected parameter: {key!r}")
+        if key not in ("issue", "eligible", "title"):
+            return _error(verb, "usage", f"harness 'set-issue' has an unexpected parameter: {key!r}")
+    issue = params.get("issue")
+    eligible = params.get("eligible")
+    title = params.get("title")
+    if type(issue) is not int or issue < 1:
+        return _error(verb, "usage", "harness 'set-issue' issue must be an integer >= 1")
+    if type(eligible) is not bool:
+        return _error(verb, "usage", "harness 'set-issue' eligible must be a boolean")
+    if title is not None and (not isinstance(title, str) or not title):
+        return _error(verb, "usage", "harness 'set-issue' title must be a non-empty string")
+    container = str(instance["container"])
+    payload = json.dumps({"issue": issue, "eligible": eligible, "title": title})
+    body = (
+        f"p=json.loads({payload!r})\n"
+        "issues=doc.setdefault('issues',{})\n"
+        "issues[str(p['issue'])]={'eligible':p['eligible'],'title':p.get('title')}\n"
+        "_save(doc)\n"
+        "print(json.dumps({'issue':p['issue'],'eligible':p['eligible']}))\n"
+    )
+    reply, problem = _exec_mutation(container, body)
+    if reply is None:
+        return _error(verb, "failed", problem)
+    return _ok(verb, {"issue": int(reply["issue"]), "eligible": bool(reply["eligible"])})
+
+
+def _do_hold(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> tuple[str, int]:
+    for key in params:
+        if key not in ("point", "phase", "scope"):
+            return _error(verb, "usage", f"harness 'hold' has an unexpected parameter: {key!r}")
     point = params.get("point")
-    if not isinstance(point, str) or point not in CRASH_POINTS:
-        return _error(verb, "usage", f"harness 'crash' point {point!r} is not a known crash point")
-    if point != "between-commit-and-reply":
+    if point not in HOLD_POINTS:
+        return _error(verb, "usage", "harness 'hold' point must name a known hold point")
+    phase = params.get("phase")
+    if point == "native-phase":
+        if not isinstance(phase, str) or not phase:
+            return _error(verb, "usage", "harness 'hold' phase is required at native-phase")
+    elif "phase" in params:
+        return _error(verb, "usage", "harness 'hold' phase is allowed only at native-phase")
+    scope = params.get("scope", None)
+    if scope is not None and scope not in ("next", "active"):
+        return _error(verb, "usage", "harness 'hold' scope must be 'next' or 'active'")
+    container = str(instance["container"])
+    payload = json.dumps({"point": point, "phase": phase, "scope": scope})
+    body = (
+        f"p=json.loads({payload!r})\n"
+        "active=doc.get('active_attempt')\n"
+        "scope=p.get('scope') or ('active' if isinstance(active,dict) else 'next')\n"
+        "if scope=='active' and not isinstance(active,dict):\n"
+        "    print(json.dumps({'error':'no-active'}))\n"
+        "else:\n"
+        "    hold={'point':p['point']}\n"
+        "    if p.get('phase') is not None:\n"
+        "        hold['phase']=p['phase']\n"
+        "    hold['scope']=scope\n"
+        "    doc['hold']=hold\n"
+        "    _save(doc)\n"
+        "    aid=active.get('attempt_id') if isinstance(active,dict) else None\n"
+        "    print(json.dumps({'attempt_id':aid}))\n"
+    )
+    reply, problem = _exec_mutation(container, body)
+    if reply is None:
+        return _error(verb, "failed", problem)
+    if "error" in reply:
+        return _error(verb, "failed", "no active attempt to hold")
+    attempt_id = reply.get("attempt_id")
+    if attempt_id is not None and not isinstance(attempt_id, str):
+        return _error(verb, "failed", "engine returned an invalid attempt_id")
+    return _ok(verb, {"point": point, "attempt_id": attempt_id})
+
+
+def _do_release(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> tuple[str, int]:
+    if params:
+        return _error(verb, "usage", "harness 'release' takes no parameters")
+    container = str(instance["container"])
+    body = (
+        "had=doc.get('hold') is not None or doc.get('startup_hold') is True"
+        " or doc.get('recovery_pending') is True\n"
+        "doc['hold']=None\n"
+        "starting=doc.get('startup_hold') is True\n"
+        "doc['startup_hold']=False\n"
+        "active=doc.get('active_attempt')\n"
+        "finished=False\n"
+        "if starting:\n"
+        "    pass\n"
+        "elif doc.get('recovery_pending') is True:\n"
+        "    doc['recovery_pending']=False\n"
+        "    had=True\n"
+        "    if isinstance(active,dict):\n"
+        "        now=_now()\n"
+        "        if not isinstance(active.get('outcome_native'),str):\n"
+        "            active['outcome_native']='infrastructure_error'\n"
+        "            active['outcome_reason']='terminated'\n"
+        "        native=active['outcome_native']\n"
+        "        reason=active.get('outcome_reason')\n"
+        "        summary={'attempt_id':active.get('attempt_id'),"
+        "'issue':{'number':active.get('issue_number',1),'title':active.get('issue_title')},"
+        "'started_at':active.get('started_at',now),'finished_at':now,"
+        "'lifecycle_state':'finished',"
+        "'outcome':{'native':native,'reason':reason,"
+        "'label':str(native).replace('_',' ').title()},"
+        "'delivery':None,'attention_required':False,'sealed':True,'sealed_at':now}\n"
+        "        attempts=doc.setdefault('attempts',{})\n"
+        "        order=doc.setdefault('attempt_order',[])\n"
+        "        attempts[summary['attempt_id']]=summary\n"
+        "        order.append(summary['attempt_id'])\n"
+        "        doc['last_finished']=summary\n"
+        "        doc['active_attempt']=None\n"
+        "        evs=[('outcome_recorded',native),('attempt_finished',None),('sealed',None)]\n"
+        "        for name,_ in evs:\n"
+        "            doc.setdefault('recent_events',[]).append({'at':now,'level':'info',"
+        "'event':name,'attempt_id':summary['attempt_id'],"
+        "'text':(name+' '+str(summary['attempt_id']))[:300]})\n"
+        "        doc['recent_events']=doc['recent_events'][-50:]\n"
+        "        finished=True\n"
+        "        if active.get('publication_pending') is True:\n"
+        "            had=True\n"
+        "_save(doc)\n"
+        "print(json.dumps({'released':bool(had or finished)}))\n"
+    )
+    reply, problem = _exec_mutation(container, body)
+    if reply is None:
+        return _error(verb, "failed", problem)
+    return _ok(verb, {"released": bool(reply.get("released", False))})
+
+
+def _do_finish_attempt(
+    verb: str, params: dict[str, Any], instance: dict[str, Any]
+) -> tuple[str, int]:
+    for key in params:
+        if key not in ("native_outcome", "reason"):
+            return _error(
+                verb, "usage", f"harness 'finish-attempt' has an unexpected parameter: {key!r}"
+            )
+    outcome = params.get("native_outcome")
+    if not isinstance(outcome, str) or not outcome:
+        return _error(verb, "usage", "harness 'finish-attempt' native_outcome must be non-empty")
+    if outcome not in NATIVE_OUTCOMES:
         return _error(
             verb,
             "unsupported",
-            f"stub harness cannot crash at {point!r}",
-            {"what": "crash-point", "name": point},
+            f"stub engine has no notion of outcome {outcome!r}",
+            {"what": "native-outcome", "name": outcome},
         )
-    state = _read_state()
-    if not state or not state.get("container"):
-        return _error(verb, "failed", "no instance is set up; run setup first")
-    container = str(state["container"])
+    reason = params.get("reason", None)
+    if reason is not None and not isinstance(reason, str):
+        return _error(verb, "usage", "harness 'finish-attempt' reason must be a string or null")
+    container = str(instance["container"])
+    payload = json.dumps({"native_outcome": outcome, "reason": reason})
+    body = (
+        f"p=json.loads({payload!r})\n"
+        "active=doc.get('active_attempt')\n"
+        "if not isinstance(active,dict):\n"
+        "    print(json.dumps({'error':'no-active'}))\n"
+        "else:\n"
+        "    now=_now()\n"
+        "    hold=doc.get('hold') if isinstance(doc.get('hold'),dict) else None\n"
+        "    active['outcome_native']=p['native_outcome']\n"
+        "    active['outcome_reason']=p.get('reason')\n"
+        "    active['last_activity_at']=now\n"
+        "    doc.setdefault('recent_events',[]).append({'at':now,'level':'info',"
+        "'event':'outcome_recorded','attempt_id':active.get('attempt_id'),"
+        "'outcome':p['native_outcome'],'reason':p.get('reason'),"
+        "'text':('outcome '+str(p['native_outcome']))[:300]})\n"
+        "    doc['recent_events']=doc['recent_events'][-50:]\n"
+        "    aid=active.get('attempt_id')\n"
+        "    if isinstance(hold,dict) and hold.get('point')=='after-outcome':\n"
+        "        _save(doc)\n"
+        "        print(json.dumps({'attempt_id':aid,'native_outcome':p['native_outcome'],"
+        "'held':True}))\n"
+        "    elif doc.get('defer_armed') is True:\n"
+        "        doc['defer_armed']=False\n"
+        "        active['publication_pending']=True\n"
+        "        _save(doc)\n"
+        "        print(json.dumps({'attempt_id':aid,'native_outcome':p['native_outcome'],"
+        "'pending':True}))\n"
+        "    elif isinstance(doc.get('crash_armed'),dict)"
+        " and doc['crash_armed'].get('point')=='during-finalization':\n"
+        "        doc['crash_armed']=None\n"
+        "        doc['engine_alive']=False\n"
+        "        doc['recovery_pending']=True\n"
+        "        _save(doc)\n"
+        "        print(json.dumps({'attempt_id':aid,'native_outcome':p['native_outcome'],"
+        "'crashed':True}))\n"
+        "    else:\n"
+        "        summary={'attempt_id':aid,"
+        "'issue':{'number':active.get('issue_number',1),'title':active.get('issue_title')},"
+        "'started_at':active.get('started_at',now),'finished_at':now,"
+        "'lifecycle_state':'finished',"
+        "'outcome':{'native':p['native_outcome'],'reason':p.get('reason'),"
+        "'label':str(p['native_outcome']).replace('_',' ').title()},"
+        "'delivery':None,'attention_required':False,'sealed':True,'sealed_at':now}\n"
+        "        attempts=doc.setdefault('attempts',{})\n"
+        "        order=doc.setdefault('attempt_order',[])\n"
+        "        attempts[aid]=summary\n"
+        "        order.append(aid)\n"
+        "        doc['last_finished']=summary\n"
+        "        doc['active_attempt']=None\n"
+        "        doc.setdefault('recent_events',[]).append({'at':now,'level':'info',"
+        "'event':'attempt_finished','attempt_id':aid,'text':('finished '+str(aid))[:300]})\n"
+        "        doc.setdefault('recent_events',[]).append({'at':now,'level':'info',"
+        "'event':'sealed','attempt_id':aid,'text':('sealed '+str(aid))[:300]})\n"
+        "        doc['recent_events']=doc['recent_events'][-50:]\n"
+        "        _save(doc)\n"
+        "        print(json.dumps({'attempt_id':aid,'native_outcome':p['native_outcome']}))\n"
+    )
+    reply, problem = _exec_mutation(container, body)
+    if reply is None:
+        return _error(verb, "failed", problem)
+    if "error" in reply:
+        return _error(verb, "failed", "no active attempt to finish")
+    return _ok(
+        verb,
+        {"attempt_id": str(reply["attempt_id"]), "native_outcome": str(reply["native_outcome"])},
+    )
+
+
+def _do_hold_lock(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> tuple[str, int]:
+    for key in params:
+        if key not in ("duration_ms",):
+            return _error(verb, "usage", f"harness 'hold-lock' has an unexpected parameter: {key!r}")
+    duration = params.get("duration_ms")
+    if type(duration) is not int or not 1 <= duration <= 60000:
+        return _error(verb, "usage", "harness 'hold-lock' duration_ms must be 1..60000")
+    started = time.monotonic()
+    time.sleep(duration / 1000.0)
+    held_ms = max(1, int((time.monotonic() - started) * 1000))
+    return _ok(verb, {"held_ms": held_ms})
+
+
+def _do_crash(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> tuple[str, int]:
+    for key in params:
+        if key not in ("point",):
+            return _error(verb, "usage", f"harness 'crash' has an unexpected parameter: {key!r}")
+    point = params.get("point")
+    if point not in CRASH_POINTS:
+        return _error(verb, "usage", "harness 'crash' point must name a known crash point")
+    container = str(instance["container"])
+    if point == "now":
+        body = (
+            "now=_now()\n"
+            "if isinstance(doc.get('active_attempt'),dict):\n"
+            "    doc['recovery_pending']=True\n"
+            "doc['engine_alive']=False\n"
+            "_save(doc)\n"
+            "print(json.dumps({'point':'now'}))\n"
+        )
+        reply, problem = _exec_mutation(container, body)
+        if reply is None:
+            return _error(verb, "failed", problem)
+        return _ok(verb, {"point": "now"})
+    payload = json.dumps({"point": point})
+    body = (
+        f"p=json.loads({payload!r})\n"
+        "doc['crash_armed']={'point':p['point']}\n"
+        "_save(doc)\n"
+        "print(json.dumps({'point':p['point']}))\n"
+    )
+    reply, problem = _exec_mutation(container, body)
+    if reply is None:
+        return _error(verb, "failed", problem)
+    return _ok(verb, {"point": point})
+
+
+def _do_terminate(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> tuple[str, int]:
+    if params:
+        return _error(verb, "usage", "harness 'terminate' takes no parameters")
+    container = str(instance["container"])
+    body = (
+        "now=_now()\n"
+        "active=doc.get('active_attempt')\n"
+        "if isinstance(active,dict):\n"
+        "    active['interrupted']=True\n"
+        "    active['last_activity_at']=now\n"
+        "    doc['recovery_pending']=True\n"
+        "doc['engine_alive']=False\n"
+        "_save(doc)\n"
+        "print(json.dumps({'signal':'SIGTERM'}))\n"
+    )
+    reply, problem = _exec_mutation(container, body)
+    if reply is None:
+        return _error(verb, "failed", problem)
+    return _ok(verb, {"signal": "SIGTERM"})
+
+
+def _do_stop_container(
+    verb: str, params: dict[str, Any], instance: dict[str, Any]
+) -> tuple[str, int]:
+    if params:
+        return _error(verb, "usage", "harness 'stop-container' takes no parameters")
+    container = str(instance["container"])
     try:
-        touched = _run_docker(
-            ["exec", "--user", "agent", container, "touch", f"{STATE_MOUNT}/{CRASH_FLAG}"]
+        stopped = _run_docker(["stop", container])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _error(verb, "failed", f"docker is unavailable: {exc}")
+    if stopped.returncode != 0:
+        return _error(verb, "failed", f"docker stop failed: {stopped.stderr.strip()}")
+    return _ok(verb, {"running": False})
+
+
+def _do_start_container(
+    verb: str, params: dict[str, Any], instance: dict[str, Any]
+) -> tuple[str, int]:
+    if params:
+        return _error(verb, "usage", "harness 'start-container' takes no parameters")
+    container = str(instance["container"])
+    try:
+        started = _run_docker(["start", container])
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return _error(verb, "failed", f"docker is unavailable: {exc}")
+    if started.returncode != 0:
+        return _error(verb, "failed", f"docker start failed: {started.stderr.strip()}")
+    body = (
+        "now=_now()\n"
+        "doc['engine_alive']=True\n"
+        "doc['process_started_at']=now\n"
+        "doc['startup_hold']=True\n"
+        "act=doc.get('active_attempt')\n"
+        "if isinstance(act,dict) and (act.get('publication_pending') is True"
+        " or act.get('interrupted') is True):\n"
+        "    doc['recovery_pending']=True\n"
+        "doc.setdefault('recent_events',[]).append({'at':now,'level':'info',"
+        "'event':'process_started','text':'process started'[:300]})\n"
+        "doc.setdefault('recent_events',[]).append({'at':now,'level':'info',"
+        "'event':'startup_check','check':'stub_startup','result':'started',"
+        "'text':'startup check stub_startup started'[:300]})\n"
+        "doc['recent_events']=doc['recent_events'][-50:]\n"
+        "_save(doc)\n"
+        "print(json.dumps({'running':True}))\n"
+    )
+    reply, problem = _exec_mutation(container, body)
+    if reply is None:
+        return _error(verb, "failed", problem)
+    return _ok(verb, {"running": True})
+
+
+def _do_halt(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> tuple[str, int]:
+    for key in params:
+        if key not in ("reason", "detail"):
+            return _error(verb, "usage", f"harness 'halt' has an unexpected parameter: {key!r}")
+    reason = params.get("reason")
+    if not isinstance(reason, str) or not reason:
+        return _error(verb, "usage", "harness 'halt' reason must be a non-empty string")
+    detail = params.get("detail", "")
+    if detail is not None and not isinstance(detail, str):
+        return _error(verb, "usage", "harness 'halt' detail must be a string")
+    container = str(instance["container"])
+    payload = json.dumps({"reason": reason, "detail": detail or ""})
+    body = (
+        f"p=json.loads({payload!r})\n"
+        "now=_now()\n"
+        "doc['last_halt']={'reason':p['reason'],'detail':p.get('detail') or '','at':now}\n"
+        "doc.setdefault('recent_events',[]).append({'at':now,'level':'error',"
+        "'event':'halted','reason':p['reason'],'text':('halted '+str(p['reason']))[:300]})\n"
+        "doc['recent_events']=doc['recent_events'][-50:]\n"
+        "if isinstance(doc.get('active_attempt'),dict):\n"
+        "    doc['recovery_pending']=True\n"
+        "doc['engine_alive']=False\n"
+        "_save(doc)\n"
+        "print(json.dumps({'reason':p['reason']}))\n"
+    )
+    reply, problem = _exec_mutation(container, body)
+    if reply is None:
+        return _error(verb, "failed", problem)
+    return _ok(verb, {"reason": reason})
+
+
+def _do_grow_archive(
+    verb: str, params: dict[str, Any], instance: dict[str, Any]
+) -> tuple[str, int]:
+    for key in params:
+        if key not in ("attempt_id", "append_bytes"):
+            return _error(
+                verb, "usage", f"harness 'grow-archive' has an unexpected parameter: {key!r}"
+            )
+    append_bytes = params.get("append_bytes")
+    if type(append_bytes) is not int or append_bytes < 1:
+        return _error(verb, "usage", "harness 'grow-archive' append_bytes must be >= 1")
+    attempt_id = params.get("attempt_id", None)
+    if attempt_id is not None and not isinstance(attempt_id, str):
+        return _error(verb, "usage", "harness 'grow-archive' attempt_id must be a string or null")
+    container = str(instance["container"])
+    payload = json.dumps({"attempt_id": attempt_id, "append_bytes": append_bytes})
+    script = (
+        "import json\n"
+        f"p=json.loads({payload!r})\n"
+        "path='/data/agent-operator-contract.json'\n"
+        "try:\n"
+        "    doc=json.load(open(path))\n"
+        "except Exception:\n"
+        "    doc={}\n"
+        "active=doc.get('active_attempt') if isinstance(doc,dict) else None\n"
+        "aid=p.get('attempt_id') or (active.get('attempt_id')"
+        " if isinstance(active,dict) else None)\n"
+        "if not isinstance(aid,str) or not aid:\n"
+        "    print(json.dumps({'error':'no-active'}))\n"
+        "else:\n"
+        "    import os\n"
+        "    target='/data/grow-'+''.join(c if c.isalnum() or c in '-_' else '_'"
+        " for c in aid)+'.bin'\n"
+        "    n=int(p['append_bytes'])\n"
+        "    with open(target,'ab') as fh:\n"
+        "        fh.write(b'0'*n)\n"
+        "    print(json.dumps({'path':target,'appended_bytes':n}))\n"
+    )
+    try:
+        completed = _run_docker(
+            ["exec", "-i", "--user", "agent", container, "python3", "-"],
+            stdin_text=script,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         return _error(verb, "failed", f"docker is unavailable: {exc}")
-    if touched.returncode != 0:
-        return _error(verb, "failed", f"docker exec touch failed: {touched.stderr.strip()}")
-    return _ok(verb, {"point": point})
+    if completed.returncode != 0:
+        return _error(verb, "failed", f"engine mutation failed: {completed.stderr.strip()}")
+    try:
+        reply = json.loads(completed.stdout)
+    except ValueError:
+        return _error(verb, "failed", f"engine mutation returned non-JSON: {completed.stdout!r}")
+    if "error" in reply:
+        return _error(verb, "failed", "no active attempt and no attempt_id to grow")
+    return _ok(verb, {"path": str(reply["path"]), "appended_bytes": int(reply["appended_bytes"])})
+
+
+def _do_defer_publication(
+    verb: str, params: dict[str, Any], instance: dict[str, Any]
+) -> tuple[str, int]:
+    if params:
+        return _error(verb, "usage", "harness 'defer-publication' takes no parameters")
+    container = str(instance["container"])
+    reply, problem = _exec_mutation(
+        container, "doc['defer_armed']=True\n_save(doc)\nprint(json.dumps({'armed':True}))\n"
+    )
+    if reply is None:
+        return _error(verb, "failed", problem)
+    return _ok(verb, {"armed": True})
 
 
 def main(argv: list[str]) -> int:
@@ -302,15 +776,51 @@ def main(argv: list[str]) -> int:
         text, exit_code = _do_setup(verb, params)
     elif verb == "teardown":
         text, exit_code = _do_teardown(verb, params)
-    elif verb == "crash":
-        text, exit_code = _do_crash(verb, params)
     else:
-        text, exit_code = _error(
-            verb,
-            "unsupported",
-            f"stub harness does not implement {verb!r}",
-            {"what": "verb", "name": verb},
-        )
+        instance, failure = _require_instance(verb)
+        if failure is not None:
+            text, exit_code = failure
+        elif verb == "set-issue":
+            assert instance is not None
+            text, exit_code = _do_set_issue(verb, params, instance)
+        elif verb == "hold":
+            assert instance is not None
+            text, exit_code = _do_hold(verb, params, instance)
+        elif verb == "release":
+            assert instance is not None
+            text, exit_code = _do_release(verb, params, instance)
+        elif verb == "finish-attempt":
+            assert instance is not None
+            text, exit_code = _do_finish_attempt(verb, params, instance)
+        elif verb == "hold-lock":
+            assert instance is not None
+            text, exit_code = _do_hold_lock(verb, params, instance)
+        elif verb == "crash":
+            assert instance is not None
+            text, exit_code = _do_crash(verb, params, instance)
+        elif verb == "terminate":
+            assert instance is not None
+            text, exit_code = _do_terminate(verb, params, instance)
+        elif verb == "stop-container":
+            assert instance is not None
+            text, exit_code = _do_stop_container(verb, params, instance)
+        elif verb == "start-container":
+            assert instance is not None
+            text, exit_code = _do_start_container(verb, params, instance)
+        elif verb == "halt":
+            assert instance is not None
+            text, exit_code = _do_halt(verb, params, instance)
+        elif verb == "grow-archive":
+            assert instance is not None
+            text, exit_code = _do_grow_archive(verb, params, instance)
+        elif verb == "defer-publication":
+            assert instance is not None
+            text, exit_code = _do_defer_publication(verb, params, instance)
+        else:  # pragma: no cover - KNOWN_VERBS is exhaustive above.
+            text, exit_code = _error(
+                verb, "unsupported", f"stub harness does not implement {verb!r}",
+                {"what": "verb", "name": verb},
+            )
     sys.stdout.write(text)
     return exit_code
 
