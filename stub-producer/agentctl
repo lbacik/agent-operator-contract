@@ -1,0 +1,73 @@
+#!/usr/bin/env python3
+"""Stub producer ``agentctl``: a minimal, test-only engine (never published).
+
+Serves ``identity`` and the grammar failures through the shared part of the
+library. Any other well-formed call answers ``internal`` with
+``details.stored: false``: the stub implements ``identity`` only, and later
+issues replace this with the full core.
+"""
+
+from __future__ import annotations
+
+import datetime
+import os
+import sys
+
+from agent_operator_contract import shared
+
+
+def _utc_now() -> str:
+    return (
+        datetime.datetime.now(datetime.timezone.utc)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _advertised_capabilities() -> set[str]:
+    raw = os.environ.get("CONTRACT_CAPABILITIES")
+    if raw is None:
+        return set(shared.OPERATOR_CAPABILITIES) - {"pool"}
+    return {piece.strip() for piece in raw.split(",") if piece.strip()}
+
+
+def _identity(offline: bool) -> dict[str, object]:
+    capabilities = sorted(_advertised_capabilities())
+    return {
+        "backend": os.environ.get("CONTRACT_BACKEND", "stub"),
+        "agent_version": os.environ.get("CONTRACT_AGENT_VERSION", "0.0.0"),
+        "contract": {"major": 1, "minor": 0},
+        "repository": os.environ.get("CONTRACT_REPOSITORY", "example-owner/example-repo"),
+        "mode": "offline" if offline else "online",
+        "process_started_at": None
+        if offline
+        else os.environ.get("CONTRACT_STARTED_AT", _utc_now()),
+        "capabilities": capabilities,
+    }
+
+
+def main(argv: list[str]) -> int:
+    parsed = shared.parse_argv(argv, capabilities=_advertised_capabilities())
+    if isinstance(parsed, shared.ArgvFailure):
+        text, exit_code = shared.render_error(
+            parsed.code, parsed.message, details=parsed.details or None,
+            request_id=parsed.request_id,
+        )
+        sys.stdout.write(text)
+        return exit_code
+    if parsed.operation == "identity":
+        sys.stdout.write(shared.render_success(_identity(parsed.offline)))
+        return 0
+    text, exit_code = shared.render_error(
+        "internal",
+        f"stub producer implements identity only (got {parsed.operation})",
+        details={"stored": False},
+        request_id=parsed.request_id,
+    )
+    sys.stdout.write(text)
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
