@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent operator contract Figure",
+  "description": "One measured or estimated figure with its unit and basis (spec section 7.3). value is null exactly when basis is unavailable or not_applicable.",
+  "type": "object",
+  "required": [
+    "value",
+    "unit",
+    "basis"
+  ],
+  "properties": {
+    "value": {
+      "type": ["number", "null"],
+      "description": "The figure value; null exactly when basis is unavailable or not_applicable, otherwise a number. Never zero as a stand-in for unknown."
+    },
+    "unit": {
+      "type": "string",
+      "enum": ["tokens", "usd", "seconds", "count", "ratio"],
+      "description": "tokens, usd, seconds, count or ratio (0 to 1)."
+    },
+    "basis": {
+      "type": "string",
+      "enum": ["measured", "estimated", "configured", "assumed", "unavailable", "not_applicable"],
+      "description": "How the value was produced; unavailable and not_applicable require a null value."
+    },
+    "reason": {
+      "type": "string",
+      "description": "Optional human text, e.g. why a figure is unavailable."
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "basis": {"enum": ["unavailable", "not_applicable"]}
+        },
+        "required": ["basis"]
+      },
+      "then": {
+        "properties": {
+          "value": {"const": null}
+        }
+      },
+      "else": {
+        "properties": {
+          "value": {"type": "number"}
+        }
+      }
+    }
+  ]
+}

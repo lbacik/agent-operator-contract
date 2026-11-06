@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Stub producer ``agentctl``: a minimal, test-only engine (never published).
 
-Serves ``identity`` and the grammar failures through the shared part of the
-library. Any other well-formed call answers ``internal`` with
-``details.stored: false``: the stub implements ``identity`` only, and later
-issues replace this with the full core.
+Serves ``identity`` and ``status`` (an idle instance) and the grammar failures
+through the shared part of the library. Any other well-formed call answers
+``internal`` with ``details.stored: false``: the stub implements the read-only
+core only, and later issues replace this with mutations and attempts.
 """
 
 from __future__ import annotations
@@ -47,6 +47,42 @@ def _identity(offline: bool) -> dict[str, object]:
     }
 
 
+def _status(offline: bool) -> dict[str, object]:
+    now = _utc_now()
+    identity = _identity(offline)
+    if offline:
+        instance: dict[str, object] = {
+            "last_halt": None,
+            "observed_at": now,
+            "startup_check": None,
+            "state": "stopped",
+        }
+    else:
+        instance = {
+            "last_halt": None,
+            "observed_at": now,
+            "startup_check": None,
+            "state": "idle",
+        }
+    return {
+        "current_attempt": None,
+        "generated_at": now,
+        "identity": identity,
+        "instance": instance,
+        "intake": {
+            "observed_at": now,
+            "pending_stop": None,
+            "priority": None,
+            "state": "open",
+            "stop_plan": None,
+        },
+        "last_finished": None,
+        "recent_commands": [],
+        "recent_events": [],
+        "truncated": False,
+    }
+
+
 def main(argv: list[str]) -> int:
     parsed = shared.parse_argv(argv, capabilities=_advertised_capabilities())
     if isinstance(parsed, shared.ArgvFailure):
@@ -59,9 +95,12 @@ def main(argv: list[str]) -> int:
     if parsed.operation == "identity":
         sys.stdout.write(shared.render_success(_identity(parsed.offline)))
         return 0
+    if parsed.operation == "status":
+        sys.stdout.write(shared.render_success(_status(parsed.offline)))
+        return 0
     text, exit_code = shared.render_error(
         "internal",
-        f"stub producer implements identity only (got {parsed.operation})",
+        f"stub producer implements identity and status only (got {parsed.operation})",
         details={"stored": False},
         request_id=parsed.request_id,
     )

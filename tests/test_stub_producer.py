@@ -62,6 +62,35 @@ def test_agentctl_identity_offline_has_null_started_at() -> None:
     assert doc["result"]["process_started_at"] is None
 
 
+def test_agentctl_status_serves_an_idle_snapshot() -> None:
+    completed = _run_agentctl(["--contract", "1", "status"], _agentctl_env())
+
+    assert completed.returncode == 0
+    assert completed.stdout.endswith("\n")
+    assert completed.stdout.count("\n") == 1
+    doc = json.loads(completed.stdout)
+    assert documents.validate_envelope(doc) == []
+    snapshot = doc["result"]
+    assert documents.validate_status(snapshot) == []
+    assert snapshot["identity"]["repository"] == "example-owner/example-repo"
+    assert snapshot["identity"]["mode"] == "online"
+    assert snapshot["instance"]["state"] == "idle"
+    assert snapshot["current_attempt"] is None
+
+
+def test_agentctl_status_offline_serves_a_stopped_snapshot() -> None:
+    completed = _run_agentctl(["--contract", "1", "--offline", "status"], _agentctl_env())
+
+    assert completed.returncode == 0
+    doc = json.loads(completed.stdout)
+    assert documents.validate_envelope(doc) == []
+    snapshot = doc["result"]
+    assert documents.validate_status(snapshot) == []
+    assert snapshot["identity"]["mode"] == "offline"
+    assert snapshot["identity"]["process_started_at"] is None
+    assert snapshot["instance"]["state"] == "stopped"
+
+
 def test_agentctl_contract_mismatch() -> None:
     completed = _run_agentctl(["--contract", "2", "status"], _agentctl_env())
 

@@ -216,6 +216,39 @@ def _check_identity(stdout: str, exit_code: int, ctx: SuiteContext) -> list[str]
     return mismatches
 
 
+def _check_status(stdout: str, exit_code: int, ctx: SuiteContext) -> list[str]:
+    """Check an online ``status`` reply: envelope, snapshot and harness setup."""
+    problems = _producer_problems(stdout, exit_code)
+    if problems:
+        return problems
+    doc = json.loads(stdout)
+    if doc.get("ok") is not True:
+        return [f"status answered ok:false: {stdout.strip()}"]
+    snapshot = doc.get("result")
+    if not isinstance(snapshot, dict):
+        return ["status result must be an object"]
+    problems = documents.validate_status(snapshot)
+    if problems:
+        return problems
+    mismatches = []
+    identity = snapshot.get("identity")
+    if not isinstance(identity, dict):
+        return ["status identity must be an object"]
+    if identity.get("repository") != ctx.repository:
+        mismatches.append(f"repository {identity.get('repository')!r} != {ctx.repository!r}")
+    if identity.get("mode") != "online":
+        mismatches.append(f"mode {identity.get('mode')!r} != 'online'")
+    contract = identity.get("contract")
+    if not isinstance(contract, dict) or contract.get("major") != CONTRACT_MAJOR:
+        mismatches.append(f"contract {contract!r} is not major {CONTRACT_MAJOR}")
+    capabilities = identity.get("capabilities")
+    if not isinstance(capabilities, list) or capabilities != sorted(capabilities):
+        mismatches.append(f"capabilities {capabilities!r} are not sorted")
+    elif capabilities != sorted(ctx.capabilities):
+        mismatches.append(f"capabilities {capabilities!r} != {sorted(ctx.capabilities)!r}")
+    return mismatches
+
+
 def _check_error(stdout: str, exit_code: int, code: str) -> list[str]:
     problems = _producer_problems(stdout, exit_code)
     if problems:
@@ -251,6 +284,17 @@ def scenario_identity(ctx: SuiteContext) -> ScenarioOutcome:
     if problems:
         return ScenarioOutcome("identity", "failed", "; ".join(problems))
     return ScenarioOutcome("identity", "passed")
+
+
+def scenario_status(ctx: SuiteContext) -> ScenarioOutcome:
+    """Online ``status`` validates and matches the harness setup."""
+    answered = _exec("status", ["--contract", "1", "status"], ctx)
+    if isinstance(answered, ScenarioOutcome):
+        return answered
+    problems = _check_status(answered.stdout, answered.exit_code, ctx)
+    if problems:
+        return ScenarioOutcome("status", "failed", "; ".join(problems))
+    return ScenarioOutcome("status", "passed")
 
 
 def scenario_argv_usage(ctx: SuiteContext) -> ScenarioOutcome:
@@ -336,6 +380,7 @@ def scenario_hold_lock(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Scenari
 
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("identity", "online identity matches the harness setup"),
+    Scenario("status", "online status validates and matches the harness setup"),
     Scenario("argv-usage", "malformed argv answers usage with exit 2"),
     Scenario("contract-mismatch", "--contract 2 answers contract_mismatch and executes nothing"),
     Scenario("unsupported-capability", "an unadvertised capability answers unsupported"),
@@ -353,6 +398,7 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
     """Run every scenario against the instance in ``ctx``."""
     return [
         scenario_identity(ctx),
+        scenario_status(ctx),
         scenario_argv_usage(ctx),
         scenario_contract_mismatch(ctx),
         scenario_unsupported_capability(ctx),

@@ -332,6 +332,8 @@ def test_resource_loaders_expose_package_data() -> None:
         "harness-reply",
         "client-envelope",
         "ls",
+        "status",
+        "figure",
     }
     for name in documents.SCHEMA_NAMES:
         schema = documents.load_schema(name)
@@ -436,3 +438,60 @@ def test_validate_ls_rejects_bad_documents() -> None:
     assert isinstance(first, dict)
     first["name"] = "Web-1"
     assert documents.validate_ls(bad_name) != []
+
+
+def _measured_figure(value: object = 118) -> dict[str, object]:
+    return {"value": value, "unit": "count", "basis": "measured"}
+
+
+def test_validate_figure_accepts_a_measured_number() -> None:
+    assert documents.validate_figure(_measured_figure()) == []
+    assert documents.validate_figure({"value": None, "unit": "ratio", "basis": "unavailable"}) == []
+    assert (
+        documents.validate_figure({"value": None, "unit": "count", "basis": "not_applicable"}) == []
+    )
+
+
+def test_validate_figure_rejects_a_measured_null() -> None:
+    assert documents.validate_figure({"value": None, "unit": "tokens", "basis": "measured"}) != []
+
+
+def test_validate_figure_rejects_an_unavailable_value() -> None:
+    assert documents.validate_figure({"value": 5, "unit": "tokens", "basis": "unavailable"}) != []
+
+
+def test_validate_figure_rejects_unknown_enums_and_booleans() -> None:
+    bad_unit = _measured_figure()
+    bad_unit["unit"] = "furlongs"
+    assert documents.validate_figure(bad_unit) != []
+
+    bad_basis = _measured_figure()
+    bad_basis["basis"] = "guessed"
+    assert documents.validate_figure(bad_basis) != []
+
+    assert documents.validate_figure(_measured_figure(True)) != []
+
+
+def _idle_snapshot() -> dict[str, Any]:
+    doc: dict[str, Any] = json.loads(documents.load_fixture("status-idle")["stdout"])
+    result: dict[str, Any] = doc["result"]
+    return result
+
+
+def test_validate_status_accepts_an_idle_snapshot() -> None:
+    assert documents.validate_status(_idle_snapshot()) == []
+
+
+def test_validate_status_rejects_an_unknown_state() -> None:
+    snapshot = _idle_snapshot()
+    instance = snapshot["instance"]
+    assert isinstance(instance, dict)
+    instance["state"] = "flying"
+
+    assert documents.validate_status(snapshot) != []
+
+
+def test_validate_status_rejects_a_measured_null_figure() -> None:
+    assert documents.validate_status(documents.load_negative("status-unknown-state")) != []
+    assert documents.validate_figure(documents.load_negative("figure-measured-null")) != []
+    assert documents.validate_figure(documents.load_negative("figure-unavailable-with-value")) != []

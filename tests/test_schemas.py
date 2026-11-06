@@ -25,8 +25,13 @@ INSTANCE_NAME_SCHEMA: dict[str, Any] = documents.load_schema("instance-name")
 HARNESS_REQUEST_SCHEMA: dict[str, Any] = documents.load_schema("harness-request")
 HARNESS_REPLY_SCHEMA: dict[str, Any] = documents.load_schema("harness-reply")
 
+STATUS_SCHEMA: dict[str, Any] = documents.load_schema("status")
+FIGURE_SCHEMA: dict[str, Any] = documents.load_schema("figure")
+
 ENVELOPE_VALIDATOR = Draft202012Validator(ENVELOPE_SCHEMA)
 IDENTITY_VALIDATOR = Draft202012Validator(IDENTITY_SCHEMA)
+STATUS_VALIDATOR = Draft202012Validator(STATUS_SCHEMA)
+FIGURE_VALIDATOR = Draft202012Validator(FIGURE_SCHEMA)
 INSTANCE_NAME_VALIDATOR = Draft202012Validator(INSTANCE_NAME_SCHEMA)
 HARNESS_REQUEST_VALIDATOR = Draft202012Validator(HARNESS_REQUEST_SCHEMA)
 HARNESS_REPLY_VALIDATOR = Draft202012Validator(HARNESS_REPLY_SCHEMA)
@@ -67,6 +72,10 @@ def _negative_schema(name: str) -> Draft202012Validator:
         return Draft202012Validator(documents.load_schema("client-envelope"))
     if name.startswith("ls-"):
         return Draft202012Validator(documents.load_schema("ls"))
+    if name.startswith("status-"):
+        return STATUS_VALIDATOR
+    if name.startswith("figure-"):
+        return FIGURE_VALIDATOR
     raise AssertionError(f"negative example without a schema: {name}")
 
 
@@ -85,6 +94,10 @@ def _negative_library_errors(name: str, doc: Any) -> list[str]:
         return documents.validate_client_envelope(doc)
     if name.startswith("ls-"):
         return documents.validate_ls(doc)
+    if name.startswith("status-"):
+        return documents.validate_status(doc)
+    if name.startswith("figure-"):
+        return documents.validate_figure(doc)
     raise AssertionError(f"negative example without a schema: {name}")
 
 
@@ -334,3 +347,67 @@ def test_ls_schema_patterns_match_library() -> None:
 
     assert item["name"]["pattern"] == documents.INSTANCE_NAME_PATTERN
     assert item["contract"]["pattern"] == documents.CONTRACT_MAJOR_PATTERN
+
+
+def _status_snapshots() -> list[tuple[str, Any]]:
+    pairs = []
+    for name in FIXTURE_NAMES:
+        doc = json.loads(documents.load_fixture(name)["stdout"])
+        if doc.get("ok") is True and isinstance(doc.get("result"), dict):
+            result = doc["result"]
+            if "instance" in result and "intake" in result and "generated_at" in result:
+                pairs.append((name, result))
+    return pairs
+
+
+def test_status_snapshots_validate_against_status_schema() -> None:
+    assert _status_snapshots()
+    for name, snapshot in _status_snapshots():
+        assert STATUS_VALIDATOR.is_valid(snapshot), name
+
+
+def test_status_snapshots_validate_against_library() -> None:
+    for name, snapshot in _status_snapshots():
+        assert documents.validate_status(snapshot) == [], name
+
+
+def test_library_agrees_with_schema_on_status_snapshots() -> None:
+    for name, snapshot in _status_snapshots():
+        assert (documents.validate_status(snapshot) == []) == STATUS_VALIDATOR.is_valid(snapshot), (
+            name
+        )
+
+
+def test_status_schema_enums_match_library() -> None:
+    assert STATUS_SCHEMA["properties"]["instance"]["properties"]["state"]["enum"] == list(
+        documents.STATUS_STATES
+    )
+    assert STATUS_SCHEMA["properties"]["intake"]["properties"]["state"]["enum"] == list(
+        documents.INTAKE_STATES
+    )
+    assert STATUS_SCHEMA["$defs"]["budget"]["properties"]["enforced_tokens"]["enum"] == list(
+        documents.ENFORCED_TOKENS
+    )
+    figure = STATUS_SCHEMA["$defs"]["figure"]
+    assert figure["properties"]["unit"]["enum"] == list(documents.FIGURE_UNITS)
+    assert figure["properties"]["basis"]["enum"] == list(documents.FIGURE_BASES)
+
+
+def test_figure_schema_enums_match_library() -> None:
+    assert FIGURE_SCHEMA["properties"]["unit"]["enum"] == list(documents.FIGURE_UNITS)
+    assert FIGURE_SCHEMA["properties"]["basis"]["enum"] == list(documents.FIGURE_BASES)
+
+
+def test_status_limit_name_enum_matches_library() -> None:
+    name_schema = STATUS_SCHEMA["$defs"]["budget"]["properties"]["limits"]["items"]["properties"][
+        "name"
+    ]
+    enum_option = next(option for option in name_schema["anyOf"] if "enum" in option)
+
+    assert enum_option["enum"] == list(documents.LIMIT_NAMES)
+
+
+def test_status_schema_covers_every_instance_state() -> None:
+    seen = {snapshot["instance"]["state"] for _, snapshot in _status_snapshots()}
+
+    assert set(documents.STATUS_STATES) <= seen
