@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "The error.code enum is generated from error-table.json by scripts/generate_schemas.py; do not edit it by hand.",
+  "title": "Agent operator contract reply envelope",
+  "description": "Exactly one JSON document a producer writes to stdout for every operation except a successful attempts export (spec section 4). ok:true requires result and forbids error; ok:false requires error and forbids result. The error.code enumeration is generated from the keys of error-table.json; tests enforce freshness.",
+  "type": "object",
+  "required": [
+    "contract",
+    "ok"
+  ],
+  "properties": {
+    "contract": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "description": "The producer's major.minor version, e.g. 1.0."
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "result": {
+      "type": "object",
+      "description": "The operation's result document; its shape depends on the operation (spec section 6)."
+    },
+    "error": {
+      "type": "object",
+      "required": [
+        "code",
+        "message",
+        "retryable"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "rejected",
+            "repository_mismatch",
+            "payload_mismatch",
+            "invalid_argument",
+            "usage",
+            "unsupported",
+            "contract_mismatch",
+            "not_found",
+            "agent_unreachable",
+            "internal"
+          ]
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable cause; consumers must not parse it."
+        },
+        "retryable": {
+          "type": "boolean",
+          "description": "Whether the same request (same request ID, same payload) may be sent again."
+        },
+        "request_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
+          "description": "Present when the failed call was a mutation that carried one."
+        },
+        "details": {
+          "type": "object",
+          "description": "Code-specific fields; consumers must ignore unknown keys."
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "result"
+        ],
+        "not": {
+          "required": [
+            "error"
+          ]
+        }
+      }
+    },
+    {
+      "if": {
+        "required": [
+          "ok"
+        ],
+        "properties": {
+          "ok": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "error"
+        ],
+        "not": {
+          "required": [
+            "result"
+          ]
+        }
+      }
+    }
+  ]
+}

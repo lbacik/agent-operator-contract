@@ -1,0 +1,52 @@
+{
+  "rejected": {
+    "exit_code": 1,
+    "retryable": false,
+    "meaning": "Valid operation refused in the current state. Nothing stored."
+  },
+  "repository_mismatch": {
+    "exit_code": 1,
+    "retryable": false,
+    "meaning": "The --expect-repo differs from the Target Repository. Nothing stored."
+  },
+  "payload_mismatch": {
+    "exit_code": 1,
+    "retryable": false,
+    "meaning": "The request ID is already used with a different payload."
+  },
+  "invalid_argument": {
+    "exit_code": 1,
+    "retryable": false,
+    "meaning": "Well-formed argv, invalid value (e.g. --after 0, bad request ID)."
+  },
+  "usage": {
+    "exit_code": 2,
+    "retryable": false,
+    "meaning": "Malformed argv."
+  },
+  "unsupported": {
+    "exit_code": 3,
+    "retryable": false,
+    "meaning": "Operation or capability not advertised. No request ID consumed, nothing stored."
+  },
+  "contract_mismatch": {
+    "exit_code": 4,
+    "retryable": false,
+    "meaning": "The consumer's --contract major is not the producer's. Nothing executed."
+  },
+  "not_found": {
+    "exit_code": 5,
+    "retryable": false,
+    "meaning": "Unknown request ID, Attempt or archive path."
+  },
+  "agent_unreachable": {
+    "exit_code": 6,
+    "retryable": true,
+    "meaning": "The CLI could not reach the engine process. For a mutation the outcome is ambiguous."
+  },
+  "internal": {
+    "exit_code": 7,
+    "retryable": true,
+    "meaning": "The engine answered but could not serve the request. For a mutation, ambiguous unless details.stored is false."
+  }
+}

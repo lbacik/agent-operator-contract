@@ -22,3 +22,68 @@ jobs:
       - run: uv run ruff check
       - run: uv run mypy
       - run: uv run pytest
+
+  package:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.14"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv build
+      - name: Wheel carries every schema, fixture and negative example
+        run: |
+          uv run --locked python - <<'EOF'
+          import glob
+          import zipfile
+          from pathlib import Path
+
+          (wheel,) = glob.glob("dist/*.whl")
+          names = set(zipfile.ZipFile(wheel).namelist())
+          root = Path("src/agent_operator_contract")
+          expected = {
+              "agent_operator_contract/" + path.relative_to(root).as_posix()
+              for path in root.rglob("*.json")
+          }
+          assert expected, "no JSON data files in the source tree"
+          assert not sorted(expected - names), sorted(expected - names)
+          unexpected = sorted(
+              name for name in names if name.endswith(".json") and name not in expected
+          )
+          assert not unexpected, unexpected
+          EOF
+      - name: Package data loads from the wheel and matches the source tree
+        run: |
+          uv run --locked python - <<'EOF'
+          import glob
+          import sys
+          from pathlib import Path
+
+          (wheel,) = glob.glob("dist/*.whl")
+          sys.path.insert(0, wheel)
+          from agent_operator_contract import documents
+
+          root = Path("src/agent_operator_contract")
+          for subdirectory, loader in (
+              ("fixtures/agentctl", documents.fixture_names),
+              ("fixtures/negative", documents.negative_names),
+          ):
+              assert loader() == sorted(
+                  path.stem
+                  for path in (root / subdirectory).glob("*.json")
+                  if path.name != "index.json"
+              ), subdirectory
+          assert set(documents.load_schema("envelope")["properties"]) >= {"contract", "ok"}
+          print("fixtures in the wheel:", len(documents.fixture_names()))
+          EOF
+      - name: Install from a git ref and load package data
+        run: |
+          uv venv /tmp/contract-ref-check
+          uv pip install --python /tmp/contract-ref-check/bin/python \
+            "git+https://github.com/${{ github.repository }}@${{ github.sha }}"
+          /tmp/contract-ref-check/bin/python -c \
+            "from agent_operator_contract import documents; print(sorted(documents.fixture_names()))"

@@ -25,7 +25,7 @@ Steps 3 and 4 may run in parallel once step 2 is done. simple-coding-agent is pr
 Work:
 
 - JSON Schemas (draft 2020-12) for the envelope, every result type (§7) and the export `manifest.json`, consistent with the prose.
-- Fixtures: consumer fixtures under `examples/agentctl/` covering every exit code and `error.code`, plus Status Snapshot examples for each `instance.state`.
+- Fixtures: consumer fixtures under `src/agent_operator_contract/fixtures/agentctl/` covering every exit code and `error.code`, plus Status Snapshot examples for each `instance.state`. The fixtures, the fixture classification index, the negative examples and the JSON Schemas ship as package data.
 - Conformance suite:
   - producer scenarios for every row of spec §14, every operation and every unadvertised capability, Offline Read;
   - the conformance harness API that engines implement;

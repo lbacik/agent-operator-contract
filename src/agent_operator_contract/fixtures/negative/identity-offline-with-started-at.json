@@ -1,0 +1,12 @@
+{
+  "backend": "coding-agent",
+  "agent_version": "0.9.0",
+  "contract": {
+    "major": 1,
+    "minor": 0
+  },
+  "repository": "example-owner/example-repo",
+  "mode": "offline",
+  "process_started_at": "2026-11-06T08:00:00Z",
+  "capabilities": []
+}

@@ -1,0 +1,10 @@
+{
+  "contract": "1.0",
+  "ok": false,
+  "error": {
+    "code": "agent_unreachable",
+    "message": "cannot reach the agent process",
+    "retryable": true,
+    "request_id": "not a valid id!"
+  }
+}

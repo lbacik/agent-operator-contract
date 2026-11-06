@@ -479,7 +479,7 @@ Each row is a conformance scenario (§15).
 A producer or consumer is compatible when it passes the conformance suite of the tag it pins, whether or not it uses the shared library.
 
 - **Producer suite.** Black-box scenarios run against a producer container. Each engine supplies a **conformance harness** that drives its own fakes (provider, GitHub) through a small control API: make an issue eligible, hold an Attempt at a phase, finish an Attempt with a given outcome, crash the process, stop the container. The suite covers every row of §14, every operation in §6 including `unsupported` for each unadvertised capability, Offline Read, and validates every reply against the JSON Schemas. The exact harness API is defined in adoption step 1.
-- **Consumer suite.** Recorded fixtures `{argv, exit_code, stdout, stderr}` (see [`examples/agentctl/`](../examples/agentctl/)) and a fake `agentctl` that replays them. A consumer passes when it classifies every fixture correctly: success, rejection, `unsupported`, ambiguous outcome, contract mismatch, malformed stdout.
+- **Consumer suite.** Recorded fixtures `{argv, exit_code, stdout, stderr}` (see [`fixtures/agentctl/`](../src/agent_operator_contract/fixtures/agentctl/), shipped as package data so consumers load them from the installed package) and a fake `agentctl` that replays them. A consumer passes when it classifies every fixture correctly: success, replay, rejection, `unsupported`, contract mismatch, not found, ambiguous outcome, malformed stdout. The expected classification of each fixture is recorded in the `index.json` next to them.
 - Engines and consumers run both from the same pinned tag in their own CI, without copying fixtures.
 
 ## 16. Backend mapping notes (informative)

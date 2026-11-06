@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent operator contract Identity",
+  "description": "The identity result document (spec section 7.1): who this Managed Instance is, what it targets and what it can do.",
+  "type": "object",
+  "required": [
+    "backend",
+    "agent_version",
+    "contract",
+    "repository",
+    "mode",
+    "process_started_at",
+    "capabilities"
+  ],
+  "properties": {
+    "backend": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The engine implementation behind the instance; display only."
+    },
+    "agent_version": {
+      "type": "string",
+      "minLength": 1
+    },
+    "contract": {
+      "type": "object",
+      "required": ["major", "minor"],
+      "properties": {
+        "major": {"type": "integer", "minimum": 1},
+        "minor": {"type": "integer", "minimum": 0}
+      }
+    },
+    "repository": {
+      "type": "string",
+      "pattern": "^[^/\\s]+/[^/\\s]+$",
+      "description": "The Target Repository, written owner/name."
+    },
+    "mode": {
+      "type": "string",
+      "enum": ["online", "offline"]
+    },
+    "process_started_at": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+      "description": "RFC 3339 UTC timestamp with a Z suffix; null only offline."
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "The optional Operator Capabilities the producer supports, sorted."
+    }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["mode"], "properties": {"mode": {"const": "offline"}}},
+      "then": {"properties": {"process_started_at": {"const": null}}}
+    },
+    {
+      "if": {"required": ["mode"], "properties": {"mode": {"const": "online"}}},
+      "then": {"properties": {"process_started_at": {"type": "string"}}}
+    }
+  ]
+}
