@@ -789,7 +789,9 @@ class _VersionAction(argparse.Action):
     ) -> NoReturn:
         from agent_operator_contract import __version__
 
-        parser.exit(0, f"{parser.prog} {__version__} (contract major {CONTRACT_MAJOR})\n")
+        sys.stdout.write(f"{parser.prog} {__version__} (contract major {CONTRACT_MAJOR})\n")
+        sys.stdout.flush()
+        parser.exit(0)
 
 
 def _build_parser() -> argparse.ArgumentParser:

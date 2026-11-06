@@ -28,6 +28,20 @@ CTX = producer_suite.SuiteContext(
     volumes=({"name": "stub-data", "path": "/data"},),
 )
 
+FULL_CTX = producer_suite.SuiteContext(
+    container="stub-abc123",
+    exec_user="agent",
+    repository="example-owner/example-repo",
+    capabilities=[
+        "errors-reset",
+        "next-issue",
+        "operator-handoff",
+        "recovery-release",
+        "recovery-retry",
+        "stop-after",
+    ],
+)
+
 IDENTITY = {
     "backend": "stub",
     "agent_version": "0.0.0",
@@ -135,6 +149,11 @@ class _FakeProducer:
         self.sequence = 1
         self.commands: dict[str, dict[str, Any]] = {}
         self.crash_armed = False
+        self.alive = True
+        self.startup = False
+        self.recovery_pending = False
+        self.crash_finalize = False
+        self.error_guard = False
         self.latency: dict[str, float] = {}
         self.engine_lock = threading.Lock()
         self.prepared: dict[str, Any] | None = None
@@ -199,7 +218,12 @@ class _FakeProducer:
             "figures": {},
         }
 
-    def _summary_doc(self, active: dict[str, Any], finished_at: str | None) -> dict[str, Any]:
+    def _summary_doc(
+        self,
+        active: dict[str, Any],
+        finished_at: str | None,
+        lifecycle: str = "finished",
+    ) -> dict[str, Any]:
         if finished_at is not None or active.get("outcome_native") is not None:
             native = str(active.get("outcome_native") or "complete")
             outcome: dict[str, Any] | None = {
@@ -214,13 +238,38 @@ class _FakeProducer:
             "issue": {"number": active["issue_number"], "title": active["issue_title"]},
             "started_at": active["started_at"],
             "finished_at": finished_at,
-            "lifecycle_state": "open" if finished_at is None else "finished",
+            "lifecycle_state": "open" if finished_at is None else lifecycle,
             "outcome": outcome,
             "delivery": None,
             "attention_required": False,
             "sealed": finished_at is not None,
             "sealed_at": finished_at,
         }
+
+    def _finish_active(self, lifecycle: str, native: str | None) -> dict[str, Any] | None:
+        """Move the active attempt to a sealed finished summary; None when idle."""
+        active = self.active_attempt
+        if not isinstance(active, dict):
+            return None
+        if native is None:
+            raw = active.get("outcome_native")
+            native = raw if isinstance(raw, str) and raw else "handoff"
+        active["outcome_native"] = native
+        if "outcome_reason" not in active:
+            active["outcome_reason"] = None
+        summary = self._summary_doc(active, TIMESTAMP, lifecycle=lifecycle)
+        self.finished_attempts.append(summary)
+        self.active_attempt = None
+        return summary
+
+    def _find_attempt(self, attempt_id: str) -> str | None:
+        """Return where an attempt lives: ``"active"``, ``"finished"`` or None."""
+        active = self.active_attempt
+        if isinstance(active, dict) and active.get("attempt_id") == attempt_id:
+            return "active"
+        if any(summary["attempt_id"] == attempt_id for summary in self.finished_attempts):
+            return "finished"
+        return None
 
     def _archive_files(self, attempt_id: str) -> dict[str, bytes]:
         return {
@@ -249,7 +298,14 @@ class _FakeProducer:
     def _fresh_doc(self) -> dict[str, Any]:
         self.tick += 1
         observed_at = self._observed_at()
-        if self.intake == "open" and self.active_attempt is None and self.eligible:
+        if (
+            self.alive
+            and not self.startup
+            and not self.recovery_pending
+            and self.intake == "open"
+            and self.active_attempt is None
+            and self.eligible
+        ):
             self.attempt_counter += 1
             issue = min(self.eligible)
             self.active_attempt = {
@@ -260,7 +316,7 @@ class _FakeProducer:
             }
             attempt_id = str(self.active_attempt["attempt_id"])
             self.snapshots[attempt_id] = self._fresh_manifest(attempt_id)
-        identity = dict(IDENTITY)
+        identity = {**IDENTITY, "capabilities": sorted(self._ctx.capabilities)}
         records = sorted(
             (entry["record"] for entry in self.commands.values()),
             key=lambda record: record["sequence"],
@@ -268,12 +324,22 @@ class _FakeProducer:
         current = None
         if self.active_attempt is not None:
             current = self._attempt_doc(self.active_attempt, observed_at)
+        if self.startup:
+            instance_state, startup_check = "starting", "fake_startup"
+        elif self.recovery_pending:
+            instance_state, startup_check = "recovering", None
+        elif self.active_attempt is not None:
+            instance_state = "active" if self.intake == "open" else "draining"
+            startup_check = None
+        else:
+            instance_state = "idle" if self.intake == "open" else "paused"
+            startup_check = None
         return {
             "generated_at": observed_at,
             "identity": identity,
             "instance": {
-                "state": "idle" if self.intake == "open" else "paused",
-                "startup_check": None,
+                "state": instance_state,
+                "startup_check": startup_check,
                 "last_halt": None,
                 "observed_at": observed_at,
             },
@@ -367,6 +433,47 @@ class _FakeProducer:
             record = self._record(request_id, "resume", "completed")
         elif operation in ("stop_after", "next_issue"):
             record = self._record(request_id, operation, "accepted", payload)
+        elif operation == "handoff":
+            if self.active_attempt is None:
+                return producer_suite.DockerResult(
+                    1, _fail_with_request("rejected", request_id), ""
+                )
+            if self.crash_finalize:
+                self.crash_finalize = False
+                record = self._record(request_id, operation, "not_fulfilled", payload)
+                self.alive = False
+                self.recovery_pending = True
+            else:
+                record = self._record(request_id, operation, "completed", payload)
+                self._finish_active("finished", "handoff")
+        elif operation == "recovery_retry":
+            attempt_id = str(payload["attempt_id"])
+            if self._find_attempt(attempt_id) is None:
+                return producer_suite.DockerResult(
+                    5, _fail_with_request("not_found", request_id), ""
+                )
+            record = self._record(request_id, operation, "completed", payload)
+        elif operation == "recovery_release":
+            attempt_id = str(payload["attempt_id"])
+            where = self._find_attempt(attempt_id)
+            if where is None:
+                return producer_suite.DockerResult(
+                    5, _fail_with_request("not_found", request_id), ""
+                )
+            record = self._record(request_id, operation, "completed", payload)
+            if where == "active":
+                self._finish_active("released", None)
+            else:
+                for summary in self.finished_attempts:
+                    if summary["attempt_id"] == attempt_id:
+                        summary["lifecycle_state"] = "released"
+        elif operation == "errors_reset":
+            if not self.error_guard:
+                return producer_suite.DockerResult(
+                    1, _fail_with_request("rejected", request_id), ""
+                )
+            self.error_guard = False
+            record = self._record(request_id, operation, "completed", payload)
         else:
             raise AssertionError(f"unexpected fake mutation: {operation!r}")
         return producer_suite.DockerResult(0, _ok({"command": record, "replayed": False}), "")
@@ -439,6 +546,23 @@ class _FakeProducer:
             return producer_suite.DockerResult(
                 4, _fail("contract_mismatch", {"supported": [1]}), ""
             )
+        if (
+            len(argv) == 8
+            and argv[:4] == ["--contract", "1", "handoff", "now"]
+            and argv[4] == "--request-id"
+            and argv[6] == "--expect-repo"
+        ):
+            if "operator-handoff" not in self._ctx.capabilities:
+                return producer_suite.DockerResult(
+                    3,
+                    _fail_with_request(
+                        "unsupported",
+                        argv[5],
+                        {"capability": "operator-handoff"},
+                    ),
+                    "",
+                )
+            return self._mutate("handoff", argv[5], argv[7])
         if argv[:3] == ["--contract", "1", "handoff"]:
             return producer_suite.DockerResult(
                 3,
@@ -484,6 +608,65 @@ class _FakeProducer:
                     1, _fail_with_request("invalid_argument", argv[6]), ""
                 )
             return self._mutate("next_issue", argv[6], argv[8], {"issue": int(argv[4])})
+        if (
+            len(argv) == 9
+            and argv[:4] == ["--contract", "1", "recovery", "retry"]
+            and argv[5] == "--request-id"
+            and argv[7] == "--expect-repo"
+        ):
+            if "recovery-retry" not in self._ctx.capabilities:
+                return producer_suite.DockerResult(
+                    3,
+                    _fail_with_request(
+                        "unsupported",
+                        argv[6],
+                        {"capability": "recovery-retry"},
+                    ),
+                    "",
+                )
+            return self._mutate(
+                "recovery_retry", argv[6], argv[8], {"attempt_id": argv[4]}
+            )
+        if (
+            len(argv) == 11
+            and argv[:4] == ["--contract", "1", "recovery", "release"]
+            and argv[5] == "--saved-at"
+            and argv[7] == "--request-id"
+            and argv[9] == "--expect-repo"
+        ):
+            if "recovery-release" not in self._ctx.capabilities:
+                return producer_suite.DockerResult(
+                    3,
+                    _fail_with_request(
+                        "unsupported",
+                        argv[8],
+                        {"capability": "recovery-release"},
+                    ),
+                    "",
+                )
+            return self._mutate(
+                "recovery_release",
+                argv[8],
+                argv[10],
+                {"attempt_id": argv[4], "saved_at": argv[6]},
+            )
+        if (
+            len(argv) == 8
+            and argv[:4] == ["--contract", "1", "errors", "reset"]
+            and argv[4] == "--request-id"
+            and argv[6] == "--expect-repo"
+        ):
+            if "errors-reset" not in self._ctx.capabilities:
+                return producer_suite.DockerResult(
+                    3,
+                    _fail_with_request(
+                        "unsupported",
+                        argv[5],
+                        {"capability": "errors-reset"},
+                    ),
+                    "",
+                )
+            return self._mutate("errors_reset", argv[5], argv[7])
         if len(argv) >= 4 and argv[:3] == ["--contract", "1", "recovery"]:
             capability = (
                 "recovery-retry"
@@ -687,6 +870,11 @@ def test_scenario_ids_are_stable() -> None:
         "export-torn-read",
         "halt-records-last-halt",
         "publication-pending-recovery",
+        "handoff",
+        "handoff-crash",
+        "recovery-retry",
+        "recovery-release",
+        "errors-reset",
         "offline-reads",
         "offline-while-running",
     ]
@@ -733,6 +921,11 @@ def test_run_all_passes_with_hold_lock_not_run(fakes: _FakeProducer) -> None:
     assert by_id["export-torn-read"].status == "not_run"
     assert by_id["halt-records-last-halt"].status == "not_run"
     assert by_id["publication-pending-recovery"].status == "not_run"
+    assert by_id["handoff"].status == "not_run"
+    assert by_id["handoff-crash"].status == "not_run"
+    assert by_id["recovery-retry"].status == "not_run"
+    assert by_id["recovery-release"].status == "not_run"
+    assert by_id["errors-reset"].status == "not_run"
     assert by_id["offline-reads"].status == "not_run"
     assert by_id["offline-while-running"].status == "not_run"
 
@@ -929,6 +1122,11 @@ def test_main_reports_per_scenario_and_exits_zero(
     assert "PASS stop-after-invalid" in out
     assert "NOT RUN stop-after-restart" in out
     assert "NOT RUN next-issue-restart" in out
+    assert "NOT RUN handoff" in out
+    assert "NOT RUN handoff-crash" in out
+    assert "NOT RUN recovery-retry" in out
+    assert "NOT RUN recovery-release" in out
+    assert "NOT RUN errors-reset" in out
 
 
 def test_main_with_expect_fail_for_a_not_run_fails(
@@ -1005,8 +1203,41 @@ def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) ->
             return producer_suite.HarnessResult(
                 "ok", {"point": params["point"], "attempt_id": attempt_id}, ""
             )
+        if verb == "crash":
+            if params.get("point") == "between-commit-and-reply":
+                producer.crash_armed = True
+                return producer_suite.HarnessResult(
+                    "ok", {"point": "between-commit-and-reply"}, ""
+                )
+            if params.get("point") == "during-finalization":
+                producer.crash_finalize = True
+                return producer_suite.HarnessResult("ok", {"point": "during-finalization"}, "")
+            return producer_suite.HarnessResult(
+                "unsupported", None, f"crash-point:{params.get('point')}"
+            )
+        if verb == "stop-container":
+            producer.alive = False
+            return producer_suite.HarnessResult("ok", {"running": False}, "")
+        if verb == "start-container":
+            producer.alive = True
+            producer.startup = True
+            return producer_suite.HarnessResult("ok", {"running": True}, "")
         if verb == "release":
             hold, producer.hold = producer.hold, None
+            if producer.startup:
+                producer.startup = False
+                return producer_suite.HarnessResult("ok", {"released": True}, "")
+            if producer.recovery_pending:
+                producer.recovery_pending = False
+                active = producer.active_attempt
+                if isinstance(active, dict):
+                    if not isinstance(active.get("outcome_native"), str):
+                        active["outcome_native"] = "infrastructure_error"
+                        active["outcome_reason"] = "terminated"
+                    summary = producer._summary_doc(active, "2026-11-06T09:13:00Z")
+                    producer.finished_attempts.append(summary)
+                    producer.active_attempt = None
+                return producer_suite.HarnessResult("ok", {"released": True}, "")
             active = producer.active_attempt
             if (
                 isinstance(hold, dict)
@@ -1033,9 +1264,11 @@ def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) ->
             active = producer.active_attempt
             if active is None:
                 return producer_suite.HarnessResult("error", None, "no active attempt")
+            active["outcome_native"] = params["native_outcome"]
+            active["outcome_reason"] = params.get("reason")
+            if params["native_outcome"] == "infrastructure_error":
+                producer.error_guard = True
             if isinstance(producer.hold, dict) and producer.hold.get("point") == "after-outcome":
-                active["outcome_native"] = params["native_outcome"]
-                active["outcome_reason"] = params.get("reason")
                 attempt_id = str(active["attempt_id"])
                 producer.snapshots[attempt_id] = producer._fresh_manifest(attempt_id)
                 return producer_suite.HarnessResult(
@@ -1047,7 +1280,10 @@ def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) ->
             producer.active_attempt = None
             return producer_suite.HarnessResult(
                 "ok",
-                {"attempt_id": active["attempt_id"], "native_outcome": "complete"},
+                {
+                    "attempt_id": active["attempt_id"],
+                    "native_outcome": params["native_outcome"],
+                },
                 "",
             )
         if verb == "grow-archive":
@@ -1764,3 +2000,219 @@ def test_offline_while_running_fails_when_the_read_is_served(
     )
 
     assert outcome.status == "failed"
+
+
+@pytest.fixture
+def full_fakes(monkeypatch: pytest.MonkeyPatch) -> _FakeProducer:
+    """A fake producer advertising every optional capability."""
+    producer = _FakeProducer(FULL_CTX)
+
+    def harness(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        if verb == "crash":
+            if params.get("point") == "between-commit-and-reply":
+                producer.crash_armed = True
+                return producer_suite.HarnessResult("ok", {"point": "between-commit-and-reply"}, "")
+            return producer_suite.HarnessResult(
+                "unsupported", None, f"crash-point:{params.get('point')}"
+            )
+        return _fake_harness(cmd, verb, params, timeout)
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", producer.handle)
+    monkeypatch.setattr(producer_suite, "_call_harness", harness)
+    return producer
+
+
+def test_unsupported_capability_passes_when_everything_advertised(
+    full_fakes: _FakeProducer,
+) -> None:
+    assert producer_suite.scenario_unsupported_capability(FULL_CTX).status == "passed"
+
+
+def test_handoff_passes_with_claim_replay_and_sealed_verdict(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+
+    outcome = producer_suite.scenario_handoff(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert full_fakes.eligible == set()
+
+
+def test_handoff_rejected_without_an_active_attempt(
+    full_fakes: _FakeProducer,
+) -> None:
+    answered = full_fakes.handle(
+        "docker",
+        "container",
+        "agent",
+        [
+            "--contract",
+            "1",
+            "handoff",
+            "now",
+            "--request-id",
+            "req-000000000030",
+            "--expect-repo",
+            FULL_CTX.repository,
+        ],
+        30.0,
+    )
+
+    assert answered.exit_code == 1
+    assert json.loads(answered.stdout)["error"]["code"] == "rejected"
+
+
+def test_handoff_is_unsupported_when_capability_missing(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, fakes)
+
+    outcome = producer_suite.scenario_handoff(CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "unsupported" in outcome.detail
+
+
+def test_handoff_crash_passes_with_retained_attempt(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+
+    outcome = producer_suite.scenario_handoff_crash(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert full_fakes.eligible == set()
+
+
+def test_handoff_crash_is_not_run_without_crash_support(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    inner = producer_suite._call_harness
+
+    def no_finalize_crash(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        if verb == "crash":
+            return producer_suite.HarnessResult(
+                "unsupported", None, "crash-point:during-finalization"
+            )
+        return inner(cmd, verb, params, timeout)
+
+    monkeypatch.setattr(producer_suite, "_call_harness", no_finalize_crash)
+
+    outcome = producer_suite.scenario_handoff_crash(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "not_run"
+
+
+def test_recovery_retry_passes_and_keeps_the_verdict(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+
+    outcome = producer_suite.scenario_recovery_retry(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert full_fakes.eligible == set()
+
+
+def test_recovery_retry_is_not_found_for_an_unknown_attempt(
+    full_fakes: _FakeProducer,
+) -> None:
+    answered = full_fakes.handle(
+        "docker",
+        "container",
+        "agent",
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "retry",
+            "no-such-attempt",
+            "--request-id",
+            "req-000000000031",
+            "--expect-repo",
+            FULL_CTX.repository,
+        ],
+        30.0,
+    )
+
+    assert answered.exit_code == 5
+    assert json.loads(answered.stdout)["error"]["code"] == "not_found"
+
+
+def test_recovery_release_passes_for_active_and_finished_attempts(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+
+    outcome = producer_suite.scenario_recovery_release(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert full_fakes.eligible == set()
+
+
+def test_recovery_release_is_not_found_for_an_unknown_attempt(
+    full_fakes: _FakeProducer,
+) -> None:
+    answered = full_fakes.handle(
+        "docker",
+        "container",
+        "agent",
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "release",
+            "no-such-attempt",
+            "--saved-at",
+            "shelf-999",
+            "--request-id",
+            "req-000000000032",
+            "--expect-repo",
+            FULL_CTX.repository,
+        ],
+        30.0,
+    )
+
+    assert answered.exit_code == 5
+    assert json.loads(answered.stdout)["error"]["code"] == "not_found"
+
+
+def test_errors_reset_passes_with_guard_and_rejects_when_clear(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+
+    outcome = producer_suite.scenario_errors_reset(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert full_fakes.eligible == set()
+
+
+def test_errors_reset_is_rejected_when_the_guard_is_clear(
+    full_fakes: _FakeProducer,
+) -> None:
+    answered = full_fakes.handle(
+        "docker",
+        "container",
+        "agent",
+        [
+            "--contract",
+            "1",
+            "errors",
+            "reset",
+            "--request-id",
+            "req-000000000033",
+            "--expect-repo",
+            FULL_CTX.repository,
+        ],
+        30.0,
+    )
+
+    assert answered.exit_code == 1
+    assert json.loads(answered.stdout)["error"]["code"] == "rejected"
