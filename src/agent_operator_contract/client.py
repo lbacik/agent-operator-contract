@@ -62,22 +62,6 @@ MAX_MUTATION_ATTEMPTS = 3
 MUTATION_RETRY_BACKOFF_BASE = 0.05
 """Base backoff in seconds between ambiguous mutation retries; doubled each time."""
 
-MUTATION_OPERATIONS: frozenset[str] = frozenset(
-    {
-        "stop",
-        "resume",
-        "next-issue",
-        "next",
-        "handoff",
-        "recovery-retry",
-        "recovery-release",
-        "recovery",
-        "errors-reset",
-        "errors",
-    }
-)
-"""Operation names that commit an Operator Command and may be ambiguous."""
-
 
 def new_request_id() -> str:
     """Generate a mutation request ID before submission (spec section 6.2).
@@ -92,11 +76,13 @@ def new_request_id() -> str:
 def timeout_for(operation: str, override: float | None = None) -> float:
     """Return the consumer default timeout for one operation class (spec section 3.3).
 
-    ``override`` wins when given (and must be positive); otherwise reads carry
-    10 s, mutations and ``attempts list``/``attempts show`` carry 15 s, and
-    ``attempts export`` carries a 30 s progress bound.
+    ``override`` wins when positive; otherwise reads carry 10 s, mutations and
+    ``attempts list``/``attempts show`` carry 15 s, and ``attempts export``
+    carries a 30 s progress bound. An unrecognized operation is treated as a
+    mutation (the only caller is the mutation retry path), so it carries 15 s:
+    a too-short timeout would manufacture ambiguous outcomes (spec §8.4).
     """
-    if override is not None:
+    if override is not None and override > 0:
         return override
     if operation in ("identity", "status", "command"):
         return READ_TIMEOUT
@@ -104,9 +90,7 @@ def timeout_for(operation: str, override: float | None = None) -> float:
         return ATTEMPTS_LIST_TIMEOUT
     if operation in ("attempts-export", "attempts_export"):
         return ATTEMPTS_EXPORT_TIMEOUT
-    if operation in MUTATION_OPERATIONS:
-        return MUTATION_TIMEOUT
-    return DEFAULT_TIMEOUT
+    return MUTATION_TIMEOUT
 
 
 def is_ambiguous_envelope(envelope: dict[str, object]) -> bool:
@@ -182,14 +166,6 @@ def invoke_mutation_with_retry(
     for attempt in range(1, attempts + 1):
         try:
             exec_result = invoke(docker, instance, agentctl_argv, timeout=effective_timeout)
-        except ExecFailedError as exc:
-            if attempt < attempts:
-                sleep(backoff_base * (2.0 ** (attempt - 1)))
-                continue
-            raise AmbiguousMutationError(
-                request_id, attempts, str(exc), exit_code=exc.exit_code
-            ) from exc
-        try:
             envelope = interpret(exec_result)
         except ExecFailedError as exc:
             if attempt < attempts:
@@ -530,7 +506,7 @@ def interpret(exec_result: ExecResult) -> dict[str, object]:
             raise ExecFailedError(f"docker exec exited {exec_result.exit_code} without an envelope")
         raise MalformedStdoutError("stdout is not a valid envelope")
     contract = doc.get("contract")
-    major = str(contract).split(".", 1)[0] if isinstance(contract, str) else ""
+    major = documents.contract_major_of(contract)
     if major != str(CONTRACT_MAJOR):
         if 125 <= exec_result.exit_code <= 127:
             raise ExecFailedError(

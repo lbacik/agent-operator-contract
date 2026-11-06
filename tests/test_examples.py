@@ -71,7 +71,7 @@ def test_malformed_fixture_stdout_is_never_a_coherent_envelope(name: str) -> Non
     if not isinstance(doc, dict) or documents.validate_envelope(doc) != []:
         return
     contract = doc.get("contract")
-    major = str(contract).split(".", 1)[0] if isinstance(contract, str) else ""
+    major = documents.contract_major_of(contract)
     assert major != "1", name
     if doc.get("ok") is True:
         # Never parsed as success: interpret must reject the incoherent reply.

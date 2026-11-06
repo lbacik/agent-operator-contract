@@ -259,7 +259,7 @@ def _check_error(stdout: str, exit_code: int, code: str) -> list[str]:
     actual = doc["error"]["code"]
     if actual != code:
         return [f"expected error {code!r}, got {actual!r}: {stdout.strip()}"]
-    if doc.get("contract", "").split(".")[0] != str(CONTRACT_MAJOR):
+    if documents.contract_major_of(doc.get("contract")) != str(CONTRACT_MAJOR):
         return [f"envelope contract {doc.get('contract')!r} is not major {CONTRACT_MAJOR}"]
     expected_retryable = documents.error_table()[code]["retryable"]
     if doc["error"].get("retryable") is not expected_retryable:

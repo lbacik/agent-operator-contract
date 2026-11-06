@@ -34,18 +34,24 @@ MUTATION_TIMEOUT_ENV_VAR = "AGENTFLEET_MUTATION_TIMEOUT"
 MAX_ATTEMPTS_ENV_VAR = "AGENTFLEET_MAX_ATTEMPTS"
 
 
+def _env_number(name: str) -> float | None:
+    """Read a number from the environment, or ``None`` when missing or unparsable."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return None
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return None
+
+
 def _mutation_timeout(override: float | None) -> float | None:
     """Resolve the mutation timeout: CLI flag, env var, then the §3.3 default."""
     if override is not None:
         return override
-    raw = os.environ.get(MUTATION_TIMEOUT_ENV_VAR)
-    if raw is not None and raw.strip():
-        try:
-            value = float(raw.strip())
-        except ValueError:
-            return None
-        if value > 0:
-            return value
+    value = _env_number(MUTATION_TIMEOUT_ENV_VAR)
+    if value is not None and value > 0:
+        return value
     return None
 
 
@@ -53,14 +59,9 @@ def _mutation_max_attempts(override: int | None) -> int | None:
     """Resolve the bounded retry count: CLI flag, env var, then the default."""
     if override is not None:
         return override
-    raw = os.environ.get(MAX_ATTEMPTS_ENV_VAR)
-    if raw is not None and raw.strip():
-        try:
-            value = int(raw.strip(), 10)
-        except ValueError:
-            return None
-        if value >= 1:
-            return value
+    value = _env_number(MAX_ATTEMPTS_ENV_VAR)
+    if value is not None and value >= 1 and value.is_integer():
+        return int(value)
     return None
 
 

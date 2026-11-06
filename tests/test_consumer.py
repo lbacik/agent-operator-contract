@@ -664,6 +664,28 @@ def test_mutation_precheck_allows_core_refuses_major_and_capability() -> None:
     assert capability_info.value.exit_code == 3
 
 
+def test_mutation_timeout_defaults_follow_spec_section_3_3() -> None:
+    assert client.timeout_for("identity") == 10.0
+    assert client.timeout_for("status") == 10.0
+    assert client.timeout_for("command") == 10.0
+    assert client.timeout_for("stop") == 15.0
+    assert client.timeout_for("resume") == 15.0
+    assert client.timeout_for("attempts-list") == 15.0
+    assert client.timeout_for("attempts-export") == 30.0
+    # The only caller is the mutation retry path: an unrecognized operation
+    # carries the mutation default so a short timeout cannot manufacture an
+    # ambiguous outcome.
+    assert client.timeout_for("stop-after") == 15.0
+    assert client.timeout_for("mutation") == 15.0
+
+
+def test_mutation_timeout_override_wins_only_when_positive() -> None:
+    assert client.timeout_for("stop", override=0.2) == 0.2
+    assert client.timeout_for("stop", override=0.0) == 15.0
+    assert client.timeout_for("stop", override=-1.0) == 15.0
+    assert client.timeout_for("identity", override=-1.0) == 10.0
+
+
 def test_mutation_ambiguous_then_replayed_with_same_generated_id(
     consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

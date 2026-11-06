@@ -1462,6 +1462,11 @@ def validate_ls(doc: object) -> list[str]:
     return errors
 
 
+def contract_major_of(contract: object) -> str:
+    """Return the major of a dotted contract string, or ``""`` when absent."""
+    return str(contract).split(".", 1)[0] if isinstance(contract, str) else ""
+
+
 def classify_fixture(fixture: object) -> Classification:
     """Read one parsed fixture the way a consumer must (spec sections 4, 8.4, 15).
 
@@ -1489,7 +1494,7 @@ def classify_fixture(fixture: object) -> Classification:
     if not isinstance(doc, dict) or validate_envelope(doc) != []:
         return "malformed_stdout"
     contract = doc.get("contract")
-    major = str(contract).split(".", 1)[0] if isinstance(contract, str) else ""
+    major = contract_major_of(contract)
     if major != "1":
         return "malformed_stdout"
     table = error_table()
