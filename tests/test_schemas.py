@@ -72,6 +72,17 @@ def test_schema_validates_against_draft_2020_12_meta_schema(name: str) -> None:
     Draft202012Validator.check_schema(documents.load_schema(name))
 
 
+def test_every_schema_file_on_disk_is_meta_validated() -> None:
+    on_disk = sorted(
+        path.stem[: -len(".schema")]
+        for path in (REPO_ROOT / "src" / "agent_operator_contract" / "schemas").glob(
+            "*.schema.json"
+        )
+    )
+
+    assert on_disk == sorted(documents.SCHEMA_NAMES)
+
+
 @pytest.mark.parametrize("name", FIXTURE_NAMES)
 def test_positive_fixture_stdout_validates_against_envelope_schema(name: str) -> None:
     doc = json.loads(documents.load_fixture(name)["stdout"])
