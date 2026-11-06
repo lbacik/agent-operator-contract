@@ -232,6 +232,14 @@ def _archive_events_path(attempt_id: str) -> str | None:
     return os.path.join(base, _safe_attempt_dir(attempt_id), "events.jsonl")
 
 
+def _archive_transcript_path(attempt_id: str) -> str | None:
+    """Growable second archive file (spec section 15.1 ``grow-archive``)."""
+    base = _archives_dir()
+    if base is None:
+        return None
+    return os.path.join(base, _safe_attempt_dir(attempt_id), "transcript.jsonl")
+
+
 def _events_for_attempt(state: dict[str, Any], attempt_id: str) -> list[dict[str, Any]]:
     events = state.get("recent_events")
     if not isinstance(events, list):
@@ -246,7 +254,10 @@ def _events_for_attempt(state: dict[str, Any], attempt_id: str) -> list[dict[str
 def _write_archives(state: dict[str, Any]) -> None:
     """Persist per-attempt ``events.jsonl`` files on the state volume.
 
-    Every Attempt Archive holds that Attempt's events in ``events.jsonl``.
+    Every Attempt Archive holds that Attempt's events in ``events.jsonl``,
+    plus a growable ``transcript.jsonl`` that ``grow-archive`` appends to.
+    The transcript file is created once and never rewritten, so a grow
+    survives the next export; the events file is regenerated from state.
     Best-effort: failures never fail the operation itself.
     """
     base = _archives_dir()
@@ -273,6 +284,21 @@ def _write_archives(state: dict[str, Any]) -> None:
             with open(path, "w", encoding="utf-8") as handle:
                 for event in lines:
                     handle.write(json.dumps(event, sort_keys=True) + "\n")
+        except OSError:
+            continue
+        transcript = _archive_transcript_path(attempt_id)
+        if transcript is None:
+            continue
+        try:
+            if not os.path.exists(transcript):
+                with open(transcript, "wb") as handle:
+                    handle.write(
+                        json.dumps(
+                            {"attempt_id": attempt_id, "stream": "transcript"},
+                            sort_keys=True,
+                        ).encode()
+                        + b"\n"
+                    )
         except OSError:
             continue
 
@@ -1178,32 +1204,89 @@ def _do_attempts_list(state: dict[str, Any], arguments: dict[str, Any]) -> int:
     return 0
 
 
-def _manifest_for(summary: dict[str, Any]) -> list[dict[str, Any]]:
+def _read_archive_bytes(attempt_id: str, filename: str) -> bytes | None:
+    """Read one archive file from the state volume, or None without a volume."""
+    base = _archives_dir()
+    if base is None:
+        return None
+    path = os.path.join(base, _safe_attempt_dir(attempt_id), filename)
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def _fresh_manifest(state: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Compute the current manifest for one attempt from the volume and state."""
     attempt_id = summary.get("attempt_id")
-    path = _archive_events_path(str(attempt_id)) if isinstance(attempt_id, str) else None
-    payload: bytes | None = None
-    if path is not None:
-        try:
-            with open(path, "rb") as handle:
-                payload = handle.read()
-        except OSError:
-            payload = None
-    if payload is None:
-        line = json.dumps(
-            {"attempt_id": summary.get("attempt_id"), "event": "claim_opened"},
-            sort_keys=True,
-        ).encode() + b"\n"
-        payload = line
-    digest = hashlib.sha256(payload).hexdigest()
+    if not isinstance(attempt_id, str) or not attempt_id:
+        return []
+    _write_archives(state)
+    events_payload = _read_archive_bytes(attempt_id, "events.jsonl")
+    if events_payload is None:
+        lines: list[str] = []
+        events = state.get("recent_events")
+        if isinstance(events, list):
+            for event in events:
+                if isinstance(event, dict) and event.get("attempt_id") == attempt_id:
+                    lines.append(json.dumps(event, sort_keys=True))
+        events_payload = ("".join(line + "\n" for line in lines)).encode("utf-8")
+    transcript_payload = _read_archive_bytes(attempt_id, "transcript.jsonl")
+    if transcript_payload is None:
+        transcript_payload = (
+            json.dumps({"attempt_id": attempt_id, "stream": "transcript"}, sort_keys=True).encode()
+            + b"\n"
+        )
     return [
         {
             "path": "events.jsonl",
             "kind": "events",
             "media_type": "application/x-ndjson",
-            "size": len(payload),
-            "sha256": digest,
-        }
+            "size": len(events_payload),
+            "sha256": hashlib.sha256(events_payload).hexdigest(),
+        },
+        {
+            "path": "transcript.jsonl",
+            "kind": "transcript",
+            "media_type": "application/x-ndjson",
+            "size": len(transcript_payload),
+            "sha256": hashlib.sha256(transcript_payload).hexdigest(),
+        },
     ]
+
+
+def _manifest_for(state: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the manifest for one attempt, preferring a stored snapshot.
+
+    An unsealed attempt paused after its outcome carries ``manifest_snapshot``
+    (taken when the outcome was recorded); a sealed summary carries its stored
+    ``manifest``. Either snapshot is served as-is so a file that grows while
+    unsealed no longer matches it (the torn read of spec section 14), while a
+    sealed archive stays immutable. Without a snapshot the manifest is fresh.
+    """
+    attempt_id = summary.get("attempt_id")
+    active = state.get("active_attempt")
+    if (
+        isinstance(active, dict)
+        and isinstance(attempt_id, str)
+        and active.get("attempt_id") == attempt_id
+    ):
+        snapshot = active.get("manifest_snapshot")
+        if isinstance(snapshot, list) and snapshot and all(isinstance(e, dict) for e in snapshot):
+            return [dict(entry) for entry in snapshot]
+        return _fresh_manifest(state, summary)
+    attempts = state.get("attempts")
+    if isinstance(attempts, dict) and isinstance(attempt_id, str):
+        stored = attempts.get(attempt_id)
+        if isinstance(stored, dict):
+            snapshot = stored.get("manifest")
+            if isinstance(snapshot, list) and snapshot and all(
+                isinstance(e, dict) for e in snapshot
+            ):
+                return [dict(entry) for entry in snapshot]
+            return _fresh_manifest(state, summary)
+    return _fresh_manifest(state, summary)
 
 
 def _do_attempts_show(state: dict[str, Any], attempt_id: str) -> int:
@@ -1212,7 +1295,7 @@ def _do_attempts_show(state: dict[str, Any], attempt_id: str) -> int:
         summary = _active_summary(state)
         assert summary is not None
         sys.stdout.write(
-            shared.render_success({"attempt": summary, "manifest": _manifest_for(summary)})
+            shared.render_success({"attempt": summary, "manifest": _manifest_for(state, summary)})
         )
         return 0
     attempts = state.get("attempts")
@@ -1220,7 +1303,9 @@ def _do_attempts_show(state: dict[str, Any], attempt_id: str) -> int:
         summary = attempts.get(attempt_id)
         if isinstance(summary, dict):
             sys.stdout.write(
-                shared.render_success({"attempt": summary, "manifest": _manifest_for(summary)})
+                shared.render_success(
+                    {"attempt": summary, "manifest": _manifest_for(state, summary)}
+                )
             )
             return 0
     text, exit_code = shared.render_error("not_found", f"no attempt {attempt_id!r} is recorded")
@@ -1294,11 +1379,14 @@ def _run_locked_mutation(parsed: shared.ParsedCall) -> int:
 
 
 def _do_attempts_export(state: dict[str, Any], arguments: dict[str, Any]) -> int:
-    """Stream a minimal ``attempts export`` tar (spec section 11.3).
+    """Stream an ``attempts export`` tar (spec section 11.3).
 
     The stream starts at once with ``manifest.json``; an unknown attempt or
-    path answers ``not_found`` before streaming starts. Sealing semantics
-    beyond the recorded attempt state belong to a later change.
+    path answers ``not_found`` before streaming starts. The manifest is the
+    stored snapshot when one exists (unsealed after its outcome, or sealed),
+    while the file bytes are current: a file that grew while unsealed no
+    longer matches its snapshot, the torn read of spec section 14. A
+    non-zero exit after streaming started means the consumer discards output.
     """
     attempt_id = arguments.get("attempt_id")
     assert isinstance(attempt_id, str)
@@ -1318,32 +1406,7 @@ def _do_attempts_export(state: dict[str, Any], arguments: dict[str, Any]) -> int
         )
         sys.stdout.write(text)
         return exit_code
-    _write_archives(state)
-    payload: bytes | None = None
-    archive_path = _archive_events_path(attempt_id)
-    if archive_path is not None:
-        try:
-            with open(archive_path, "rb") as handle:
-                payload = handle.read()
-        except OSError:
-            payload = None
-    if payload is None:
-        lines: list[str] = []
-        events = state.get("recent_events")
-        if isinstance(events, list):
-            for event in events:
-                if isinstance(event, dict) and event.get("attempt_id") == attempt_id:
-                    lines.append(json.dumps(event, sort_keys=True))
-        payload = ("".join(line + "\n" for line in lines)).encode("utf-8")
-    files = [
-        {
-            "path": "events.jsonl",
-            "kind": "events",
-            "media_type": "application/x-ndjson",
-            "size": len(payload),
-            "sha256": hashlib.sha256(payload).hexdigest(),
-        }
-    ]
+    files = _manifest_for(state, summary)
     wanted = arguments.get("paths")
     assert isinstance(wanted, list)
     if wanted:
@@ -1358,15 +1421,37 @@ def _do_attempts_export(state: dict[str, Any], arguments: dict[str, Any]) -> int
         files = [entry for entry in files if entry["path"] in wanted]
     manifest = {"contract": "1.0", "attempt": summary, "files": files}
     manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode("utf-8")
+    # Stream current bytes (which may have grown past a snapshot manifest).
+    _write_archives(state)
+    payloads: dict[str, bytes] = {}
+    for entry in files:
+        name = str(entry["path"])
+        data = _read_archive_bytes(attempt_id, name)
+        if data is None:
+            lines: list[str] = []
+            events = state.get("recent_events")
+            if isinstance(events, list) and name == "events.jsonl":
+                for event in events:
+                    if isinstance(event, dict) and event.get("attempt_id") == attempt_id:
+                        lines.append(json.dumps(event, sort_keys=True))
+                data = ("".join(line + "\n" for line in lines)).encode("utf-8")
+            else:
+                data = (
+                    json.dumps({"attempt_id": attempt_id, "stream": "transcript"}).encode()
+                    + b"\n"
+                )
+        payloads[name] = data
     stream = sys.stdout.buffer
     with tarfile.open(fileobj=stream, mode="w|") as archive:
         info = tarfile.TarInfo("manifest.json")
         info.size = len(manifest_bytes)
         archive.addfile(info, io.BytesIO(manifest_bytes))
-        if any(entry["path"] == "events.jsonl" for entry in files):
-            info = tarfile.TarInfo("events.jsonl")
-            info.size = len(payload)
-            archive.addfile(info, io.BytesIO(payload))
+        for entry in files:
+            name = str(entry["path"])
+            data = payloads[name]
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
     stream.flush()
     return 0
 

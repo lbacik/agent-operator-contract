@@ -89,6 +89,7 @@ SCHEMA_NAMES: tuple[str, ...] = (
     "attempts-list",
     "attempts-show",
     "contract-event",
+    "export-manifest",
 )
 
 STATUS_STATES: tuple[str, ...] = (
@@ -817,6 +818,34 @@ def validate_attempts_show(doc: object) -> list[str]:
     else:
         for index, entry in enumerate(doc["manifest"]):
             errors.extend(validate_manifest_entry(entry, f"attempts show result.manifest[{index}]"))
+    return errors
+
+
+def validate_export_manifest(doc: object) -> list[str]:
+    """Check an export ``manifest.json``; the empty list means valid (spec section 11.3).
+
+    The stream's first member is ``{"contract": "1.0", "attempt": AttemptSummary,
+    "files": [ManifestEntry]}``. The contract must be the ``1.0`` this library
+    speaks; unknown fields are ignored so a minor can add them.
+    """
+    if not isinstance(doc, dict):
+        return ["export manifest must be an object"]
+    errors: list[str] = []
+    if "contract" not in doc:
+        errors.append("export manifest is missing required property: 'contract'")
+    elif doc["contract"] != "1.0":
+        errors.append("export manifest contract must be '1.0'")
+    if "attempt" not in doc:
+        errors.append("export manifest is missing required property: 'attempt'")
+    else:
+        errors.extend(_validate_attempt_summary(doc["attempt"], "export manifest.attempt"))
+    if "files" not in doc:
+        errors.append("export manifest is missing required property: 'files'")
+    elif not isinstance(doc["files"], list):
+        errors.append("export manifest.files must be an array")
+    else:
+        for index, entry in enumerate(doc["files"]):
+            errors.extend(validate_manifest_entry(entry, f"export manifest.files[{index}]"))
     return errors
 
 

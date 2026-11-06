@@ -1,0 +1,24 @@
+{
+  "contract": "1.0",
+  "attempt": {
+    "attempt_id": "#41/1",
+    "issue": {"number": 41, "title": "Fix pagination"},
+    "started_at": "2026-11-06T08:01:10Z",
+    "finished_at": "2026-11-06T08:44:52Z",
+    "lifecycle_state": "finished",
+    "outcome": {"native": "delivered", "reason": null, "label": "Delivered"},
+    "delivery": null,
+    "attention_required": false,
+    "sealed": true,
+    "sealed_at": "2026-11-06T08:45:01Z"
+  },
+  "files": [
+    {
+      "path": "/etc/passwd",
+      "kind": "events",
+      "media_type": "application/x-ndjson",
+      "size": 10,
+      "sha256": "9f2c000000000000000000000000000000000000000000000000000000000000"
+    }
+  ]
+}

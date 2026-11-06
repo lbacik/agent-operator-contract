@@ -89,6 +89,8 @@ def _negative_schema(name: str) -> Draft202012Validator:
         return Draft202012Validator(documents.load_schema("attempts-show"))
     if name.startswith("manifest-entry-"):
         return Draft202012Validator(documents.load_schema("manifest-entry"))
+    if name.startswith("export-manifest-"):
+        return Draft202012Validator(documents.load_schema("export-manifest"))
     if name.startswith("contract-event-"):
         return Draft202012Validator(documents.load_schema("contract-event"))
     raise AssertionError(f"negative example without a schema: {name}")
@@ -121,6 +123,8 @@ def _negative_library_errors(name: str, doc: Any) -> list[str]:
         return documents.validate_attempts_show(doc)
     if name.startswith("manifest-entry-"):
         return documents.validate_manifest_entry(doc)
+    if name.startswith("export-manifest-"):
+        return documents.validate_export_manifest(doc)
     if name.startswith("contract-event-"):
         return documents.validate_contract_event(doc)
     raise AssertionError(f"negative example without a schema: {name}")
