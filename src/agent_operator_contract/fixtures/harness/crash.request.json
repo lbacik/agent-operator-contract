@@ -1,0 +1,6 @@
+{
+  "verb": "crash",
+  "params": {
+    "point": "between-commit-and-reply"
+  }
+}

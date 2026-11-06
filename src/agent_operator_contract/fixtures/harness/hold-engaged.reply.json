@@ -1,0 +1,9 @@
+{
+  "harness": "1.0",
+  "verb": "hold",
+  "ok": true,
+  "result": {
+    "point": "native-phase",
+    "attempt_id": "#7/2"
+  }
+}

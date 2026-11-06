@@ -1,0 +1,7 @@
+{
+  "verb": "hold",
+  "params": {
+    "point": "after-claim",
+    "scope": "active"
+  }
+}

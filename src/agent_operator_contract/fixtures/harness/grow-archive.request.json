@@ -1,0 +1,7 @@
+{
+  "verb": "grow-archive",
+  "params": {
+    "attempt_id": null,
+    "append_bytes": 65536
+  }
+}

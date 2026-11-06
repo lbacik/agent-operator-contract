@@ -1,0 +1,9 @@
+{
+  "harness": "1.0",
+  "verb": "hold",
+  "ok": false,
+  "error": {
+    "code": "unsupported",
+    "message": "this engine cannot pause after the outcome is recorded"
+  }
+}

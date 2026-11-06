@@ -478,9 +478,101 @@ Each row is a conformance scenario (§15).
 
 A producer or consumer is compatible when it passes the conformance suite of the tag it pins, whether or not it uses the shared library.
 
-- **Producer suite.** Black-box scenarios run against a producer container. Each engine supplies a **conformance harness** that drives its own fakes (provider, GitHub) through a small control API: make an issue eligible, hold an Attempt at a phase, finish an Attempt with a given outcome, crash the process, stop the container. The suite covers every row of §14, every operation in §6 including `unsupported` for each unadvertised capability, Offline Read, and validates every reply against the JSON Schemas. The exact harness API is defined in adoption step 1.
+- **Producer suite.** Black-box scenarios run against a producer container. Each engine supplies a **Conformance Harness** that drives its own fakes (provider, GitHub) and its own container through the control API in §15.1: make an issue eligible, hold an Attempt at a named point, finish an Attempt with a given native outcome, crash the process, stop the container, and the rest. The suite covers every row of §14, every operation in §6 including `unsupported` for each unadvertised capability, Offline Read, and validates every reply against the JSON Schemas.
 - **Consumer suite.** Recorded fixtures `{argv, exit_code, stdout, stderr}` (see [`fixtures/agentctl/`](../src/agent_operator_contract/fixtures/agentctl/), shipped as package data so consumers load them from the installed package) and a fake `agentctl` that replays them. A consumer passes when it classifies every fixture correctly: success, replay, rejection, `unsupported`, contract mismatch, not found, ambiguous outcome, malformed stdout. The expected classification of each fixture is recorded in the `index.json` next to them.
 - Engines and consumers run both from the same pinned tag in their own CI, without copying fixtures.
+
+### 15.1 Conformance harness protocol
+
+Each engine supplies a **Conformance Harness**: an executable that runs on the host, outside the production image, and steers one Managed Instance through the failure and race scenarios of §14. The harness drives the engine's own fakes (provider, GitHub) and its own container; the suite never touches them directly. The harness is language-neutral and imports no code from this repository.
+
+#### Invocation
+
+```text
+<harness> <verb> '<request-json>'
+```
+
+- `<verb>` is one of the fourteen verbs below.
+- `<request-json>` is an object `{"verb": "<verb>", "params": {...}}`: the verb repeated from argv plus the verb's parameters. The argv verb and the document verb MUST agree; a mismatch is a usage error.
+- Every invocation writes exactly one JSON document followed by a newline to stdout, also for usage errors. stderr is free-form diagnostics and MUST NOT be parsed.
+- Exit codes mirror the contract's classes: `0` for `ok:true`, `1` for `failed`, `2` for `usage`, `3` for `unsupported`.
+
+```json
+{"harness": "1.0", "verb": "hold", "ok": true,
+ "result": {"point": "before-claim", "attempt_id": null}}
+```
+
+```json
+{"harness": "1.0", "verb": "hold", "ok": false,
+ "error": {"code": "unsupported", "message": "this engine cannot pause after the outcome is recorded",
+           "details": {"what": "hold-point", "name": "after-outcome"}}}
+```
+
+- `harness` is the harness protocol's `major.minor`, currently `1.0`. A minor adds verbs or optional parameters; it never removes or retypes a field, never changes a meaning, and never makes an optional parameter required.
+- `verb` echoes the invoked verb. It is absent only when the invocation named no verb.
+- The request and reply shapes below are normative in prose; [`harness-request.schema.json`](../src/agent_operator_contract/schemas/harness-request.schema.json) and [`harness-reply.schema.json`](../src/agent_operator_contract/schemas/harness-reply.schema.json) are the machine-readable form. The examples under [`fixtures/harness/`](../src/agent_operator_contract/fixtures/harness/) and the negatives under [`fixtures/negative/`](../src/agent_operator_contract/fixtures/negative/) (`harness-request-*`, `harness-reply-*`) are checked against both the schemas and the shared library in CI, like the other documents.
+- Requests are strict and replies are lenient: a harness MUST reject unknown parameters with `usage`, so suite typos fail loudly, while the suite MUST ignore unknown `result` and `details` keys, so a minor can add fields.
+
+#### Errors
+
+| Exit | `error.code` | Meaning |
+| --- | --- | --- |
+| 1 | `failed` | The harness could not perform the action: no current instance, no active Attempt, the engine already stopped. |
+| 2 | `usage` | Malformed invocation: no verb, an unknown verb, an argv/document verb mismatch, unparsable JSON, parameters that fail the request schema. Nothing was steered. |
+| 3 | `unsupported` | The engine cannot do this. |
+
+An `unsupported` reply MUST name what is not supported in `details`: `details.what` is one of `verb`, `hold-point`, `crash-point`, `native-outcome` or `capability`, and `details.name` is the unsupported value. A harness MAY list what it does support under further `details` keys. A scenario that depends on an `unsupported` answer is reported as not run, never as passed. `failed` and `usage` fail the scenario: they mean the harness or the suite is broken, not that the engine lacks a feature.
+
+#### Verbs
+
+The harness manages one current instance: `setup` fails with `failed` while one exists, so the suite calls `teardown` before the next `setup`. `teardown` removes the container and its fresh state volume; `{removed: false}` means there was nothing to remove.
+
+| Verb | `params` | Successful `result` |
+| --- | --- | --- |
+| `setup` | `{repository, capabilities?, config?}` | `{container, image, volumes: [{name, path}], exec_user, repository, capabilities}` |
+| `teardown` | `{}` | `{removed}` |
+| `set-issue` | `{issue, eligible, title?}` | `{issue, eligible}` |
+| `hold` | `{point, phase?, scope?}` | `{point, attempt_id}` |
+| `release` | `{}` | `{released}` |
+| `finish-attempt` | `{native_outcome, reason?}` | `{attempt_id, native_outcome}` |
+| `hold-lock` | `{duration_ms}` | `{held_ms}` |
+| `crash` | `{point}` | `{point}` |
+| `terminate` | `{}` | `{signal: "SIGTERM"}` |
+| `stop-container` | `{}` | `{running: false}` |
+| `start-container` | `{}` | `{running: true}` |
+| `halt` | `{reason, detail?}` | `{reason}` |
+| `grow-archive` | `{attempt_id?, append_bytes}` | `{path, appended_bytes}` |
+| `defer-publication` | `{}` | `{armed: true}` |
+
+- **`setup`** creates a fresh state volume and starts the instance from the engine's image with its fakes: no active Attempt, Intake open. It reports the six discovery facts: the container (name or ID), the image ID (as used for Offline Read), every volume as `{name, path}` with the in-container mount path, the exec user (never `root`), the Target Repository, and the advertised Operator Capabilities. `capabilities` asks the harness to enable that subset when the engine can toggle capabilities; an engine-fixed set is reported as-is. A request the harness cannot honour answers `unsupported` with `details.what: "capability"`. `config` carries opaque engine knobs; only `native.*` keys are allowed.
+- **`set-issue`** marks the fake issue `issue` (an integer `>= 1`) eligible or ineligible for selection. `title` is display text.
+- **`hold`** pauses the next or the active Attempt at `point`. `scope` selects which: `next` holds the next Attempt even when one is active, `active` requires one (else `failed`); the default holds the active Attempt when one exists, else the next. The reply's `attempt_id` is the held Attempt, or null when the hold is armed for an Attempt that does not exist yet.
+
+  | `point` | Meaning |
+  | --- | --- |
+  | `before-claim` | The next Claim boundary does not open while held. |
+  | `after-claim` | The Attempt opens, then pauses immediately after the Claim. |
+  | `native-phase` | Pauses when the active Attempt enters the native phase `phase` (required; allowed only at this point). |
+  | `after-outcome` | Pauses after the outcome is recorded but before finalization completes; the archive stays unsealed. |
+
+- **`release`** clears the hold; a paused Attempt resumes. `{released: false}` means nothing was held.
+- **`finish-attempt`** drives the active Attempt to completion through the engine's normal finalization with the given native outcome, recording `reason` alongside it when given. An outcome the engine has no notion of answers `unsupported` with `details.what: "native-outcome"`. No active Attempt is `failed`.
+- **`hold-lock`** blocks while holding the engine's lock for `duration_ms` (1 to 60000). The suite calls `status` concurrently; the producer MUST still answer within its 3 s budget (§3.3). The reply carries the actual `held_ms`.
+- **`crash`** kills the engine process with SIGKILL.
+
+  | `point` | Meaning |
+  | --- | --- |
+  | `now` | Crash at once. |
+  | `between-commit-and-reply` | One-shot: the next committed mutation stays durable, then the process dies before replying. |
+  | `before-claim`, `after-claim` | One-shot: die when the engine next reaches that point. |
+  | `during-finalization` | One-shot: die in the middle of finalization. |
+
+  Every point but `now` arms a one-shot crash that fires once; a `teardown` discards an armed crash that never fired. The reply carries the `point` once the crash is armed (for `now`, after killing).
+- **`terminate`** sends the engine process SIGTERM: an interruption, from which the engine recovers on the next start.
+- **`stop-container`** and **`start-container`** stop and start the instance container.
+- **`halt`** arranges an engine Halt with the given `reason` (`detail` is optional human text). The engine records the halted event and `last_halt` and exits by decision (§14).
+- **`grow-archive`** appends `append_bytes` to one file of the unsealed archive: the active Attempt's, or the named `attempt_id`'s when given. The reply names the grown `path` and the `appended_bytes`. The suite exports the archive and expects the torn read of §14: content that no longer matches its manifest `sha256`.
+- **`defer-publication`** arms a one-shot: the next finishing Attempt leaves its publication effect pending across the restart. Recovery finishes it before new Claims open; `instance.state` is `recovering` meanwhile, and no command changes a recorded verdict (§14). An engine whose publication is always synchronous answers `unsupported` with `details.what: "verb"`.
 
 ## 16. Backend mapping notes (informative)
 

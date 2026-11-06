@@ -323,13 +323,22 @@ def test_classify_malformed_stdout(fixture: object) -> None:
 
 
 def test_resource_loaders_expose_package_data() -> None:
-    assert set(documents.SCHEMA_NAMES) == {"envelope", "identity", "fixture", "instance-name"}
+    assert set(documents.SCHEMA_NAMES) == {
+        "envelope",
+        "identity",
+        "fixture",
+        "instance-name",
+        "harness-request",
+        "harness-reply",
+    }
     for name in documents.SCHEMA_NAMES:
         schema = documents.load_schema(name)
         assert schema["$schema"] == "https://json-schema.org/draft/2020-12/schema"
 
     assert "identity" in documents.fixture_names()
     assert documents.negative_names()
+    assert documents.harness_example_names()
+    assert documents.load_harness_example("setup.request")["verb"] == "setup"
 
     index = documents.load_fixture_index()
     assert index["version"] == 1

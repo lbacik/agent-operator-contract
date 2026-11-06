@@ -1,0 +1,6 @@
+{
+  "verb": "hold-lock",
+  "params": {
+    "duration_ms": 0
+  }
+}

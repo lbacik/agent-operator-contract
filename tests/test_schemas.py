@@ -22,13 +22,34 @@ REPO_ROOT = Path(__file__).parent.parent
 ENVELOPE_SCHEMA: dict[str, Any] = documents.load_schema("envelope")
 IDENTITY_SCHEMA: dict[str, Any] = documents.load_schema("identity")
 INSTANCE_NAME_SCHEMA: dict[str, Any] = documents.load_schema("instance-name")
+HARNESS_REQUEST_SCHEMA: dict[str, Any] = documents.load_schema("harness-request")
+HARNESS_REPLY_SCHEMA: dict[str, Any] = documents.load_schema("harness-reply")
 
 ENVELOPE_VALIDATOR = Draft202012Validator(ENVELOPE_SCHEMA)
 IDENTITY_VALIDATOR = Draft202012Validator(IDENTITY_SCHEMA)
 INSTANCE_NAME_VALIDATOR = Draft202012Validator(INSTANCE_NAME_SCHEMA)
+HARNESS_REQUEST_VALIDATOR = Draft202012Validator(HARNESS_REQUEST_SCHEMA)
+HARNESS_REPLY_VALIDATOR = Draft202012Validator(HARNESS_REPLY_SCHEMA)
 
 FIXTURE_NAMES = documents.fixture_names()
 NEGATIVE_NAMES = documents.negative_names()
+HARNESS_NAMES = documents.harness_example_names()
+
+
+def _harness_validator(name: str) -> Draft202012Validator:
+    if name.endswith(".request"):
+        return HARNESS_REQUEST_VALIDATOR
+    if name.endswith(".reply"):
+        return HARNESS_REPLY_VALIDATOR
+    raise AssertionError(f"harness example without a schema: {name}")
+
+
+def _harness_library_errors(name: str, doc: Any) -> list[str]:
+    if name.endswith(".request"):
+        return documents.validate_harness_request(doc)
+    if name.endswith(".reply"):
+        return documents.validate_harness_reply(doc)
+    raise AssertionError(f"harness example without a validator: {name}")
 
 
 def _negative_schema(name: str) -> Draft202012Validator:
@@ -38,6 +59,10 @@ def _negative_schema(name: str) -> Draft202012Validator:
         return Draft202012Validator(IDENTITY_SCHEMA)
     if name.startswith("fixture-"):
         return Draft202012Validator(documents.load_schema("fixture"))
+    if name.startswith("harness-request-"):
+        return HARNESS_REQUEST_VALIDATOR
+    if name.startswith("harness-reply-"):
+        return HARNESS_REPLY_VALIDATOR
     raise AssertionError(f"negative example without a schema: {name}")
 
 
@@ -48,6 +73,10 @@ def _negative_library_errors(name: str, doc: Any) -> list[str]:
         return documents.validate_identity(doc)
     if name.startswith("fixture-"):
         return documents.validate_fixture(doc)
+    if name.startswith("harness-request-"):
+        return documents.validate_harness_request(doc)
+    if name.startswith("harness-reply-"):
+        return documents.validate_harness_reply(doc)
     raise AssertionError(f"negative example without a schema: {name}")
 
 
@@ -147,6 +176,76 @@ def test_library_agrees_with_schema_on_negatives(name: str) -> None:
     doc = documents.load_negative(name)
 
     assert (_negative_library_errors(name, doc) == []) == _negative_schema(name).is_valid(doc)
+
+
+@pytest.mark.parametrize("name", HARNESS_NAMES)
+def test_harness_example_validates_against_schema(name: str) -> None:
+    doc = documents.load_harness_example(name)
+
+    assert _harness_validator(name).is_valid(doc), name
+
+
+@pytest.mark.parametrize("name", HARNESS_NAMES)
+def test_library_agrees_with_schema_on_harness_examples(name: str) -> None:
+    doc = documents.load_harness_example(name)
+
+    assert (_harness_library_errors(name, doc) == []) == _harness_validator(name).is_valid(doc)
+
+
+def test_harness_verb_enums_match_library() -> None:
+    expected = list(documents.HARNESS_VERBS)
+
+    assert HARNESS_REQUEST_SCHEMA["properties"]["verb"]["enum"] == expected
+    assert HARNESS_REPLY_SCHEMA["properties"]["verb"]["enum"] == expected
+
+
+def test_harness_point_enums_match_library() -> None:
+    def collect_point_enums(node: Any) -> list[list[str]]:
+        found: list[list[str]] = []
+        if isinstance(node, dict):
+            for key, value in node.items():
+                if (
+                    key == "properties"
+                    and isinstance(value, dict)
+                    and isinstance(value.get("point"), dict)
+                    and isinstance(value["point"].get("enum"), list)
+                ):
+                    found.append(value["point"]["enum"])
+                found.extend(collect_point_enums(value))
+        elif isinstance(node, list):
+            for item in node:
+                found.extend(collect_point_enums(item))
+        return found
+
+    expected = {tuple(documents.HOLD_POINTS), tuple(documents.CRASH_POINTS)}
+    request_enums = {tuple(enum) for enum in collect_point_enums(HARNESS_REQUEST_SCHEMA)}
+    reply_enums = {tuple(enum) for enum in collect_point_enums(HARNESS_REPLY_SCHEMA)}
+
+    assert request_enums == expected
+    assert reply_enums == expected
+
+
+def test_harness_error_code_enum_matches_library() -> None:
+    enum = HARNESS_REPLY_SCHEMA["properties"]["error"]["properties"]["code"]["enum"]
+
+    assert set(enum) == set(documents.HARNESS_ERROR_CODES)
+    assert len(enum) == len(set(enum))
+
+
+def test_harness_unsupported_what_enum_matches_library() -> None:
+    details = HARNESS_REPLY_SCHEMA["properties"]["error"]["properties"]["details"]
+
+    assert details["properties"]["what"]["enum"] == list(documents.HARNESS_UNSUPPORTED_WHAT)
+
+
+def test_harness_setup_repository_pattern_matches_library() -> None:
+    params = HARNESS_REQUEST_SCHEMA["allOf"][0]["then"]["properties"]["params"]
+
+    assert params["properties"]["repository"]["pattern"] == documents.REPOSITORY_PATTERN
+
+
+def test_harness_version_pattern_matches_library() -> None:
+    assert HARNESS_REPLY_SCHEMA["properties"]["harness"]["pattern"] == documents.CONTRACT_PATTERN
 
 
 @pytest.mark.parametrize("name", ["web-1", "a", "0abc"])

@@ -1,0 +1,13 @@
+{
+  "harness": "1.0",
+  "verb": "defer-publication",
+  "ok": false,
+  "error": {
+    "code": "unsupported",
+    "message": "this engine publishes synchronously, so there is nothing to defer",
+    "details": {
+      "what": "verb",
+      "name": "defer-publication"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "verb": "finish-attempt",
+  "params": {
+    "native_outcome": "complete",
+    "reason": "all checks passed"
+  }
+}

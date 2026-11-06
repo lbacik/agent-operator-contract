@@ -1,0 +1,9 @@
+{
+  "harness": "1.0",
+  "verb": "set-issue",
+  "ok": true,
+  "result": {
+    "issue": 42,
+    "eligible": true
+  }
+}

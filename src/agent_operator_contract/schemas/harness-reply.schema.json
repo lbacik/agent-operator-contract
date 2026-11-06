@@ -1,0 +1,329 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Conformance harness reply",
+  "description": "Exactly one JSON document a harness writes to stdout for every invocation (spec section 15.1). ok:true requires result and forbids error; ok:false requires error and forbids result. Replies are lenient: unknown result and details keys are allowed so a minor can add fields. The verb echo selects the per-verb result shape; it is absent only when the invocation named no verb.",
+  "type": "object",
+  "required": ["harness", "ok"],
+  "properties": {
+    "harness": {
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$",
+      "description": "The harness protocol version, e.g. 1.0."
+    },
+    "verb": {
+      "type": "string",
+      "enum": [
+        "setup",
+        "teardown",
+        "set-issue",
+        "hold",
+        "release",
+        "finish-attempt",
+        "hold-lock",
+        "crash",
+        "terminate",
+        "stop-container",
+        "start-container",
+        "halt",
+        "grow-archive",
+        "defer-publication"
+      ],
+      "description": "The invoked verb, echoed from argv."
+    },
+    "ok": {
+      "type": "boolean"
+    },
+    "result": {
+      "type": "object",
+      "description": "The verb's result document; its shape depends on the verb."
+    },
+    "error": {
+      "type": "object",
+      "required": ["code", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": ["usage", "unsupported", "failed"],
+          "description": "usage: malformed invocation (exit 2). unsupported: the engine cannot do this (exit 3); the suite reports dependents as not run. failed: the harness could not perform the action (exit 1)."
+        },
+        "message": {
+          "type": "string",
+          "description": "Human-readable cause; the suite must not parse it."
+        },
+        "details": {
+          "type": "object",
+          "description": "For unsupported: what (verb, hold-point, crash-point, native-outcome or capability) and name. Extra keys (for example the supported values) are allowed.",
+          "properties": {
+            "what": {
+              "type": "string",
+              "enum": ["verb", "hold-point", "crash-point", "native-outcome", "capability"]
+            },
+            "name": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"required": ["ok"], "properties": {"ok": {"const": true}}},
+      "then": {"required": ["result"], "not": {"required": ["error"]}}
+    },
+    {
+      "if": {"required": ["ok"], "properties": {"ok": {"const": false}}},
+      "then": {"required": ["error"], "not": {"required": ["result"]}}
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "setup"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "object",
+            "required": [
+              "container",
+              "image",
+              "volumes",
+              "exec_user",
+              "repository",
+              "capabilities"
+            ],
+            "properties": {
+              "container": {"type": "string", "minLength": 1},
+              "image": {"type": "string", "minLength": 1},
+              "volumes": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["name", "path"],
+                  "properties": {
+                    "name": {"type": "string", "minLength": 1},
+                    "path": {
+                      "type": "string",
+                      "pattern": "^/",
+                      "description": "In-container mount path of the volume."
+                    }
+                  }
+                }
+              },
+              "exec_user": {
+                "type": "string",
+                "minLength": 1,
+                "not": {"const": "root"},
+                "description": "The contract exec user; never root."
+              },
+              "repository": {
+                "type": "string",
+                "pattern": "^[^/\\s]+/[^/\\s]+$"
+              },
+              "capabilities": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1}
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "teardown"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {"result": {"type": "object", "required": ["removed"], "properties": {"removed": {"type": "boolean"}}}}
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "set-issue"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "object",
+            "required": ["issue", "eligible"],
+            "properties": {
+              "issue": {"type": "integer", "minimum": 1},
+              "eligible": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "hold"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "object",
+            "required": ["point", "attempt_id"],
+            "properties": {
+              "point": {
+                "type": "string",
+                "enum": ["before-claim", "after-claim", "native-phase", "after-outcome"]
+              },
+              "attempt_id": {
+                "type": ["string", "null"],
+                "description": "The held Attempt when one is active; null when the hold is armed for the next Attempt."
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "release"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {"result": {"type": "object", "required": ["released"], "properties": {"released": {"type": "boolean"}}}}
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "finish-attempt"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "object",
+            "required": ["attempt_id", "native_outcome"],
+            "properties": {
+              "attempt_id": {"type": "string", "minLength": 1},
+              "native_outcome": {"type": "string", "minLength": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "hold-lock"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {"result": {"type": "object", "required": ["held_ms"], "properties": {"held_ms": {"type": "integer", "minimum": 1}}}}
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "crash"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "object",
+            "required": ["point"],
+            "properties": {
+              "point": {
+                "type": "string",
+                "enum": [
+                  "between-commit-and-reply",
+                  "before-claim",
+                  "after-claim",
+                  "during-finalization",
+                  "now"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "terminate"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {"result": {"type": "object", "required": ["signal"], "properties": {"signal": {"const": "SIGTERM"}}}}
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "stop-container"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {"result": {"type": "object", "required": ["running"], "properties": {"running": {"const": false}}}}
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "start-container"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {"result": {"type": "object", "required": ["running"], "properties": {"running": {"const": true}}}}
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "halt"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {"result": {"type": "object", "required": ["reason"], "properties": {"reason": {"type": "string", "minLength": 1}}}}
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "grow-archive"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {
+          "result": {
+            "type": "object",
+            "required": ["path", "appended_bytes"],
+            "properties": {
+              "path": {"type": "string", "minLength": 1},
+              "appended_bytes": {"type": "integer", "minimum": 1}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "defer-publication"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {"result": {"type": "object", "required": ["armed"], "properties": {"armed": {"const": true}}}}
+      }
+    },
+    {
+      "if": {
+        "required": ["ok"],
+        "properties": {
+          "ok": {"const": false},
+          "error": {"properties": {"code": {"const": "unsupported"}}, "required": ["code"]}
+        }
+      },
+      "then": {
+        "properties": {
+          "error": {
+            "required": ["details"],
+            "properties": {
+              "details": {"required": ["what", "name"]}
+            }
+          }
+        }
+      }
+    }
+  ]
+}

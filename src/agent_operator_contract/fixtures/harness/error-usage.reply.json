@@ -1,0 +1,9 @@
+{
+  "harness": "1.0",
+  "verb": "crash",
+  "ok": false,
+  "error": {
+    "code": "usage",
+    "message": "unknown crash point 'at-teatime'"
+  }
+}

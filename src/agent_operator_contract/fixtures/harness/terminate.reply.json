@@ -1,0 +1,8 @@
+{
+  "harness": "1.0",
+  "verb": "terminate",
+  "ok": true,
+  "result": {
+    "signal": "SIGTERM"
+  }
+}
