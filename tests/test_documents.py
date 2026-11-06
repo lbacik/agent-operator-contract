@@ -425,6 +425,7 @@ def test_resource_loaders_expose_package_data() -> None:
         "attempts-list",
         "attempts-show",
         "contract-event",
+        "export-manifest",
     }
     for name in documents.SCHEMA_NAMES:
         schema = documents.load_schema(name)

@@ -201,6 +201,54 @@ def _exec_mutation(
         return None, f"engine mutation returned non-JSON: {completed.stdout!r}"
 
 
+def _archive_snapshot_snippet(aid_expr: str, target: str, indent: str = "") -> str:
+    """Build the engine snippet computing archive manifest entries into ``target``.
+
+    The snippet rewrites the attempt's ``events.jsonl`` from state (so the
+    snapshot covers every recorded event), creates ``transcript.jsonl`` once
+    when missing without touching its bytes, then records one entry per file
+    with its current size and sha256. ``aid_expr`` is snippet code evaluating
+    to the attempt ID; the entries land in the snippet variable ``target``.
+    Every line carries the ``indent`` prefix so the snippet slots into a block.
+    """
+    snippet = (
+        "import hashlib,os\n"
+        f"_adir='/data/archives/'+''.join(c if c.isalnum() or c in '-_' else '_' for c in {aid_expr})\n"
+        "try:\n"
+        "    os.makedirs(_adir,exist_ok=True)\n"
+        "except OSError:\n"
+        "    pass\n"
+        "_epath=_adir+'/events.jsonl'\n"
+        "_lines=[]\n"
+        "for _e in doc.get('recent_events',[]):\n"
+        f"    if isinstance(_e,dict) and _e.get('attempt_id')=={aid_expr}:\n"
+        "        _lines.append(json.dumps(_e,sort_keys=True))\n"
+        "try:\n"
+        "    open(_epath,'w').write(''.join(_l+'\\n' for _l in _lines))\n"
+        "except OSError:\n"
+        "    pass\n"
+        "_tpath=_adir+'/transcript.jsonl'\n"
+        "if not os.path.exists(_tpath):\n"
+        "    try:\n"
+        f"        open(_tpath,'wb').write((json.dumps({{'attempt_id':{aid_expr},'stream':'transcript'}},sort_keys=True)+'\\n').encode())\n"
+        "    except OSError:\n"
+        "        pass\n"
+        f"{target}=[]\n"
+        "for _pn,_kk in (('events.jsonl','events'),('transcript.jsonl','transcript')):\n"
+        "    try:\n"
+        "        _dd=open(_adir+'/'+_pn,'rb').read()\n"
+        "    except OSError:\n"
+        "        _dd=b''\n"
+        f"    {target}.append({{'path':_pn,'kind':_kk,'media_type':'application/x-ndjson','size':len(_dd),'sha256':hashlib.sha256(_dd).hexdigest()}})\n"
+    )
+    if indent:
+        snippet = "".join(
+            indent + line if line.strip() else line
+            for line in snippet.splitlines(keepends=True)
+        )
+    return snippet
+
+
 def _do_setup(verb: str, params: dict[str, Any]) -> tuple[str, int]:
     for key in params:
         if key not in ("repository", "capabilities", "config"):
@@ -389,6 +437,7 @@ def _do_release(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> 
     body = (
         "had=doc.get('hold') is not None or doc.get('startup_hold') is True"
         " or doc.get('recovery_pending') is True\n"
+        "was_after=isinstance(doc.get('hold'),dict) and doc['hold'].get('point')=='after-outcome'\n"
         "doc['hold']=None\n"
         "starting=doc.get('startup_hold') is True\n"
         "doc['startup_hold']=False\n"
@@ -396,6 +445,34 @@ def _do_release(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> 
         "finished=False\n"
         "if starting:\n"
         "    pass\n"
+        "elif was_after and isinstance(active,dict) and isinstance(active.get('outcome_native'),str):\n"
+        "    now=_now()\n"
+        "    aid=active.get('attempt_id')\n"
+        "    native=active['outcome_native']\n"
+        "    reason=active.get('outcome_reason')\n"
+        "    doc.setdefault('recent_events',[]).append({'at':now,'level':'info',"
+        "'event':'attempt_finished','attempt_id':aid,"
+        "'text':('finished '+str(aid))[:300]})\n"
+        "    doc.setdefault('recent_events',[]).append({'at':now,'level':'info',"
+        "'event':'sealed','attempt_id':aid,"
+        "'text':('sealed '+str(aid))[:300]})\n"
+        "    doc['recent_events']=doc['recent_events'][-50:]\n"
+        + _archive_snapshot_snippet("aid", "_entries", indent="    ")
+        + "    summary={'attempt_id':aid,"
+        "'issue':{'number':active.get('issue_number',1),'title':active.get('issue_title')},"
+        "'started_at':active.get('started_at',now),'finished_at':now,"
+        "'lifecycle_state':'finished',"
+        "'outcome':{'native':native,'reason':reason,"
+        "'label':str(native).replace('_',' ').title()},"
+        "'delivery':None,'attention_required':False,'sealed':True,'sealed_at':now,"
+        "'manifest':_entries}\n"
+        "    attempts=doc.setdefault('attempts',{})\n"
+        "    order=doc.setdefault('attempt_order',[])\n"
+        "    attempts[aid]=summary\n"
+        "    order.append(aid)\n"
+        "    doc['last_finished']=summary\n"
+        "    doc['active_attempt']=None\n"
+        "    finished=True\n"
         "elif doc.get('recovery_pending') is True:\n"
         "    doc['recovery_pending']=False\n"
         "    had=True\n"
@@ -483,6 +560,8 @@ def _do_finish_attempt(
         "    doc['recent_events']=doc['recent_events'][-50:]\n"
         "    aid=active.get('attempt_id')\n"
         "    if isinstance(hold,dict) and hold.get('point')=='after-outcome':\n"
+        + _archive_snapshot_snippet("aid", "_entries", indent="        ")
+        + "        active['manifest_snapshot']=_entries\n"
         "        _save(doc)\n"
         "        print(json.dumps({'attempt_id':aid,'native_outcome':p['native_outcome'],"
         "'held':True}))\n"
@@ -739,16 +818,28 @@ def _do_grow_archive(
         "active=doc.get('active_attempt') if isinstance(doc,dict) else None\n"
         "aid=p.get('attempt_id') or (active.get('attempt_id')"
         " if isinstance(active,dict) else None)\n"
-        "if not isinstance(aid,str) or not aid:\n"
+        "attempts=doc.get('attempts') if isinstance(doc,dict) else None\n"
+        "sealed=isinstance(attempts,dict) and isinstance(aid,str) and aid in attempts\n"
+        "growing=isinstance(active,dict) and isinstance(aid,str) and active.get('attempt_id')==aid\n"
+        "if not isinstance(aid,str) or not aid or (not growing and sealed):\n"
+        "    print(json.dumps({'error':'sealed' if sealed else 'no-active'}))\n"
+        "elif not growing:\n"
         "    print(json.dumps({'error':'no-active'}))\n"
         "else:\n"
         "    import os\n"
-        "    target='/data/grow-'+''.join(c if c.isalnum() or c in '-_' else '_'"
-        " for c in aid)+'.bin'\n"
+        "    adir='/data/archives/'+''.join(c if c.isalnum() or c in '-_' else '_'"
+        " for c in aid)\n"
+        "    try:\n"
+        "        os.makedirs(adir,exist_ok=True)\n"
+        "    except OSError:\n"
+        "        pass\n"
+        "    target=adir+'/transcript.jsonl'\n"
+        "    if not os.path.exists(target):\n"
+        "        open(target,'wb').write((json.dumps({'attempt_id':aid,'stream':'transcript'})+'\\n').encode())\n"
         "    n=int(p['append_bytes'])\n"
         "    with open(target,'ab') as fh:\n"
         "        fh.write(b'0'*n)\n"
-        "    print(json.dumps({'path':target,'appended_bytes':n}))\n"
+        "    print(json.dumps({'path':'transcript.jsonl','appended_bytes':n}))\n"
     )
     try:
         completed = _run_docker(
@@ -764,6 +855,8 @@ def _do_grow_archive(
     except ValueError:
         return _error(verb, "failed", f"engine mutation returned non-JSON: {completed.stdout!r}")
     if "error" in reply:
+        if reply["error"] == "sealed":
+            return _error(verb, "failed", "the archive is sealed and immutable")
         return _error(verb, "failed", "no active attempt and no attempt_id to grow")
     return _ok(verb, {"path": str(reply["path"]), "appended_bytes": int(reply["appended_bytes"])})
 

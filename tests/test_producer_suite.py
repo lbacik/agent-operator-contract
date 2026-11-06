@@ -7,6 +7,7 @@ small in-memory producer that mirrors the contract's mutation semantics
 (repository guard, idempotency, state) so the mutation scenarios run green.
 """
 
+import hashlib
 import io
 import json
 import tarfile
@@ -143,6 +144,9 @@ class _FakeProducer:
         self.attempt_counter = 0
         self.tick = 0
         self.extra_events: list[dict[str, Any]] = []
+        self.hold: dict[str, Any] | None = None
+        self.snapshots: dict[str, list[dict[str, Any]]] = {}
+        self.grown: dict[str, bytes] = {}
 
     def _record(
         self,
@@ -194,20 +198,51 @@ class _FakeProducer:
         }
 
     def _summary_doc(self, active: dict[str, Any], finished_at: str | None) -> dict[str, Any]:
+        if finished_at is not None or active.get("outcome_native") is not None:
+            native = str(active.get("outcome_native") or "complete")
+            outcome: dict[str, Any] | None = {
+                "native": native,
+                "reason": active.get("outcome_reason"),
+                "label": native.replace("_", " ").title(),
+            }
+        else:
+            outcome = None
         return {
             "attempt_id": active["attempt_id"],
             "issue": {"number": active["issue_number"], "title": active["issue_title"]},
             "started_at": active["started_at"],
             "finished_at": finished_at,
             "lifecycle_state": "open" if finished_at is None else "finished",
-            "outcome": None
-            if finished_at is None
-            else {"native": "complete", "reason": None, "label": "Complete"},
+            "outcome": outcome,
             "delivery": None,
             "attention_required": False,
             "sealed": finished_at is not None,
             "sealed_at": finished_at,
         }
+
+    def _archive_files(self, attempt_id: str) -> dict[str, bytes]:
+        return {
+            "events.jsonl": b"",
+            "transcript.jsonl": b"transcript-seed\n" + self.grown.get(attempt_id, b""),
+        }
+
+    def _fresh_manifest(self, attempt_id: str) -> list[dict[str, Any]]:
+        return [
+            {
+                "path": name,
+                "kind": "events" if name == "events.jsonl" else "transcript",
+                "media_type": "application/x-ndjson",
+                "size": len(data),
+                "sha256": hashlib.sha256(data).hexdigest(),
+            }
+            for name, data in self._archive_files(attempt_id).items()
+        ]
+
+    def _manifest_for(self, attempt_id: str) -> list[dict[str, Any]]:
+        snapshot = self.snapshots.get(attempt_id)
+        if snapshot is not None:
+            return [dict(entry) for entry in snapshot]
+        return self._fresh_manifest(attempt_id)
 
     def _fresh_doc(self) -> dict[str, Any]:
         self.tick += 1
@@ -221,6 +256,8 @@ class _FakeProducer:
                 "issue_title": None,
                 "started_at": observed_at,
             }
+            attempt_id = str(self.active_attempt["attempt_id"])
+            self.snapshots[attempt_id] = self._fresh_manifest(attempt_id)
         identity = dict(IDENTITY)
         records = sorted(
             (entry["record"] for entry in self.commands.values()),
@@ -386,16 +423,7 @@ class _FakeProducer:
             summaries.extend(self.finished_attempts)
             for summary in summaries:
                 if summary["attempt_id"] == argv[4]:
-                    manifest = [
-                        {
-                            "path": "events.jsonl",
-                            "kind": "events",
-                            "media_type": "application/x-ndjson",
-                            "size": 0,
-                            "sha256": "e3b0c44298fc1c149afbf4c8996fb924"
-                            "27ae41e4649b934ca495991b7852b855",
-                        }
-                    ]
+                    manifest = self._manifest_for(summary["attempt_id"])
                     return producer_suite.DockerResult(
                         0, _ok({"attempt": summary, "manifest": manifest}), ""
                     )
@@ -576,6 +604,8 @@ def test_scenario_ids_are_stable() -> None:
         "stop-after-invalid",
         "stop-after-restart",
         "next-issue-restart",
+        "sealed-after-outcome",
+        "export-torn-read",
         "halt-records-last-halt",
         "publication-pending-recovery",
     ]
@@ -618,6 +648,8 @@ def test_run_all_passes_with_hold_lock_not_run(fakes: _FakeProducer) -> None:
     assert by_id["stop-after-invalid"].status == "passed"
     assert by_id["stop-after-restart"].status == "not_run"
     assert by_id["next-issue-restart"].status == "not_run"
+    assert by_id["sealed-after-outcome"].status == "not_run"
+    assert by_id["export-torn-read"].status == "not_run"
     assert by_id["halt-records-last-halt"].status == "not_run"
     assert by_id["publication-pending-recovery"].status == "not_run"
 
@@ -863,7 +895,13 @@ def test_every_producer_reply_is_validated(
 
 
 def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) -> None:
-    """Harness override that supports set-issue, release and finish-attempt."""
+    """Harness override that supports claims plus archive finality.
+
+    Beyond set-issue, release and finish-attempt it stages ``hold``,
+    ``grow-archive`` and the after-outcome seal: finishing under an
+    ``after-outcome`` hold records the outcome with a manifest snapshot while
+    the archive stays unsealed, and the release seals it with that snapshot.
+    """
 
     def harness(
         cmd: Any, verb: str, params: dict[str, Any], timeout: float
@@ -877,18 +915,74 @@ def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) ->
             return producer_suite.HarnessResult(
                 "ok", {"issue": issue, "eligible": params["eligible"]}, ""
             )
+        if verb == "hold":
+            producer.hold = {"point": params["point"], "scope": params.get("scope")}
+            active = producer.active_attempt
+            attempt_id = active["attempt_id"] if isinstance(active, dict) else None
+            return producer_suite.HarnessResult(
+                "ok", {"point": params["point"], "attempt_id": attempt_id}, ""
+            )
         if verb == "release":
+            hold, producer.hold = producer.hold, None
+            active = producer.active_attempt
+            if (
+                isinstance(hold, dict)
+                and hold.get("point") == "after-outcome"
+                and isinstance(active, dict)
+                and isinstance(active.get("outcome_native"), str)
+            ):
+                attempt_id = str(active["attempt_id"])
+                summary = producer._summary_doc(active, "2026-11-06T09:13:00Z")
+                producer.finished_attempts.append(summary)
+                producer.active_attempt = None
+                producer.extra_events.append(
+                    {
+                        "at": "2026-11-06T09:13:00Z",
+                        "level": "info",
+                        "event": "sealed",
+                        "text": f"sealed {attempt_id}",
+                        "attempt_id": attempt_id,
+                    }
+                )
+                return producer_suite.HarnessResult("ok", {"released": True}, "")
             return producer_suite.HarnessResult("ok", {"released": True}, "")
         if verb == "finish-attempt":
             active = producer.active_attempt
             if active is None:
                 return producer_suite.HarnessResult("error", None, "no active attempt")
+            if isinstance(producer.hold, dict) and producer.hold.get("point") == "after-outcome":
+                active["outcome_native"] = params["native_outcome"]
+                active["outcome_reason"] = params.get("reason")
+                attempt_id = str(active["attempt_id"])
+                producer.snapshots[attempt_id] = producer._fresh_manifest(attempt_id)
+                return producer_suite.HarnessResult(
+                    "ok",
+                    {"attempt_id": attempt_id, "native_outcome": params["native_outcome"]},
+                    "",
+                )
             producer.finished_attempts.append(producer._summary_doc(active, "2026-11-06T09:13:00Z"))
             producer.active_attempt = None
             return producer_suite.HarnessResult(
                 "ok",
                 {"attempt_id": active["attempt_id"], "native_outcome": "complete"},
                 "",
+            )
+        if verb == "grow-archive":
+            attempt_id = params.get("attempt_id")
+            if not isinstance(attempt_id, str):
+                active = producer.active_attempt
+                attempt_id = active["attempt_id"] if isinstance(active, dict) else None
+            if not isinstance(attempt_id, str) or not attempt_id:
+                return producer_suite.HarnessResult("error", None, "no active attempt to grow")
+            if any(summary["attempt_id"] == attempt_id for summary in producer.finished_attempts):
+                return producer_suite.HarnessResult(
+                    "error", None, "the archive is sealed and immutable"
+                )
+            append_bytes = int(params["append_bytes"])
+            grown = producer.grown.get(attempt_id, b"") + b"0" * append_bytes
+            producer.grown[attempt_id] = grown
+            return producer_suite.HarnessResult(
+                "ok", {"path": "transcript.jsonl", "appended_bytes": append_bytes}, ""
             )
         return _fake_harness(cmd, verb, params, timeout)
 
@@ -1103,14 +1197,45 @@ def test_contract_events_passes_with_a_finished_attempt(
     assert fakes.eligible == set()
 
 
-def _export_tar(attempt_id: str) -> bytes:
-    manifest = {"contract": "1.0", "attempt": {"attempt_id": attempt_id}, "files": []}
+def _export_summary(attempt_id: str) -> dict[str, Any]:
+    """A full AttemptSummary for a standalone export tar."""
+    return {
+        "attempt_id": attempt_id,
+        "issue": {"number": 42, "title": "Issue 42"},
+        "started_at": TIMESTAMP,
+        "finished_at": None,
+        "lifecycle_state": "open",
+        "outcome": None,
+        "delivery": None,
+        "attention_required": False,
+        "sealed": False,
+        "sealed_at": None,
+    }
+
+
+def _export_tar(attempt_id: str, files: dict[str, bytes] | None = None) -> bytes:
+    payload_files = {"events.jsonl": b""} if files is None else files
+    entries = [
+        {
+            "path": name,
+            "kind": "events" if name == "events.jsonl" else "transcript",
+            "media_type": "application/x-ndjson",
+            "size": len(data),
+            "sha256": hashlib.sha256(data).hexdigest(),
+        }
+        for name, data in payload_files.items()
+    ]
+    manifest = {"contract": "1.0", "attempt": _export_summary(attempt_id), "files": entries}
     payload = (json.dumps(manifest, sort_keys=True) + "\n").encode()
     stream = io.BytesIO()
     with tarfile.open(fileobj=stream, mode="w") as archive:
         info = tarfile.TarInfo("manifest.json")
         info.size = len(payload)
         archive.addfile(info, io.BytesIO(payload))
+        for name, data in payload_files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
     return stream.getvalue()
 
 
@@ -1147,6 +1272,48 @@ class _SlowStream:
             size = len(self._payload)
         out, self._payload = self._payload[:size], self._payload[size:]
         return out
+
+
+def _serve_export(producer: _FakeProducer, argv: list[str]) -> _FakeExportProc:
+    """Build the fake's export tar: snapshot manifest plus the live bytes.
+
+    Mirrors the stub producer: ``--path`` narrows the stream (an unknown
+    path answers ``not_found`` before streaming), the manifest is the stored
+    snapshot when one exists, and the file bytes are always current, so a
+    file that grew while unsealed no longer matches its manifest entry.
+    """
+    attempt_id = argv[4]
+    paths = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--path"]
+    summaries: list[dict[str, Any]] = []
+    if producer.active_attempt is not None:
+        summaries.append(producer._summary_doc(producer.active_attempt, None))
+    summaries.extend(producer.finished_attempts)
+    summary = next((entry for entry in summaries if entry["attempt_id"] == attempt_id), None)
+    if summary is None:
+        proc = _FakeExportProc(io.BytesIO(b""))
+        proc.returncode = 5
+        return proc
+    entries = producer._manifest_for(attempt_id)
+    if paths:
+        known = {entry["path"] for entry in entries}
+        if any(path not in known for path in paths):
+            proc = _FakeExportProc(io.BytesIO(b""))
+            proc.returncode = 5
+            return proc
+        entries = [entry for entry in entries if entry["path"] in paths]
+    manifest = {"contract": "1.0", "attempt": summary, "files": entries}
+    payload = (json.dumps(manifest, sort_keys=True) + "\n").encode()
+    stream = io.BytesIO()
+    with tarfile.open(fileobj=stream, mode="w") as archive:
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(payload)
+        archive.addfile(info, io.BytesIO(payload))
+        for entry in entries:
+            data = producer._archive_files(attempt_id)[str(entry["path"])]
+            info = tarfile.TarInfo(str(entry["path"]))
+            info.size = len(data)
+            archive.addfile(info, io.BytesIO(data))
+    return _FakeExportProc(io.BytesIO(stream.getvalue()))
 
 
 def test_budget_export_passes_with_a_claim(
@@ -1209,6 +1376,101 @@ def test_budget_export_fails_when_manifest_is_for_another_attempt(
 
     assert outcome.status == "failed"
     assert "not for attempt" in outcome.detail
+
+
+def test_sealed_after_outcome_passes_with_hold_and_release(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, fakes)
+
+    def finality_export(
+        docker: str, container: str, exec_user: str, argv: list[str]
+    ) -> _FakeExportProc:
+        return _serve_export(fakes, argv)
+
+    monkeypatch.setattr(producer_suite, "_popen_export", finality_export)
+
+    outcome = producer_suite.scenario_sealed_after_outcome(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
+
+
+def test_sealed_after_outcome_fails_without_a_sealed_event(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, fakes)
+    inner = producer_suite._call_harness
+
+    def no_seal(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        if verb == "release":
+            fakes.hold = None
+            return producer_suite.HarnessResult("ok", {"released": True}, "")
+        return inner(cmd, verb, params, timeout)
+
+    monkeypatch.setattr(producer_suite, "_call_harness", no_seal)
+
+    def finality_export(
+        docker: str, container: str, exec_user: str, argv: list[str]
+    ) -> _FakeExportProc:
+        return _serve_export(fakes, argv)
+
+    monkeypatch.setattr(producer_suite, "_popen_export", finality_export)
+
+    outcome = producer_suite.scenario_sealed_after_outcome(CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "sealed event" in outcome.detail
+
+
+def test_export_torn_read_passes_when_a_file_grows(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, fakes)
+
+    def finality_export(
+        docker: str, container: str, exec_user: str, argv: list[str]
+    ) -> _FakeExportProc:
+        return _serve_export(fakes, argv)
+
+    monkeypatch.setattr(producer_suite, "_popen_export", finality_export)
+
+    outcome = producer_suite.scenario_export_torn_read(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
+
+
+def test_export_torn_read_fails_when_the_archive_never_grows(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, fakes)
+    inner = producer_suite._call_harness
+
+    def no_grow(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        if verb == "grow-archive":
+            return producer_suite.HarnessResult(
+                "ok", {"path": "transcript.jsonl", "appended_bytes": 0}, ""
+            )
+        return inner(cmd, verb, params, timeout)
+
+    monkeypatch.setattr(producer_suite, "_call_harness", no_grow)
+
+    def finality_export(
+        docker: str, container: str, exec_user: str, argv: list[str]
+    ) -> _FakeExportProc:
+        return _serve_export(fakes, argv)
+
+    monkeypatch.setattr(producer_suite, "_popen_export", finality_export)
+
+    outcome = producer_suite.scenario_export_torn_read(CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "torn read" in outcome.detail
 
 
 def test_snapshot_bounds_passes(fakes: _FakeProducer) -> None:

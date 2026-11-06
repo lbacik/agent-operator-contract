@@ -35,7 +35,8 @@
             "client.malformed_stdout",
             "client.contract_mismatch",
             "client.unsupported_capability",
-            "client.usage"
+            "client.usage",
+            "client.export_torn"
           ]
         },
         "message": {

@@ -1,0 +1,12 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "attempts",
+    "export",
+    "#99/9"
+  ],
+  "exit_code": 5,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"not_found\",\"message\":\"no attempt #99/9 is recorded\",\"retryable\":false},\"ok\":false}\n",
+  "stderr": ""
+}

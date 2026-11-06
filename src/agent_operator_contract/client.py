@@ -17,12 +17,17 @@ section 4).
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import io
 import json
 import os
 import secrets
 import subprocess
+import tarfile
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -58,6 +63,12 @@ ATTEMPTS_EXPORT_TIMEOUT = 30.0
 
 MAX_MUTATION_ATTEMPTS = 3
 """Bounded retries for one ambiguous mutation call (spec section 8.4)."""
+
+EXPORT_MAX_ATTEMPTS = 3
+"""Bounded refetches of a torn export stream (spec section 11.3)."""
+
+EXPORT_CHUNK_SIZE = 65536
+"""Read size for one streaming export chunk."""
 
 MUTATION_RETRY_BACKOFF_BASE = 0.05
 """Base backoff in seconds between ambiguous mutation retries; doubled each time."""
@@ -525,3 +536,243 @@ def interpret(exec_result: ExecResult) -> dict[str, object]:
             f"error.code {code!r} contradicts exit code {exec_result.exit_code}"
         )
     return doc
+
+
+class ExportProducerError(Exception):
+    """``attempts export`` failed before streaming started: relay the producer.
+
+    The producer answered with an ``ok:false`` envelope (for example
+    ``not_found`` for an unknown attempt or path) before any tar bytes were
+    sent. The consumer relays the envelope and its exit code instead of
+    reporting a client failure.
+    """
+
+    def __init__(self, envelope: dict[str, object], exit_code: int) -> None:
+        super().__init__(f"export failed: {envelope}")
+        self.envelope = envelope
+        self.exit_code = exit_code
+
+
+class TornExportError(ClientError):
+    """An export stayed torn after the bounded refetch (spec section 11.3).
+
+    Streamed file bytes did not match the manifest ``sha256`` on every
+    attempt, so the output was discarded. The archive is unsealed and moving;
+    the export may be retried.
+    """
+
+    def __init__(self, attempt_id: str, attempts: int, detail: str) -> None:
+        super().__init__(
+            "client.export_torn",
+            f"export of attempt {attempt_id!r} is torn after {attempts} attempts: {detail}",
+        )
+        self.attempt_id = attempt_id
+        self.attempts = attempts
+
+
+def _popen(docker: str, instance: Instance, agentctl_argv: list[str]) -> subprocess.Popen[bytes]:
+    """Start ``agentctl`` with piped stdout exactly as spec section 3.1."""
+    argv = [
+        "exec",
+        "--user",
+        instance.exec_user,
+        instance.container_id,
+        AGENTCTL_PATH,
+        "--contract",
+        str(CONTRACT_MAJOR),
+        *agentctl_argv,
+    ]
+    try:
+        return subprocess.Popen(
+            [docker, *argv],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise DockerUnavailableError(f"cannot run {docker!r}: {exc.strerror or exc}") from exc
+    except OSError as exc:
+        raise DockerUnavailableError(f"cannot run {docker!r}: {exc}") from exc
+
+
+def _drain_with_progress(proc: subprocess.Popen[bytes], timeout: float) -> tuple[bytes, bytes]:
+    """Read a streaming export to EOF; stall past ``timeout`` without bytes.
+
+    Every chunk received restarts the progress deadline, so a slow producer
+    keeps streaming while a stalled one trips ``client.exec_failed``. Stderr
+    is drained alongside stdout so diagnostics can never block the stream.
+    """
+    stdout_chunks: list[bytes] = []
+    stderr_chunks: list[bytes] = []
+    stdout_done = threading.Event()
+    stderr_done = threading.Event()
+
+    def _read_stdout() -> None:
+        try:
+            stream = proc.stdout
+            if stream is None:
+                return
+            while True:
+                data = stream.read(EXPORT_CHUNK_SIZE)
+                if not data:
+                    return
+                stdout_chunks.append(data)
+        except (OSError, ValueError):
+            return
+        finally:
+            stdout_done.set()
+
+    def _read_stderr() -> None:
+        try:
+            stream = proc.stderr
+            if stream is None:
+                return
+            while True:
+                data = stream.read(EXPORT_CHUNK_SIZE)
+                if not data:
+                    return
+                stderr_chunks.append(data)
+        except (OSError, ValueError):
+            return
+        finally:
+            stderr_done.set()
+
+    stdout_reader = threading.Thread(target=_read_stdout, daemon=True)
+    stderr_reader = threading.Thread(target=_read_stderr, daemon=True)
+    stdout_reader.start()
+    stderr_reader.start()
+    seen = 0
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        stdout_done.wait(max(0.0, remaining))
+        if len(stdout_chunks) != seen:
+            seen = len(stdout_chunks)
+            deadline = time.monotonic() + timeout
+            continue
+        if stdout_done.is_set():
+            break
+        proc.kill()
+        stdout_reader.join(timeout=10.0)
+        stderr_reader.join(timeout=10.0)
+        with contextlib.suppress(OSError, ValueError, subprocess.TimeoutExpired):
+            proc.wait(timeout=10.0)
+        raise ExecFailedError(f"export stalled: no bytes for {timeout:g}s")
+    stdout_reader.join(timeout=10.0)
+    stderr_reader.join(timeout=10.0)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        raise ExecFailedError(f"export did not finish within {timeout:g}s") from exc
+    return b"".join(stdout_chunks), b"".join(stderr_chunks)
+
+
+def _parse_export_envelope(data: bytes) -> dict[str, object] | None:
+    """Return the producer envelope when ``data`` is one, else ``None``."""
+    try:
+        doc = json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+    if not isinstance(doc, dict) or documents.validate_envelope(doc) != []:
+        return None
+    return doc
+
+
+def _verify_export_stream(data: bytes, attempt_id: str) -> tuple[dict[str, object], str | None]:
+    """Check a drained export tar; return its manifest and any torn detail.
+
+    Structural failures (an unreadable tar, a missing or invalid
+    ``manifest.json``) raise :class:`MalformedStdoutError`: the producer is
+    at fault deterministically. A file whose size or ``sha256`` does not
+    match its manifest entry is a torn read of an unsealed archive, returned
+    as a detail string so the caller can refetch within its bound.
+    """
+    members: dict[str, bytes] = {}
+    order: list[str] = []
+    try:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
+            for member in archive:
+                extracted = archive.extractfile(member)
+                order.append(member.name)
+                members[member.name] = extracted.read() if extracted is not None else b""
+    except (tarfile.TarError, OSError, EOFError) as exc:
+        raise MalformedStdoutError(f"export is not a readable tar stream: {exc}") from exc
+    if not order or order[0] != "manifest.json":
+        raise MalformedStdoutError(f"export must start with manifest.json, got {order[:1]!r}")
+    try:
+        manifest = json.loads(members["manifest.json"])
+    except ValueError as exc:
+        raise MalformedStdoutError("export manifest.json is not valid JSON") from exc
+    if not isinstance(manifest, dict):
+        raise MalformedStdoutError("export manifest.json must be an object")
+    problems = documents.validate_export_manifest(manifest)
+    if problems:
+        raise MalformedStdoutError(f"export manifest.json is invalid: {problems[0]}")
+    attempt = manifest.get("attempt")
+    if not isinstance(attempt, dict) or attempt.get("attempt_id") != attempt_id:
+        raise MalformedStdoutError(f"export manifest is not for attempt {attempt_id!r}")
+    entries = manifest.get("files")
+    assert isinstance(entries, list)
+    for entry in entries:
+        assert isinstance(entry, dict)
+        content = members.get(str(entry["path"]))
+        if content is None:
+            raise MalformedStdoutError(
+                f"export manifest lists {entry['path']!r} but the tar lacks it"
+            )
+        if len(content) != entry["size"] or hashlib.sha256(content).hexdigest() != entry["sha256"]:
+            return manifest, (f"export file {entry['path']!r} does not match its manifest sha256")
+    return manifest, None
+
+
+def export_attempt(
+    docker: str,
+    instance: Instance,
+    attempt_id: str,
+    paths: Sequence[str] | None = None,
+    sink: Callable[[bytes], object] | None = None,
+    timeout: float | None = None,
+    max_attempts: int | None = None,
+) -> dict[str, object]:
+    """Stream one ``attempts export`` tar to ``sink`` with torn-read refetch.
+
+    The tar is drained with a progress timeout (``timeout``, default 30 s
+    without bytes), the streamed ``manifest.json`` is read first and every
+    file's size and ``sha256`` is verified as it streams. A torn read of an
+    unsealed archive is fetched again up to ``max_attempts`` times (default
+    3); when every attempt is torn, raises :class:`TornExportError` and the
+    caller discards the output. The verified tar bytes reach ``sink`` exactly
+    once, only after verification. Nothing is cached, so an unsealed moving
+    snapshot is never mistaken for a sealed archive.
+
+    An envelope answered before streaming starts (for example ``not_found``)
+    raises :class:`ExportProducerError` so the caller relays the producer
+    instead of reporting a client failure.
+    """
+    wanted = list(paths) if paths else []
+    argv = ["attempts", "export", attempt_id]
+    for path in wanted:
+        argv += ["--path", path]
+    effective_timeout = timeout_for("attempts-export", timeout)
+    attempts = max_attempts if max_attempts is not None else EXPORT_MAX_ATTEMPTS
+    if attempts < 1:
+        attempts = 1
+    torn_detail: str | None = None
+    for _attempt in range(1, attempts + 1):
+        proc = _popen(docker, instance, argv)
+        data, _stderr = _drain_with_progress(proc, effective_timeout)
+        exit_code = proc.returncode if proc.returncode is not None else 1
+        if exit_code != 0:
+            envelope = _parse_export_envelope(data)
+            if envelope is not None and envelope.get("ok") is False:
+                raise ExportProducerError(envelope, exit_code)
+            raise MalformedStdoutError(
+                f"export exited {exit_code} after streaming started; discarding the output"
+            )
+        manifest, torn_detail = _verify_export_stream(data, attempt_id)
+        if torn_detail is None:
+            if sink is not None:
+                sink(data)
+            return manifest
+    raise TornExportError(attempt_id, attempts, torn_detail or "sha256 mismatch")

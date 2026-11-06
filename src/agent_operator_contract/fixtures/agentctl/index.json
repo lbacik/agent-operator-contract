@@ -166,6 +166,10 @@
     "attempts-not-found": {
       "classification": "not_found",
       "note": "Exit 5, not_found: unknown Attempt ID."
+    },
+    "attempts-export-not-found": {
+      "classification": "not_found",
+      "note": "Exit 5, not_found: unknown Attempt ID for attempts export before streaming starts."
     }
   }
 }
