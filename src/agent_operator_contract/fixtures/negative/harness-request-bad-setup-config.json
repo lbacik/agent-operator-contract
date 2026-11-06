@@ -1,0 +1,9 @@
+{
+  "verb": "setup",
+  "params": {
+    "repository": "acme/widgets",
+    "config": {
+      "provider": "example"
+    }
+  }
+}

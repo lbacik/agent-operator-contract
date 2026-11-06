@@ -1,0 +1,13 @@
+{
+  "harness": "1.0",
+  "verb": "finish-attempt",
+  "ok": false,
+  "error": {
+    "code": "unsupported",
+    "message": "unknown native outcome 'complete' for this engine",
+    "details": {
+      "what": "native-outcome",
+      "name": "complete"
+    }
+  }
+}

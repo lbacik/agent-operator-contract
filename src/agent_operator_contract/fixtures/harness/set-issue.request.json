@@ -1,0 +1,8 @@
+{
+  "verb": "set-issue",
+  "params": {
+    "issue": 42,
+    "eligible": true,
+    "title": "Widgets fall over when the moon is full"
+  }
+}

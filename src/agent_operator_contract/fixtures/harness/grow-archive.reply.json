@@ -1,0 +1,9 @@
+{
+  "harness": "1.0",
+  "verb": "grow-archive",
+  "ok": true,
+  "result": {
+    "path": "transcript.jsonl",
+    "appended_bytes": 65536
+  }
+}

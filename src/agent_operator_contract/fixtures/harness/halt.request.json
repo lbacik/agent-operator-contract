@@ -1,0 +1,7 @@
+{
+  "verb": "halt",
+  "params": {
+    "reason": "credential-failure",
+    "detail": "the provider token was revoked mid-attempt"
+  }
+}

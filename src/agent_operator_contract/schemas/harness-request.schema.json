@@ -1,0 +1,253 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Conformance harness request",
+  "description": "One harness invocation's JSON argument: the verb from argv plus its parameters (spec section 15.1). The argv verb and the document verb must agree; a mismatch is a usage error. Request parameters are strict: unknown keys are rejected so suite typos fail loudly.",
+  "type": "object",
+  "required": ["verb", "params"],
+  "additionalProperties": false,
+  "properties": {
+    "verb": {
+      "type": "string",
+      "enum": [
+        "setup",
+        "teardown",
+        "set-issue",
+        "hold",
+        "release",
+        "finish-attempt",
+        "hold-lock",
+        "crash",
+        "terminate",
+        "stop-container",
+        "start-container",
+        "halt",
+        "grow-archive",
+        "defer-publication"
+      ],
+      "description": "The harness verb, repeated from argv for dispatch and record-keeping."
+    },
+    "params": {
+      "type": "object",
+      "description": "The verb's parameters; the required keys depend on the verb."
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"verb": {"const": "setup"}}, "required": ["verb"]},
+      "then": {
+        "properties": {
+          "params": {
+            "type": "object",
+            "required": ["repository"],
+            "properties": {
+              "repository": {
+                "type": "string",
+                "pattern": "^[^/\\s]+/[^/\\s]+$",
+                "description": "The Target Repository of the fresh instance, written owner/name."
+              },
+              "capabilities": {
+                "type": "array",
+                "items": {"type": "string", "minLength": 1},
+                "description": "Requested Operator Capabilities to enable when the engine can toggle them; the harness reports the actual set."
+              },
+              "config": {
+                "type": "object",
+                "description": "Opaque engine knobs for the fresh instance; only native.* keys are allowed.",
+                "patternProperties": {"^native\\.": {}},
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verb": {"const": "teardown"}}, "required": ["verb"]},
+      "then": {"properties": {"params": {"type": "object", "additionalProperties": false}}}
+    },
+    {
+      "if": {"properties": {"verb": {"const": "set-issue"}}, "required": ["verb"]},
+      "then": {
+        "properties": {
+          "params": {
+            "type": "object",
+            "required": ["issue", "eligible"],
+            "properties": {
+              "issue": {"type": "integer", "minimum": 1},
+              "eligible": {"type": "boolean"},
+              "title": {"type": "string", "minLength": 1}
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verb": {"const": "hold"}}, "required": ["verb"]},
+      "then": {
+        "properties": {
+          "params": {
+            "type": "object",
+            "required": ["point"],
+            "properties": {
+              "point": {
+                "type": "string",
+                "enum": ["before-claim", "after-claim", "native-phase", "after-outcome"]
+              },
+              "phase": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Engine-native phase name; required exactly when point is native-phase."
+              },
+              "scope": {
+                "type": "string",
+                "enum": ["next", "active"],
+                "description": "Hold the next Attempt (next) or the currently active one (active); the default holds the active Attempt when one exists, else the next."
+              }
+            },
+            "additionalProperties": false,
+            "allOf": [
+              {
+                "if": {"properties": {"point": {"const": "native-phase"}}},
+                "then": {"required": ["phase"]},
+                "else": {"not": {"required": ["phase"]}}
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verb": {"const": "release"}}, "required": ["verb"]},
+      "then": {"properties": {"params": {"type": "object", "additionalProperties": false}}}
+    },
+    {
+      "if": {"properties": {"verb": {"const": "finish-attempt"}}, "required": ["verb"]},
+      "then": {
+        "properties": {
+          "params": {
+            "type": "object",
+            "required": ["native_outcome"],
+            "properties": {
+              "native_outcome": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Engine-native outcome the active Attempt must finish with."
+              },
+              "reason": {
+                "type": ["string", "null"],
+                "description": "Engine-native reason recorded alongside the outcome."
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verb": {"const": "hold-lock"}}, "required": ["verb"]},
+      "then": {
+        "properties": {
+          "params": {
+            "type": "object",
+            "required": ["duration_ms"],
+            "properties": {
+              "duration_ms": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 60000,
+                "description": "How long the harness blocks while holding the engine's lock."
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verb": {"const": "crash"}}, "required": ["verb"]},
+      "then": {
+        "properties": {
+          "params": {
+            "type": "object",
+            "required": ["point"],
+            "properties": {
+              "point": {
+                "type": "string",
+                "enum": [
+                  "between-commit-and-reply",
+                  "before-claim",
+                  "after-claim",
+                  "during-finalization",
+                  "now"
+                ],
+                "description": "now crashes immediately; any other point arms a one-shot crash for the next time the engine reaches it."
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verb": {"const": "terminate"}}, "required": ["verb"]},
+      "then": {"properties": {"params": {"type": "object", "additionalProperties": false}}}
+    },
+    {
+      "if": {"properties": {"verb": {"const": "stop-container"}}, "required": ["verb"]},
+      "then": {"properties": {"params": {"type": "object", "additionalProperties": false}}}
+    },
+    {
+      "if": {"properties": {"verb": {"const": "start-container"}}, "required": ["verb"]},
+      "then": {"properties": {"params": {"type": "object", "additionalProperties": false}}}
+    },
+    {
+      "if": {"properties": {"verb": {"const": "halt"}}, "required": ["verb"]},
+      "then": {
+        "properties": {
+          "params": {
+            "type": "object",
+            "required": ["reason"],
+            "properties": {
+              "reason": {
+                "type": "string",
+                "minLength": 1,
+                "description": "Halt reason the engine must record before exiting by decision."
+              },
+              "detail": {"type": "string"}
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verb": {"const": "grow-archive"}}, "required": ["verb"]},
+      "then": {
+        "properties": {
+          "params": {
+            "type": "object",
+            "required": ["append_bytes"],
+            "properties": {
+              "attempt_id": {
+                "type": ["string", "null"],
+                "description": "Whose unsealed archive grows; null (or absent) means the active Attempt."
+              },
+              "append_bytes": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "How many bytes the harness appends to one file of the archive."
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"verb": {"const": "defer-publication"}}, "required": ["verb"]},
+      "then": {"properties": {"params": {"type": "object", "additionalProperties": false}}}
+    }
+  ]
+}

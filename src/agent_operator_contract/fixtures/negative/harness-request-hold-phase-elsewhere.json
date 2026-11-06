@@ -1,0 +1,7 @@
+{
+  "verb": "hold",
+  "params": {
+    "point": "before-claim",
+    "phase": "model_running"
+  }
+}

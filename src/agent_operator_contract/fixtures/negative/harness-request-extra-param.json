@@ -1,0 +1,6 @@
+{
+  "verb": "teardown",
+  "params": {
+    "now": true
+  }
+}

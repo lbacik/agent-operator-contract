@@ -1,0 +1,8 @@
+{
+  "harness": "1.0",
+  "verb": "hold-lock",
+  "ok": true,
+  "result": {
+    "held_ms": 2500
+  }
+}

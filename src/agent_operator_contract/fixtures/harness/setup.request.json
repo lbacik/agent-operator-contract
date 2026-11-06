@@ -1,0 +1,7 @@
+{
+  "verb": "setup",
+  "params": {
+    "repository": "acme/widgets",
+    "capabilities": ["next-issue", "stop-after"]
+  }
+}

@@ -89,3 +89,9 @@ _Avoid_: final, complete, finished
 **Offline Read**:
 Serving the read-only part of the contract from a stopped Managed Instance's state volume, mounted read-only into a throwaway container of the same image.
 _Avoid_: cold read, docker cp
+
+## Conformance
+
+**Conformance Harness**:
+The engine-supplied executable the producer suite drives to steer a Managed Instance through failure and race scenarios: fresh setup and teardown, issue eligibility, Attempt holds and native outcomes, lock holds, crashes, stops, Halts, archive growth and deferred publication. It runs on the host, outside the production image, and answers each verb with one JSON document. A verb or hold point its engine cannot support is answered `unsupported`, and the dependent scenarios are reported as not run.
+_Avoid_: fake producer, stub engine, test double

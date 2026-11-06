@@ -1,0 +1,7 @@
+{
+  "verb": "set-issue",
+  "params": {
+    "issue": 0,
+    "eligible": true
+  }
+}

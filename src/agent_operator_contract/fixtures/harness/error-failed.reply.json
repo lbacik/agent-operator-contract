@@ -1,0 +1,12 @@
+{
+  "harness": "1.0",
+  "verb": "finish-attempt",
+  "ok": false,
+  "error": {
+    "code": "failed",
+    "message": "there is no active Attempt to finish",
+    "details": {
+      "attempt_id": null
+    }
+  }
+}
