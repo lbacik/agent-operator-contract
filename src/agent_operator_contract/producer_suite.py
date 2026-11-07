@@ -3064,6 +3064,10 @@ def _offline_unsupported_checks(
         ["resume"],
         ["stop", "--after", "2"],
         ["next", "issue", "7"],
+        ["handoff", "now"],
+        ["recovery", "retry", "attempt-1"],
+        ["recovery", "release", "attempt-1", "--saved-at", "somewhere"],
+        ["errors", "reset"],
     ]
     request_ids: list[str] = []
     for operation in mutations:

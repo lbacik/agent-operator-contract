@@ -449,6 +449,44 @@ def test_offline_read_of_running_container_is_refused(
     assert exc_info.value.code == "client.instance_running"
 
 
+def test_status_paused_is_refused_with_no_run(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A paused container still has a live engine, so no Offline Read runs.
+
+    ``docker ps`` reports paused containers as up, and the engine owns the
+    volume while paused; ``agentfleet status <paused>`` exits with
+    ``client.instance_running`` and records neither ``exec`` nor ``run``.
+    """
+    fleet = {
+        "containers": [
+            {
+                "id": "f" * 64,
+                "name": "paused-1",
+                "backend": "coding-agent",
+                "contract": "1",
+                "exec_user": "agent",
+                "state": "paused",
+            }
+        ]
+    }
+    fleet_file = tmp_path / "paused-fleet.json"
+    fleet_file.write_text(json.dumps(fleet), encoding="utf-8")
+    monkeypatch.setenv("FAKE_DOCKER_FLEET", str(fleet_file))
+    env = {**consumer_env["env"], "FAKE_DOCKER_FLEET": str(fleet_file)}
+    completed = _run_agentfleet(["status", "paused-1", "--json"], env)
+
+    table = documents.client_table()
+    assert completed.returncode == int(table["client.instance_running"]["exit_code"])
+    doc = json.loads(completed.stdout.decode("utf-8"))
+    assert documents.validate_client_envelope(doc) == []
+    assert doc["error"]["code"] == "client.instance_running"
+    recorded = _recorded(consumer_env)
+    assert _exec_argvs(recorded) == []
+    assert _run_argvs(recorded) == []
+    assert all(entry["argv"][0] in ("ps", "inspect") for entry in recorded)
+
+
 def test_offline_docker_argv_mounts_everything_read_only() -> None:
     """The Offline Read argv pins the spec section 3.2 shape exactly."""
     target = client.OfflineTarget(

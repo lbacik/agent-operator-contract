@@ -534,7 +534,7 @@ class _FakeProducer:
 
     def _offline_identity_doc(self) -> dict[str, Any]:
         """The offline identity: the setup document with no running process."""
-        identity = dict(IDENTITY)
+        identity: dict[str, Any] = dict(IDENTITY)
         identity["mode"] = "offline"
         identity["process_started_at"] = None
         return identity
@@ -589,9 +589,13 @@ class _FakeProducer:
             return producer_suite.DockerResult(0, _ok(self._offline_status_doc()), "")
         if len(argv) >= 4 and argv[:3] == ["--contract", "1", "--offline"]:
             tail = argv[3:]
-            is_mutation = (
-                tail[:1] == ["stop"] or tail[:1] == ["resume"] or tail[:2] == ["next", "issue"]
-            )
+            is_mutation = tail[:1] in (
+                ["stop"],
+                ["resume"],
+                ["handoff"],
+                ["recovery"],
+                ["errors"],
+            ) or tail[:2] == ["next", "issue"]
             if is_mutation:
                 request_id = _probe_request_id(argv)
                 return producer_suite.DockerResult(

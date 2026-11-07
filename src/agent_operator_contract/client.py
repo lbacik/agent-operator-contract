@@ -515,21 +515,33 @@ def resolve(fleet: Fleet, name: str) -> Instance:
     return matches[0]
 
 
+_STOPPED_STATUSES = frozenset({"created", "dead", "exited"})
+"""Docker container statuses with no live engine (spec section 12).
+
+Any other status (``paused``, ``restarting``, ``removing``, or an
+unrecognized value) keeps the Offline Read refused: the engine may still
+own the volume.
+"""
+
+
 def _entry_is_running(entry: dict[str, Any]) -> bool:
     """Decide liveness from one ``docker inspect`` entry; unknown means running.
 
     The consumer must never read a maybe-running container offline (spec
     section 12), so an entry without a readable ``State`` refuses the
-    Offline Read.
+    Offline Read. Only an explicitly stopped status (created, exited, dead)
+    with no live or paused engine is read offline.
     """
     state = entry.get("State")
     if not isinstance(state, dict):
         return True
     if state.get("Running") is True:
         return True
+    if state.get("Paused") is True:
+        return True
     status = state.get("Status")
-    if isinstance(status, str):
-        return status == "running"
+    if isinstance(status, str) and status:
+        return status not in _STOPPED_STATUSES
     return state.get("Running") is not False
 
 

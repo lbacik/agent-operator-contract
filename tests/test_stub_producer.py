@@ -504,6 +504,13 @@ def test_stub_intake_is_durable_offline(tmp_path: Path) -> None:
         (["resume"], "req-000000000042"),
         (["stop", "--after", "2"], "req-000000000043"),
         (["next", "issue", "7"], "req-000000000044"),
+        (["handoff", "now"], "req-000000000046"),
+        (["recovery", "retry", "attempt-1"], "req-000000000047"),
+        (
+            ["recovery", "release", "attempt-1", "--saved-at", "somewhere"],
+            "req-000000000048",
+        ),
+        (["errors", "reset"], "req-000000000049"),
     ],
 )
 def test_stub_offline_mutations_are_unsupported_and_store_nothing(
