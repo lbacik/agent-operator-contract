@@ -1463,3 +1463,266 @@ def test_attempts_export_unknown_id_relays_not_found(
     assert _exec_argvs(_recorded(consumer_env)) == [
         ["--contract", "1", "attempts", "export", "#99/9"]
     ]
+
+
+FULL_OPERATOR_CAPABILITIES = [
+    "errors-reset",
+    "next-issue",
+    "operator-handoff",
+    "recovery-release",
+    "recovery-retry",
+    "stop-after",
+]
+
+
+def _widened_identity_doc() -> dict[str, Any]:
+    """The checkout identity advertising every optional mutation capability."""
+    base = dict(json.loads((FIXTURES_DIR / "identity.json").read_text(encoding="utf-8")))
+    inner = json.loads(base["stdout"])
+    widened_stdout = json.dumps(
+        {**inner, "result": {**inner["result"], "capabilities": FULL_OPERATOR_CAPABILITIES}},
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return {**base, "stdout": widened_stdout + "\n"}
+
+
+def test_handoff_with_supplied_request_id_sends_now(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "req-a1b2c3d4e5f6"
+    env = _fixture_env(
+        consumer_env,
+        tmp_path,
+        monkeypatch,
+        ["handoff-completed"],
+        {"identity": _widened_identity_doc()},
+    )
+    completed = _run_agentfleet(
+        [
+            "handoff",
+            "web-1",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            request_id,
+        ],
+        env,
+    )
+
+    assert completed.returncode == 0
+    assert request_id in completed.stdout.decode("utf-8")
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "identity"],
+        [
+            "--contract",
+            "1",
+            "handoff",
+            "now",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+    ]
+
+
+def test_recovery_retry_with_supplied_request_id_sends_attempt(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "req-c1b2c3d4e5f6"
+    env = _fixture_env(
+        consumer_env,
+        tmp_path,
+        monkeypatch,
+        ["recovery-retry-completed"],
+        {"identity": _widened_identity_doc()},
+    )
+    completed = _run_agentfleet(
+        [
+            "recovery-retry",
+            "web-1",
+            "stub-1",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            request_id,
+        ],
+        env,
+    )
+
+    assert completed.returncode == 0
+    assert request_id in completed.stdout.decode("utf-8")
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "identity"],
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "retry",
+            "stub-1",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+    ]
+
+
+def test_recovery_release_with_supplied_request_id_sends_saved_at(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "req-e1b2c3d4e5f6"
+    env = _fixture_env(
+        consumer_env,
+        tmp_path,
+        monkeypatch,
+        ["recovery-release-completed"],
+        {"identity": _widened_identity_doc()},
+    )
+    completed = _run_agentfleet(
+        [
+            "recovery-release",
+            "web-1",
+            "stub-1",
+            "--saved-at",
+            "shelf-303",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            request_id,
+        ],
+        env,
+    )
+
+    assert completed.returncode == 0
+    assert request_id in completed.stdout.decode("utf-8")
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "identity"],
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "release",
+            "stub-1",
+            "--saved-at",
+            "shelf-303",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+    ]
+
+
+def test_errors_reset_with_supplied_request_id_sends_reset(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request_id = "req-01b2c3d4e5f6"
+    env = _fixture_env(
+        consumer_env,
+        tmp_path,
+        monkeypatch,
+        ["errors-reset-completed"],
+        {"identity": _widened_identity_doc()},
+    )
+    completed = _run_agentfleet(
+        [
+            "errors-reset",
+            "web-1",
+            "--expect-repo",
+            "example-owner/example-repo",
+            "--request-id",
+            request_id,
+        ],
+        env,
+    )
+
+    assert completed.returncode == 0
+    assert request_id in completed.stdout.decode("utf-8")
+    assert _exec_argvs(_recorded(consumer_env)) == [
+        ["--contract", "1", "identity"],
+        [
+            "--contract",
+            "1",
+            "errors",
+            "reset",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("cli", "capability"),
+    [
+        (["handoff", "web-1"], "operator-handoff"),
+        (["recovery-retry", "web-1", "stub-1"], "recovery-retry"),
+        (["recovery-release", "web-1", "stub-1", "--saved-at", "shelf-303"], "recovery-release"),
+        (["errors-reset", "web-1"], "errors-reset"),
+    ],
+)
+def test_new_operations_refused_when_capability_missing(
+    consumer_env: dict[str, Any],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cli: list[str],
+    capability: str,
+) -> None:
+    """Each new operation is gated on its advertised capability.
+
+    The checkout identity advertises only ``next-issue`` and ``stop-after``,
+    so the precheck refuses with ``client.unsupported_capability`` and the
+    fake records the ``identity`` read and no mutation.
+    """
+    request_id = "req-9c4d5e6f7a8b"
+    env = _fixture_env(consumer_env, tmp_path, monkeypatch, ["identity"])
+    completed = _run_agentfleet(
+        [*cli, "--expect-repo", "example-owner/example-repo", "--request-id", request_id, "--json"],
+        env,
+    )
+
+    table = documents.client_table()
+    assert completed.returncode == int(table["client.unsupported_capability"]["exit_code"])
+    doc = json.loads(completed.stdout.decode("utf-8"))
+    assert documents.validate_client_envelope(doc) == []
+    assert doc["error"]["code"] == "client.unsupported_capability"
+    assert capability in str(doc["error"].get("message", ""))
+    assert _exec_argvs(_recorded(consumer_env)) == [["--contract", "1", "identity"]]
+
+
+@pytest.mark.parametrize(
+    "cli",
+    [
+        ["handoff", "web-1"],
+        ["recovery-retry", "web-1", "stub-1"],
+        ["recovery-release", "web-1", "stub-1", "--saved-at", "shelf-303"],
+        ["errors-reset", "web-1"],
+    ],
+)
+def test_new_operations_without_expect_repo_are_usage_and_send_nothing(
+    consumer_env: dict[str, Any], cli: list[str]
+) -> None:
+    env: dict[str, str] = consumer_env["env"]
+    completed = _run_agentfleet(cli, env)
+
+    assert completed.returncode == 2
+    doc = json.loads(completed.stdout.decode("utf-8"))
+    assert documents.validate_client_envelope(doc) == []
+    assert doc["error"]["code"] == "client.usage"
+    recorded = _recorded(consumer_env)
+    assert not any(entry["argv"][0] == "exec" for entry in recorded)
+
+
+def test_new_operation_fixture_classifications_cover_success_rejection_and_not_found() -> None:
+    index = documents.load_fixture_index()["fixtures"]
+    assert index["handoff-completed"]["classification"] == "success"
+    assert index["handoff-rejected"]["classification"] == "rejection"
+    assert index["recovery-retry-completed"]["classification"] == "success"
+    assert index["recovery-retry-not-found"]["classification"] == "not_found"
+    assert index["recovery-release-completed"]["classification"] == "success"
+    assert index["recovery-release-not-found"]["classification"] == "not_found"
+    assert index["errors-reset-completed"]["classification"] == "success"
+    assert index["errors-reset-rejected"]["classification"] == "rejection"

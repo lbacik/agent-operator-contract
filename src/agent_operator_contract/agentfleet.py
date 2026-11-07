@@ -5,7 +5,8 @@ Instances through the operator contract. ``ls`` lists the Fleet from discovery
 labels and container state alone (no ``exec``) and flags duplicate instance
 names rather than hiding them. ``identity``, ``status`` and ``command`` relay
 the producer reply: human output by default, ``--json`` prints the producer's
-envelope verbatim. ``stop``, ``resume``, ``stop-after`` and ``next-issue``
+envelope verbatim. ``stop``, ``resume``, ``stop-after``, ``next-issue``,
+``handoff``, ``recovery-retry``, ``recovery-release`` and ``errors-reset``
 submit mutations: the request ID is
 generated before submission from a cryptographically secure source (or taken
 from ``--request-id``), ``--expect-repo`` is always supplied by the caller and
@@ -31,7 +32,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any, NoReturn
 
-from agent_operator_contract import CONTRACT_MAJOR, __version__, client, shared
+from agent_operator_contract import CONTRACT_MAJOR, client, shared
 
 LS_VERSION = 1
 
@@ -772,6 +773,27 @@ class _Parser(argparse.ArgumentParser):
         self.exit(2)
 
 
+class _VersionAction(argparse.Action):
+    """Print the package version; resolved only when ``--version`` is passed.
+
+    The version lookup scans the installed distributions, so it stays out of
+    the import path and runs only for this flag.
+    """
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: str | Sequence[Any] | None,
+        option_string: str | None = None,
+    ) -> NoReturn:
+        from agent_operator_contract import __version__
+
+        sys.stdout.write(f"{parser.prog} {__version__} (contract major {CONTRACT_MAJOR})\n")
+        sys.stdout.flush()
+        parser.exit(0)
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = _Parser(
         prog="agentfleet",
@@ -779,8 +801,9 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--version",
-        action="version",
-        version=f"%(prog)s {__version__} (contract major {CONTRACT_MAJOR})",
+        action=_VersionAction,
+        nargs=0,
+        help="print the agentfleet version and contract major, then exit",
     )
     parser.add_argument(
         "--json",
@@ -924,6 +947,133 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="bounded retries for an ambiguous mutation (default: 3 attempts)",
     )
+    handoff_parser = sub.add_parser(
+        "handoff", help="complete an Operator Handoff of the active attempt"
+    )
+    handoff_parser.add_argument("instance", help="instance name from the discovery labels")
+    handoff_parser.add_argument(
+        "--expect-repo",
+        required=True,
+        help="Target Repository as owner/name; never taken from the instance itself",
+    )
+    handoff_parser.add_argument(
+        "--request-id",
+        default=None,
+        help="durable request ID (generated when omitted)",
+    )
+    handoff_parser.add_argument("--json", dest="json", action="store_true")
+    handoff_parser.add_argument("--docker", dest="docker", default=None)
+    handoff_parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=float,
+        default=None,
+        help="consumer timeout in seconds (default: §3.3 class default, 15 s for mutations)",
+    )
+    handoff_parser.add_argument(
+        "--max-attempts",
+        dest="max_attempts",
+        type=int,
+        default=None,
+        help="bounded retries for an ambiguous mutation (default: 3 attempts)",
+    )
+    retry_parser = sub.add_parser(
+        "recovery-retry", help="retry safe finalization from retained evidence"
+    )
+    retry_parser.add_argument("instance", help="instance name from the discovery labels")
+    retry_parser.add_argument("attempt_id", help="attempt ID to retry finalization for")
+    retry_parser.add_argument(
+        "--expect-repo",
+        required=True,
+        help="Target Repository as owner/name; never taken from the instance itself",
+    )
+    retry_parser.add_argument(
+        "--request-id",
+        default=None,
+        help="durable request ID (generated when omitted)",
+    )
+    retry_parser.add_argument("--json", dest="json", action="store_true")
+    retry_parser.add_argument("--docker", dest="docker", default=None)
+    retry_parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=float,
+        default=None,
+        help="consumer timeout in seconds (default: §3.3 class default, 15 s for mutations)",
+    )
+    retry_parser.add_argument(
+        "--max-attempts",
+        dest="max_attempts",
+        type=int,
+        default=None,
+        help="bounded retries for an ambiguous mutation (default: 3 attempts)",
+    )
+    release_parser = sub.add_parser(
+        "recovery-release", help="record where work was secured, release the issue, finalize"
+    )
+    release_parser.add_argument("instance", help="instance name from the discovery labels")
+    release_parser.add_argument("attempt_id", help="attempt ID to release")
+    release_parser.add_argument(
+        "--saved-at",
+        required=True,
+        help="location where the work was secured (stored and echoed, never a credential)",
+    )
+    release_parser.add_argument(
+        "--expect-repo",
+        required=True,
+        help="Target Repository as owner/name; never taken from the instance itself",
+    )
+    release_parser.add_argument(
+        "--request-id",
+        default=None,
+        help="durable request ID (generated when omitted)",
+    )
+    release_parser.add_argument("--json", dest="json", action="store_true")
+    release_parser.add_argument("--docker", dest="docker", default=None)
+    release_parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=float,
+        default=None,
+        help="consumer timeout in seconds (default: §3.3 class default, 15 s for mutations)",
+    )
+    release_parser.add_argument(
+        "--max-attempts",
+        dest="max_attempts",
+        type=int,
+        default=None,
+        help="bounded retries for an ambiguous mutation (default: 3 attempts)",
+    )
+    reset_parser = sub.add_parser(
+        "errors-reset", help="reset the durable infrastructure-error guard"
+    )
+    reset_parser.add_argument("instance", help="instance name from the discovery labels")
+    reset_parser.add_argument(
+        "--expect-repo",
+        required=True,
+        help="Target Repository as owner/name; never taken from the instance itself",
+    )
+    reset_parser.add_argument(
+        "--request-id",
+        default=None,
+        help="durable request ID (generated when omitted)",
+    )
+    reset_parser.add_argument("--json", dest="json", action="store_true")
+    reset_parser.add_argument("--docker", dest="docker", default=None)
+    reset_parser.add_argument(
+        "--timeout",
+        dest="timeout",
+        type=float,
+        default=None,
+        help="consumer timeout in seconds (default: §3.3 class default, 15 s for mutations)",
+    )
+    reset_parser.add_argument(
+        "--max-attempts",
+        dest="max_attempts",
+        type=int,
+        default=None,
+        help="bounded retries for an ambiguous mutation (default: 3 attempts)",
+    )
     command_parser = sub.add_parser(
         "command", help="read one committed Operator Command by request ID"
     )
@@ -1032,6 +1182,72 @@ def main(argv: Sequence[str] | None = None) -> int:
             max_attempts=int(max_attempts) if isinstance(max_attempts, int) else None,
             capability="next-issue",
             argv_prefix=["next", "issue", str(args.issue)],
+        )
+    if args.operation == "handoff":
+        timeout = getattr(args, "timeout", None)
+        max_attempts = getattr(args, "max_attempts", None)
+        return _run_mutation(
+            docker,
+            str(args.instance),
+            "handoff",
+            str(args.expect_repo),
+            args.request_id if isinstance(args.request_id, str) else None,
+            use_json,
+            timeout=float(timeout) if isinstance(timeout, (int, float)) else None,
+            max_attempts=int(max_attempts) if isinstance(max_attempts, int) else None,
+            capability="operator-handoff",
+            argv_prefix=["handoff", "now"],
+        )
+    if args.operation == "recovery-retry":
+        timeout = getattr(args, "timeout", None)
+        max_attempts = getattr(args, "max_attempts", None)
+        return _run_mutation(
+            docker,
+            str(args.instance),
+            "recovery-retry",
+            str(args.expect_repo),
+            args.request_id if isinstance(args.request_id, str) else None,
+            use_json,
+            timeout=float(timeout) if isinstance(timeout, (int, float)) else None,
+            max_attempts=int(max_attempts) if isinstance(max_attempts, int) else None,
+            capability="recovery-retry",
+            argv_prefix=["recovery", "retry", str(args.attempt_id)],
+        )
+    if args.operation == "recovery-release":
+        timeout = getattr(args, "timeout", None)
+        max_attempts = getattr(args, "max_attempts", None)
+        return _run_mutation(
+            docker,
+            str(args.instance),
+            "recovery-release",
+            str(args.expect_repo),
+            args.request_id if isinstance(args.request_id, str) else None,
+            use_json,
+            timeout=float(timeout) if isinstance(timeout, (int, float)) else None,
+            max_attempts=int(max_attempts) if isinstance(max_attempts, int) else None,
+            capability="recovery-release",
+            argv_prefix=[
+                "recovery",
+                "release",
+                str(args.attempt_id),
+                "--saved-at",
+                str(args.saved_at),
+            ],
+        )
+    if args.operation == "errors-reset":
+        timeout = getattr(args, "timeout", None)
+        max_attempts = getattr(args, "max_attempts", None)
+        return _run_mutation(
+            docker,
+            str(args.instance),
+            "errors-reset",
+            str(args.expect_repo),
+            args.request_id if isinstance(args.request_id, str) else None,
+            use_json,
+            timeout=float(timeout) if isinstance(timeout, (int, float)) else None,
+            max_attempts=int(max_attempts) if isinstance(max_attempts, int) else None,
+            capability="errors-reset",
+            argv_prefix=["errors", "reset"],
         )
     if args.operation == "command":
         return _run_command(docker, str(args.instance), str(args.request_id), use_json)

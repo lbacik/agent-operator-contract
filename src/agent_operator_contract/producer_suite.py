@@ -3433,6 +3433,645 @@ def scenario_publication_pending_recovery(
     return ScenarioOutcome(scenario_id, "passed")
 
 
+def _submit_operation(
+    ctx: SuiteContext, scenario_id: str, argv: list[str]
+) -> tuple[dict[str, Any] | None, ScenarioOutcome | None]:
+    """Commit one arbitrary mutation and validate the mutation reply."""
+    answered = _exec(scenario_id, argv, ctx)
+    if isinstance(answered, ScenarioOutcome):
+        return None, answered
+    problems = _check_mutation(answered.stdout, answered.exit_code, replayed=False)
+    if problems:
+        return None, ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    return json.loads(answered.stdout)["result"]["command"], None
+
+
+def _expect_rejection(
+    ctx: SuiteContext, scenario_id: str, argv: list[str], code: str, request_id: str
+) -> ScenarioOutcome | None:
+    """Submit a mutation that must fail with ``code`` and store nothing."""
+    answered = _exec(scenario_id, argv, ctx)
+    if isinstance(answered, ScenarioOutcome):
+        return answered
+    problems = _check_error_request(answered.stdout, answered.exit_code, code, request_id)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    stored = _exec(scenario_id, ["--contract", "1", "command", request_id], ctx)
+    if isinstance(stored, ScenarioOutcome):
+        return stored
+    nothing = _check_error(stored.stdout, stored.exit_code, "not_found")
+    if nothing:
+        return ScenarioOutcome(scenario_id, "failed", f"rejected call stored {request_id}")
+    return None
+
+
+def scenario_handoff(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
+    """``handoff now`` completes the active Attempt and seals it as handoff."""
+    scenario_id = "handoff"
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return settled
+    idle_id = _new_request_id()
+    idle = _expect_rejection(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "handoff",
+            "now",
+            "--request-id",
+            idle_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        "rejected",
+        idle_id,
+    )
+    if idle is not None:
+        return idle
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 201, "eligible": True}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status for the claim")
+    current = snapshot.get("current_attempt")
+    if not isinstance(current, dict) or not isinstance(current.get("attempt_id"), str):
+        return ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim")
+    attempt_id = str(current["attempt_id"])
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 201, "eligible": False}
+    )
+    if outcome is not None:
+        return outcome
+    request_id = _new_request_id()
+    record, outcome = _submit_operation(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "handoff",
+            "now",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+    )
+    if outcome is not None or record is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "handoff committed nothing")
+    if record.get("kind") != "handoff" or record.get("acknowledgement") != "completed":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"handoff must complete at once, got {record.get('acknowledgement')!r}",
+        )
+    if record.get("arguments") != {}:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"handoff arguments must be empty, got {record.get('arguments')!r}",
+        )
+    replayed = _exec(
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "handoff",
+            "now",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        ctx,
+    )
+    if isinstance(replayed, ScenarioOutcome):
+        return replayed
+    problems = _check_mutation(replayed.stdout, replayed.exit_code, replayed=True)
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    if json.loads(replayed.stdout)["result"]["command"] != record:
+        return ScenarioOutcome(scenario_id, "failed", "the replay changed the stored record")
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status after handoff")
+    if snapshot["current_attempt"] is not None:
+        return ScenarioOutcome(scenario_id, "failed", "the handoff must clear the active attempt")
+    finished = snapshot["last_finished"]
+    if not isinstance(finished, dict) or finished.get("attempt_id") != attempt_id:
+        return ScenarioOutcome(
+            scenario_id, "failed", f"attempt {attempt_id} must reach its final lifecycle state"
+        )
+    outcome_doc = finished.get("outcome")
+    if not isinstance(outcome_doc, dict) or outcome_doc.get("native") != "handoff":
+        return ScenarioOutcome(
+            scenario_id, "failed", f"the handoff verdict must be handoff: {outcome_doc!r}"
+        )
+    if finished.get("sealed") is not True:
+        return ScenarioOutcome(scenario_id, "failed", "the handoff must seal its attempt")
+    stored, outcome = _read_command(ctx, scenario_id, request_id)
+    if outcome is not None or stored is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "handoff record is missing")
+    if stored.get("acknowledgement") != "completed":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"handoff must stay completed, got {stored.get('acknowledgement')!r}",
+        )
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_handoff_crash(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
+    """``handoff now`` in progress, crash: ``not_fulfilled``, partial work retained."""
+    scenario_id = "handoff-crash"
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return settled
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 202, "eligible": True}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status for the claim")
+    current = snapshot.get("current_attempt")
+    if not isinstance(current, dict) or not isinstance(current.get("attempt_id"), str):
+        return ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim")
+    attempt_id = str(current["attempt_id"])
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "crash", {"point": "during-finalization"})
+    if outcome is not None:
+        return outcome
+    request_id = _new_request_id()
+    record, outcome = _submit_operation(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "handoff",
+            "now",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+    )
+    if outcome is not None or record is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "handoff committed nothing")
+    if record.get("kind") != "handoff" or record.get("acknowledgement") != "not_fulfilled":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"an interrupted handoff must be not_fulfilled, got {record.get('acknowledgement')!r}",
+        )
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "stop-container", {})
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status after restart")
+    if snapshot["instance"]["state"] != "starting":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"expected starting after restart, got {snapshot['instance']['state']!r}",
+        )
+    stored, outcome = _read_command(ctx, scenario_id, request_id)
+    if outcome is not None or stored is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "handoff record is missing")
+    if stored.get("acknowledgement") != "not_fulfilled":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"handoff must stay not_fulfilled, got {stored.get('acknowledgement')!r}",
+        )
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status while recovering")
+    if snapshot["instance"]["state"] != "recovering":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"expected recovering after startup, got {snapshot['instance']['state']!r}",
+        )
+    current = snapshot.get("current_attempt")
+    if not isinstance(current, dict) or current.get("attempt_id") != attempt_id:
+        return ScenarioOutcome(
+            scenario_id, "failed", "recovery must retain the interrupted attempt"
+        )
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 202, "eligible": False}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status after recovery")
+    finished = snapshot["last_finished"]
+    if not isinstance(finished, dict) or finished.get("attempt_id") != attempt_id:
+        return ScenarioOutcome(scenario_id, "failed", "recovery must finalize the attempt")
+    stored, outcome = _read_command(ctx, scenario_id, request_id)
+    if outcome is not None or stored is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "handoff record is missing")
+    if stored.get("acknowledgement") != "not_fulfilled":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"recovery must not complete the handoff, got {stored.get('acknowledgement')!r}",
+        )
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_recovery_retry(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
+    """``recovery retry`` retries safe finalization without touching the verdict."""
+    scenario_id = "recovery-retry"
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return settled
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 203, "eligible": True}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status for the claim")
+    current = snapshot.get("current_attempt")
+    if not isinstance(current, dict) or not isinstance(current.get("attempt_id"), str):
+        return ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim")
+    attempt_id = str(current["attempt_id"])
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "finish-attempt", {"native_outcome": "complete"}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 203, "eligible": False}
+    )
+    if outcome is not None:
+        return outcome
+    request_id = _new_request_id()
+    record, outcome = _submit_operation(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "retry",
+            attempt_id,
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+    )
+    if outcome is not None or record is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "recovery retry committed nothing")
+    if record.get("kind") != "recovery_retry" or record.get("acknowledgement") != "completed":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"recovery retry must complete, got {record.get('acknowledgement')!r}",
+        )
+    if record.get("arguments") != {"attempt_id": attempt_id}:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"recovery retry arguments must name the attempt, got {record.get('arguments')!r}",
+        )
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status after the retry")
+    finished = snapshot["last_finished"]
+    if not isinstance(finished, dict) or finished.get("attempt_id") != attempt_id:
+        return ScenarioOutcome(scenario_id, "failed", "the retry must keep the finished attempt")
+    outcome_doc = finished.get("outcome")
+    if not isinstance(outcome_doc, dict) or outcome_doc.get("native") != "complete":
+        return ScenarioOutcome(
+            scenario_id, "failed", f"no command may change the recorded verdict: {outcome_doc!r}"
+        )
+    unknown_id = _new_request_id()
+    unknown = _expect_rejection(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "retry",
+            "no-such-attempt",
+            "--request-id",
+            unknown_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        "not_found",
+        unknown_id,
+    )
+    if unknown is not None:
+        return unknown
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_recovery_release(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
+    """``recovery release`` records ``--saved-at``, releases and finalizes."""
+    scenario_id = "recovery-release"
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return settled
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 204, "eligible": True}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status for the claim")
+    current = snapshot.get("current_attempt")
+    if not isinstance(current, dict) or not isinstance(current.get("attempt_id"), str):
+        return ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim")
+    active_id = str(current["attempt_id"])
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 204, "eligible": False}
+    )
+    if outcome is not None:
+        return outcome
+    request_id = _new_request_id()
+    record, outcome = _submit_operation(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "release",
+            active_id,
+            "--saved-at",
+            "shelf-204",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+    )
+    if outcome is not None or record is None:
+        return outcome or ScenarioOutcome(
+            scenario_id, "failed", "recovery release committed nothing"
+        )
+    if record.get("kind") != "recovery_release" or record.get("acknowledgement") != "completed":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"recovery release must complete, got {record.get('acknowledgement')!r}",
+        )
+    if record.get("arguments") != {"attempt_id": active_id, "saved_at": "shelf-204"}:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"recovery release arguments must echo the attempt and location, "
+            f"got {record.get('arguments')!r}",
+        )
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status after the release")
+    if snapshot["current_attempt"] is not None:
+        return ScenarioOutcome(scenario_id, "failed", "the release must clear the active attempt")
+    finished = snapshot["last_finished"]
+    if not isinstance(finished, dict) or finished.get("attempt_id") != active_id:
+        return ScenarioOutcome(scenario_id, "failed", "the release must finalize the attempt")
+    if finished.get("lifecycle_state") != "released":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"the released attempt must be released, got {finished.get('lifecycle_state')!r}",
+        )
+    if finished.get("sealed") is not True:
+        return ScenarioOutcome(scenario_id, "failed", "the release must seal its attempt")
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 205, "eligible": True}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status for the next claim")
+    if snapshot.get("current_attempt") is None:
+        return ScenarioOutcome(scenario_id, "failed", "a second eligible issue must open a claim")
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "finish-attempt", {"native_outcome": "complete"}
+    )
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status after finishing")
+    finished = snapshot["last_finished"]
+    if not isinstance(finished, dict) or not isinstance(finished.get("attempt_id"), str):
+        return ScenarioOutcome(scenario_id, "failed", "no finished attempt to release")
+    finished_id = str(finished["attempt_id"])
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 205, "eligible": False}
+    )
+    if outcome is not None:
+        return outcome
+    second_id = _new_request_id()
+    second, outcome = _submit_operation(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "release",
+            finished_id,
+            "--saved-at",
+            "shelf-205",
+            "--request-id",
+            second_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+    )
+    if outcome is not None or second is None:
+        return outcome or ScenarioOutcome(
+            scenario_id, "failed", "recovery release committed nothing"
+        )
+    if second.get("acknowledgement") != "completed":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"recovery release must complete, got {second.get('acknowledgement')!r}",
+        )
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status after the release")
+    finished = snapshot["last_finished"]
+    if not isinstance(finished, dict) or finished.get("attempt_id") != finished_id:
+        return ScenarioOutcome(scenario_id, "failed", "the release must keep the finished attempt")
+    if finished.get("lifecycle_state") != "released":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"the released attempt must be released, got {finished.get('lifecycle_state')!r}",
+        )
+    outcome_doc = finished.get("outcome")
+    if not isinstance(outcome_doc, dict) or outcome_doc.get("native") != "complete":
+        return ScenarioOutcome(
+            scenario_id, "failed", f"no command may change the recorded verdict: {outcome_doc!r}"
+        )
+    unknown_id = _new_request_id()
+    unknown = _expect_rejection(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "release",
+            "no-such-attempt",
+            "--saved-at",
+            "shelf-999",
+            "--request-id",
+            unknown_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        "not_found",
+        unknown_id,
+    )
+    if unknown is not None:
+        return unknown
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_errors_reset(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
+    """``errors reset`` resets the durable infrastructure-error guard."""
+    scenario_id = "errors-reset"
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return settled
+    clear_id = _new_request_id()
+    clear = _expect_rejection(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "errors",
+            "reset",
+            "--request-id",
+            clear_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        "rejected",
+        clear_id,
+    )
+    if clear is not None:
+        return clear
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 206, "eligible": True}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status for the claim")
+    if snapshot.get("current_attempt") is None:
+        return ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim")
+    _, outcome = _harness(
+        ctx,
+        harness_cmd,
+        scenario_id,
+        "finish-attempt",
+        {"native_outcome": "infrastructure_error", "reason": "boom"},
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 206, "eligible": False}
+    )
+    if outcome is not None:
+        return outcome
+    request_id = _new_request_id()
+    record, outcome = _submit_operation(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "errors",
+            "reset",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+    )
+    if outcome is not None or record is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "errors reset committed nothing")
+    if record.get("kind") != "errors_reset" or record.get("acknowledgement") != "completed":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"errors reset must complete, got {record.get('acknowledgement')!r}",
+        )
+    spent_id = _new_request_id()
+    spent = _expect_rejection(
+        ctx,
+        scenario_id,
+        [
+            "--contract",
+            "1",
+            "errors",
+            "reset",
+            "--request-id",
+            spent_id,
+            "--expect-repo",
+            ctx.repository,
+        ],
+        "rejected",
+        spent_id,
+    )
+    if spent is not None:
+        return spent
+    return ScenarioOutcome(scenario_id, "passed")
+
+
 SCENARIOS: tuple[Scenario, ...] = (
     Scenario("identity", "online identity matches the harness setup"),
     Scenario("status", "online status validates and matches the harness setup"),
@@ -3523,6 +4162,26 @@ SCENARIOS: tuple[Scenario, ...] = (
         "a pending publication recovers before new claims; the verdict sticks",
     ),
     Scenario(
+        "handoff",
+        "handoff now completes the active attempt and seals it as handoff",
+    ),
+    Scenario(
+        "handoff-crash",
+        "handoff now in progress, crash: not_fulfilled, partial work retained",
+    ),
+    Scenario(
+        "recovery-retry",
+        "recovery retry retries safe finalization without touching the verdict",
+    ),
+    Scenario(
+        "recovery-release",
+        "recovery release records --saved-at, releases the issue and finalizes",
+    ),
+    Scenario(
+        "errors-reset",
+        "errors reset resets the durable infrastructure-error guard",
+    ),
+    Scenario(
         "offline-reads",
         "offline read of a stopped instance serves every read and refuses mutations",
     ),
@@ -3576,6 +4235,11 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_export_torn_read(ctx, harness_cmd),
         scenario_halt_records_last_halt(ctx, harness_cmd),
         scenario_publication_pending_recovery(ctx, harness_cmd),
+        scenario_handoff(ctx, harness_cmd),
+        scenario_handoff_crash(ctx, harness_cmd),
+        scenario_recovery_retry(ctx, harness_cmd),
+        scenario_recovery_release(ctx, harness_cmd),
+        scenario_errors_reset(ctx, harness_cmd),
         scenario_offline_reads(ctx, harness_cmd),
         scenario_offline_while_running(ctx, harness_cmd),
     ]

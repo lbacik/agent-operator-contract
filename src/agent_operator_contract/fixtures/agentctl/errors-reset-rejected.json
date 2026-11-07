@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "errors",
+    "reset",
+    "--request-id",
+    "req-02b2c3d4e5f6",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 1,
+  "stderr": "",
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"rejected\",\"message\":\"the infrastructure-error guard is already clear\",\"request_id\":\"req-02b2c3d4e5f6\",\"retryable\":false},\"ok\":false}\n"
+}

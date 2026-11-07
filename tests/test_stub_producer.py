@@ -1968,3 +1968,331 @@ def test_harness_hold_lock_holds_the_engine_lock(tmp_path: Path) -> None:
     doc = json.loads(replies[0].stdout)
     assert documents.validate_harness_reply(doc) == []
     assert doc["result"]["held_ms"] >= 2000
+
+
+FULL_OPERATOR_CAPABILITIES = (
+    "next-issue,stop-after,operator-handoff,recovery-retry,recovery-release,errors-reset"
+)
+
+
+def _full_env(tmp_path: Path) -> dict[str, str]:
+    """A durable stub env advertising every optional mutation capability."""
+    env = _durable_env(tmp_path)
+    env["CONTRACT_CAPABILITIES"] = FULL_OPERATOR_CAPABILITIES
+    return env
+
+
+def _handoff(request_id: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "handoff",
+            "now",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+
+
+def _recovery_retry(
+    attempt_id: str, request_id: str, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "retry",
+            attempt_id,
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+
+
+def _recovery_release(
+    attempt_id: str, saved_at: str, request_id: str, env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
+    return _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "recovery",
+            "release",
+            attempt_id,
+            "--saved-at",
+            saved_at,
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+
+
+def _errors_reset(request_id: str, env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    return _run_agentctl(
+        [
+            "--contract",
+            "1",
+            "errors",
+            "reset",
+            "--request-id",
+            request_id,
+            "--expect-repo",
+            "example-owner/example-repo",
+        ],
+        env,
+    )
+
+
+def test_stub_handoff_completes_and_seals_the_active_attempt(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+    _set_issue(env, 301, True)
+    claimed = _status(env)
+    assert isinstance(claimed["current_attempt"], dict)
+    attempt_id = claimed["current_attempt"]["attempt_id"]
+    _set_issue(env, 301, False)
+
+    completed = _handoff("req-000000000101", env)
+
+    assert completed.returncode == 0
+    doc = json.loads(completed.stdout)
+    assert documents.validate_envelope(doc) == []
+    assert documents.validate_mutation_result(doc["result"]) == []
+    record = doc["result"]["command"]
+    assert record["kind"] == "handoff"
+    assert record["acknowledgement"] == "completed"
+    assert doc["result"]["replayed"] is False
+
+    snapshot = _status(env)
+    assert snapshot["current_attempt"] is None
+    finished = snapshot["last_finished"]
+    assert isinstance(finished, dict)
+    assert finished["attempt_id"] == attempt_id
+    assert finished["sealed"] is True
+
+
+def test_stub_handoff_without_an_active_attempt_is_rejected(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+
+    refused = _handoff("req-000000000102", env)
+
+    assert refused.returncode == 1
+    assert json.loads(refused.stdout)["error"]["code"] == "rejected"
+    assert _command("req-000000000102", env).returncode == 5
+
+
+def test_stub_handoff_identical_resend_replays(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+    _set_issue(env, 302, True)
+    assert isinstance(_status(env)["current_attempt"], dict)
+
+    first = _handoff("req-000000000103", env)
+    second = _handoff("req-000000000103", env)
+
+    assert first.returncode == 0
+    assert second.returncode == 0
+    replayed = json.loads(second.stdout)
+    assert replayed["result"]["replayed"] is True
+    assert replayed["result"]["command"] == json.loads(first.stdout)["result"]["command"]
+
+
+def test_stub_handoff_during_finalization_crash_retains_partial_work(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+    _set_issue(env, 303, True)
+    claimed = _status(env)
+    assert isinstance(claimed["current_attempt"], dict)
+    attempt_id = claimed["current_attempt"]["attempt_id"]
+    _patch_state(env, "doc['crash_armed'] = {'point': 'during-finalization'}")
+
+    crashed = _handoff("req-000000000104", env)
+
+    assert crashed.returncode == 0
+    record = json.loads(crashed.stdout)["result"]["command"]
+    assert record["acknowledgement"] == "not_fulfilled"
+
+    dead = _run_agentctl(["--contract", "1", "status"], env)
+    assert dead.returncode == 6
+    assert json.loads(dead.stdout)["error"]["code"] == "agent_unreachable"
+
+    _patch_state(env, "doc['engine_alive'] = True")
+    stored = _command("req-000000000104", env)
+    assert json.loads(stored.stdout)["result"]["command"]["acknowledgement"] == "not_fulfilled"
+    recovering = _status(env)
+    assert recovering["instance"]["state"] == "recovering"  # type: ignore[index]
+    assert isinstance(recovering["current_attempt"], dict)
+    assert recovering["current_attempt"]["attempt_id"] == attempt_id
+
+
+def test_stub_handoff_unsupported_without_capability(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+
+    completed = _handoff("req-000000000105", env)
+
+    assert completed.returncode == 3
+    assert json.loads(completed.stdout)["error"]["code"] == "unsupported"
+
+
+def test_stub_recovery_retry_completes_without_touching_the_attempt(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+    _set_issue(env, 304, True)
+    claimed = _status(env)
+    assert isinstance(claimed["current_attempt"], dict)
+    attempt_id: str = claimed["current_attempt"]["attempt_id"]
+
+    completed = _recovery_retry(attempt_id, "req-000000000106", env)
+
+    assert completed.returncode == 0
+    record = json.loads(completed.stdout)["result"]["command"]
+    assert record["kind"] == "recovery_retry"
+    assert record["acknowledgement"] == "completed"
+    assert record["arguments"] == {"attempt_id": attempt_id}
+
+    snapshot = _status(env)
+    assert isinstance(snapshot["current_attempt"], dict)
+    assert snapshot["current_attempt"]["attempt_id"] == attempt_id
+    assert snapshot["last_finished"] is None
+
+
+def test_stub_recovery_retry_keeps_the_recorded_verdict(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+    _set_issue(env, 305, True)
+    assert isinstance(_status(env)["current_attempt"], dict)
+    assert _handoff("req-000000000107", env).returncode == 0
+    finished_id: str = _status(env)["last_finished"]["attempt_id"]  # type: ignore[index]
+
+    completed = _recovery_retry(finished_id, "req-000000000108", env)
+
+    assert completed.returncode == 0
+    assert json.loads(completed.stdout)["result"]["command"]["acknowledgement"] == "completed"
+    snapshot = _status(env)
+    assert snapshot["last_finished"]["attempt_id"] == finished_id  # type: ignore[index]
+    assert snapshot["last_finished"]["outcome"]["native"] == "handoff"  # type: ignore[index]
+
+
+def test_stub_recovery_retry_unknown_attempt_is_not_found(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+
+    missing = _recovery_retry("no-such-attempt", "req-000000000109", env)
+
+    assert missing.returncode == 5
+    assert json.loads(missing.stdout)["error"]["code"] == "not_found"
+    assert _command("req-000000000109", env).returncode == 5
+
+
+def test_stub_recovery_retry_unsupported_without_capability(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+
+    completed = _recovery_retry("stub-1", "req-000000000110", env)
+
+    assert completed.returncode == 3
+    assert json.loads(completed.stdout)["error"]["code"] == "unsupported"
+
+
+def test_stub_recovery_release_active_finalizes_released(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+    _set_issue(env, 306, True)
+    claimed = _status(env)
+    assert isinstance(claimed["current_attempt"], dict)
+    attempt_id: str = claimed["current_attempt"]["attempt_id"]
+    _set_issue(env, 306, False)
+
+    completed = _recovery_release(attempt_id, "shelf-306", "req-000000000111", env)
+
+    assert completed.returncode == 0
+    record = json.loads(completed.stdout)["result"]["command"]
+    assert record["kind"] == "recovery_release"
+    assert record["acknowledgement"] == "completed"
+    assert record["arguments"] == {"attempt_id": attempt_id, "saved_at": "shelf-306"}
+
+    snapshot = _status(env)
+    assert snapshot["current_attempt"] is None
+    finished = snapshot["last_finished"]
+    assert isinstance(finished, dict)
+    assert finished["attempt_id"] == attempt_id
+    assert finished["lifecycle_state"] == "released"
+    assert finished["sealed"] is True
+
+
+def test_stub_recovery_release_finished_keeps_the_verdict(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+    _set_issue(env, 307, True)
+    assert isinstance(_status(env)["current_attempt"], dict)
+    assert _handoff("req-000000000112", env).returncode == 0
+    finished_id: str = _status(env)["last_finished"]["attempt_id"]  # type: ignore[index]
+
+    completed = _recovery_release(finished_id, "shelf-307", "req-000000000113", env)
+
+    assert completed.returncode == 0
+    snapshot = _status(env)
+    finished = snapshot["last_finished"]
+    assert isinstance(finished, dict)
+    assert finished["attempt_id"] == finished_id
+    assert finished["lifecycle_state"] == "released"
+    assert finished["outcome"]["native"] == "handoff"
+
+
+def test_stub_recovery_release_unknown_attempt_is_not_found(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+
+    missing = _recovery_release("no-such-attempt", "shelf-999", "req-000000000114", env)
+
+    assert missing.returncode == 5
+    assert json.loads(missing.stdout)["error"]["code"] == "not_found"
+
+
+def test_stub_recovery_release_unsupported_without_capability(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+
+    completed = _recovery_release("stub-1", "shelf-1", "req-000000000115", env)
+
+    assert completed.returncode == 3
+    assert json.loads(completed.stdout)["error"]["code"] == "unsupported"
+
+
+def test_stub_errors_reset_rejects_when_guard_is_clear(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+
+    refused = _errors_reset("req-000000000116", env)
+
+    assert refused.returncode == 1
+    assert json.loads(refused.stdout)["error"]["code"] == "rejected"
+    assert _command("req-000000000116", env).returncode == 5
+
+
+def test_stub_errors_reset_completes_and_rejects_again(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+    _patch_state(env, "doc['error_guard'] = True")
+
+    completed = _errors_reset("req-000000000117", env)
+
+    assert completed.returncode == 0
+    record = json.loads(completed.stdout)["result"]["command"]
+    assert record["kind"] == "errors_reset"
+    assert record["acknowledgement"] == "completed"
+
+    replayed = _errors_reset("req-000000000117", env)
+    assert replayed.returncode == 0
+    assert json.loads(replayed.stdout)["result"]["replayed"] is True
+
+    again = _errors_reset("req-000000000118", env)
+    assert again.returncode == 1
+    assert json.loads(again.stdout)["error"]["code"] == "rejected"
+
+
+def test_stub_errors_reset_unsupported_without_capability(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+
+    completed = _errors_reset("req-000000000119", env)
+
+    assert completed.returncode == 3
+    assert json.loads(completed.stdout)["error"]["code"] == "unsupported"

@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "handoff",
+    "now",
+    "--request-id",
+    "req-a1b2c3d4e5f6",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 0,
+  "stderr": "",
+  "stdout": "{\"contract\":\"1.0\",\"ok\":true,\"result\":{\"command\":{\"acknowledgement\":\"completed\",\"arguments\":{},\"created_at\":\"2026-11-06T09:12:03Z\",\"detail\":\"handoff completed; publication, issue release and cleanup finished\",\"kind\":\"handoff\",\"repository\":\"example-owner/example-repo\",\"request_id\":\"req-a1b2c3d4e5f6\",\"sequence\":1,\"updated_at\":\"2026-11-06T09:12:03Z\"},\"replayed\":false}}\n"
+}
