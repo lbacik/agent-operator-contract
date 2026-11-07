@@ -53,6 +53,9 @@ FLEET: dict[str, Any] = {
             "contract": "1",
             "exec_user": "agent",
             "state": "exited",
+            "image": "sha256:offline-image-web-2",
+            "volumes": [{"name": "stub-data", "path": "/data"}],
+            "binds": [{"source": "/host/cfg", "path": "/cfg"}],
         },
         {
             "id": "c" * 64,
@@ -268,6 +271,18 @@ def _exec_argvs(recorded: list[dict[str, Any]]) -> list[list[str]]:
     ]
 
 
+def _run_argvs(recorded: list[dict[str, Any]]) -> list[list[str]]:
+    """The full docker argv of every recorded Offline Read ``run``."""
+    return [entry["argv"] for entry in recorded if entry["argv"][0] == "run"]
+
+
+def _agentctl_argvs_of_run(run_argv: list[str]) -> list[str]:
+    """The agentctl args of one recorded ``run`` (everything after the image)."""
+    entrypoint = run_argv.index("--entrypoint")
+    assert run_argv[entrypoint + 1] == "/usr/local/bin/agentctl"
+    return run_argv[entrypoint + 3 :]
+
+
 def _status_env(
     consumer_env: dict[str, Any],
     tmp_path: Path,
@@ -353,6 +368,155 @@ def test_status_human_output_for_idle_shows_no_attempt(
     out = completed.stdout.decode("utf-8")
     assert "instance: idle" in out
     assert "current_attempt: none" in out
+
+
+def test_status_stopped_reads_offline_with_readonly_mounts(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stopped instance is read through ``docker run``, never ``exec``.
+
+    The Offline Read re-runs the stopped container's image with every volume
+    and bind mount re-mounted read-only at the same destination, ``--network
+    none``, the exec user, and ``--rm`` (spec section 3.2).
+    """
+    env = _status_env(consumer_env, tmp_path, monkeypatch, "offline-status-halted")
+    fixture = json.loads((FIXTURES_DIR / "offline-status-halted.json").read_text(encoding="utf-8"))
+    completed = _run_agentfleet(["status", "web-2", "--json"], env)
+
+    assert completed.returncode == fixture["exit_code"]
+    assert completed.stdout.decode("utf-8") == fixture["stdout"]
+    recorded = _recorded(consumer_env)
+    assert not any(entry["argv"][0] == "exec" for entry in recorded)
+    runs = _run_argvs(recorded)
+    assert len(runs) == 1
+    assert runs[0] == [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--user",
+        "agent",
+        "--mount",
+        "type=volume,src=stub-data,dst=/data,readonly",
+        "--mount",
+        "type=bind,src=/host/cfg,dst=/cfg,readonly",
+        "--entrypoint",
+        "/usr/local/bin/agentctl",
+        "sha256:offline-image-web-2",
+        "--contract",
+        "1",
+        "--offline",
+        "status",
+    ]
+
+
+def test_stop_stopped_is_refused_client_side_with_no_agentctl(
+    consumer_env: dict[str, Any],
+) -> None:
+    """A mutation on a stopped instance is refused before anything is sent.
+
+    ``agentfleet stop <stopped>`` exits with ``client.instance_stopped`` and
+    the fake records no ``agentctl`` invocation at all (neither ``exec`` nor
+    an Offline Read ``run``); only discovery (``ps``/``inspect``) runs.
+    """
+    env: dict[str, str] = consumer_env["env"]
+    completed = _run_agentfleet(
+        ["stop", "web-2", "--expect-repo", "example-owner/example-repo", "--json"], env
+    )
+
+    table = documents.client_table()
+    assert completed.returncode == int(table["client.instance_stopped"]["exit_code"])
+    doc = json.loads(completed.stdout.decode("utf-8"))
+    assert documents.validate_client_envelope(doc) == []
+    assert CLIENT_ENVELOPE_VALIDATOR.is_valid(doc)
+    assert doc["error"]["code"] == "client.instance_stopped"
+    recorded = _recorded(consumer_env)
+    assert _exec_argvs(recorded) == []
+    assert _run_argvs(recorded) == []
+    assert all(entry["argv"][0] in ("ps", "inspect") for entry in recorded)
+
+
+def test_offline_read_of_running_container_is_refused(
+    consumer_env: dict[str, Any],
+) -> None:
+    """Building an Offline Read target for a running container fails client-side."""
+    fleet = client.discover(str(FAKE_DOCKER))
+    instance = client.resolve(fleet, "web-1")
+
+    with pytest.raises(client.InstanceRunningError) as exc_info:
+        client.inspect_offline_target(str(FAKE_DOCKER), instance)
+
+    assert exc_info.value.code == "client.instance_running"
+
+
+def test_status_paused_is_refused_with_no_run(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A paused container still has a live engine, so no Offline Read runs.
+
+    ``docker ps`` reports paused containers as up, and the engine owns the
+    volume while paused; ``agentfleet status <paused>`` exits with
+    ``client.instance_running`` and records neither ``exec`` nor ``run``.
+    """
+    fleet = {
+        "containers": [
+            {
+                "id": "f" * 64,
+                "name": "paused-1",
+                "backend": "coding-agent",
+                "contract": "1",
+                "exec_user": "agent",
+                "state": "paused",
+            }
+        ]
+    }
+    fleet_file = tmp_path / "paused-fleet.json"
+    fleet_file.write_text(json.dumps(fleet), encoding="utf-8")
+    monkeypatch.setenv("FAKE_DOCKER_FLEET", str(fleet_file))
+    env = {**consumer_env["env"], "FAKE_DOCKER_FLEET": str(fleet_file)}
+    completed = _run_agentfleet(["status", "paused-1", "--json"], env)
+
+    table = documents.client_table()
+    assert completed.returncode == int(table["client.instance_running"]["exit_code"])
+    doc = json.loads(completed.stdout.decode("utf-8"))
+    assert documents.validate_client_envelope(doc) == []
+    assert doc["error"]["code"] == "client.instance_running"
+    recorded = _recorded(consumer_env)
+    assert _exec_argvs(recorded) == []
+    assert _run_argvs(recorded) == []
+    assert all(entry["argv"][0] in ("ps", "inspect") for entry in recorded)
+
+
+def test_offline_docker_argv_mounts_everything_read_only() -> None:
+    """The Offline Read argv pins the spec section 3.2 shape exactly."""
+    target = client.OfflineTarget(
+        image="sha256:abc",
+        mounts=(
+            client.VolumeMount("volume", "stub-data", "/data"),
+            client.VolumeMount("bind", "/host/cfg", "/cfg"),
+        ),
+        exec_user="agent",
+    )
+
+    assert client.offline_docker_argv(target, ["status"]) == [
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--user",
+        "agent",
+        "--mount",
+        "type=volume,src=stub-data,dst=/data,readonly",
+        "--mount",
+        "type=bind,src=/host/cfg,dst=/cfg,readonly",
+        "--entrypoint",
+        "/usr/local/bin/agentctl",
+        "sha256:abc",
+        "--contract",
+        "1",
+        "--offline",
+        "status",
+    ]
 
 
 @pytest.mark.parametrize("name", STATUS_FIXTURES)

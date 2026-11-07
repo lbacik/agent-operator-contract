@@ -99,6 +99,8 @@ class SuiteContext:
     capabilities: list[str]
     docker: str = "docker"
     timeout: float = 30.0
+    image: str = ""
+    volumes: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -186,6 +188,58 @@ def _popen_export(
     """Start ``agentctl attempts export`` streaming; the caller times first bytes."""
     return subprocess.Popen(
         [docker, "exec", "--user", exec_user, container, AGENTCTL, *agentctl_argv],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def _docker_run_argv(ctx: SuiteContext, agentctl_argv: list[str]) -> list[str]:
+    """Build the ``docker run`` argv for one Offline Read (spec section 3.2).
+
+    The stopped container's image runs removed (``--rm``) with no network,
+    every volume re-mounted read-only at the same destination, and
+    ``agentctl`` as the entrypoint. The caller supplies the full agentctl
+    argv including ``--contract 1 --offline``.
+    """
+    argv: list[str] = [
+        ctx.docker,
+        "run",
+        "--rm",
+        "--network",
+        "none",
+        "--user",
+        ctx.exec_user,
+    ]
+    for volume in ctx.volumes:
+        name = volume.get("name")
+        path = volume.get("path")
+        if isinstance(name, str) and name and isinstance(path, str) and path:
+            argv += [
+                "--mount",
+                f"type=volume,src={name},dst={path},readonly",
+            ]
+    argv += ["--entrypoint", AGENTCTL, ctx.image, *agentctl_argv]
+    return argv
+
+
+def _docker_run(
+    ctx: SuiteContext, agentctl_argv: list[str], timeout: float | None = None
+) -> DockerResult:
+    """Run one Offline Read through ``docker run`` (spec section 3.2)."""
+    argv = _docker_run_argv(ctx, agentctl_argv)
+    completed = subprocess.run(
+        argv,
+        capture_output=True,
+        text=True,
+        timeout=ctx.timeout if timeout is None else timeout,
+    )
+    return DockerResult(completed.returncode, completed.stdout, completed.stderr)
+
+
+def _popen_run(ctx: SuiteContext, agentctl_argv: list[str]) -> subprocess.Popen[bytes]:
+    """Start one offline ``attempts export`` streaming through ``docker run``."""
+    return subprocess.Popen(
+        _docker_run_argv(ctx, agentctl_argv),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
@@ -368,6 +422,80 @@ def _check_status(stdout: str, exit_code: int, ctx: SuiteContext) -> list[str]:
         mismatches.append(f"capabilities {capabilities!r} are not sorted")
     elif capabilities != sorted(ctx.capabilities):
         mismatches.append(f"capabilities {capabilities!r} != {sorted(ctx.capabilities)!r}")
+    return mismatches
+
+
+def _check_offline_identity(stdout: str, exit_code: int, ctx: SuiteContext) -> list[str]:
+    """Check an offline ``identity`` reply: envelope, offline mode, harness setup."""
+    problems = _producer_problems(stdout, exit_code)
+    if problems:
+        return problems
+    doc = json.loads(stdout)
+    if doc.get("ok") is not True:
+        return [f"identity answered ok:false: {stdout.strip()}"]
+    identity = doc.get("result")
+    if not isinstance(identity, dict):
+        return ["identity result must be an object"]
+    problems = documents.validate_identity(identity)
+    if problems:
+        return problems
+    mismatches = []
+    if identity.get("repository") != ctx.repository:
+        mismatches.append(f"repository {identity.get('repository')!r} != {ctx.repository!r}")
+    if identity.get("mode") != "offline":
+        mismatches.append(f"mode {identity.get('mode')!r} != 'offline'")
+    if identity.get("process_started_at") is not None:
+        mismatches.append("process_started_at must be null offline")
+    contract = identity.get("contract")
+    if not isinstance(contract, dict) or contract.get("major") != CONTRACT_MAJOR:
+        mismatches.append(f"contract {contract!r} is not major {CONTRACT_MAJOR}")
+    capabilities = identity.get("capabilities")
+    if not isinstance(capabilities, list) or capabilities != sorted(capabilities):
+        mismatches.append(f"capabilities {capabilities!r} are not sorted")
+    elif capabilities != sorted(ctx.capabilities):
+        mismatches.append(f"capabilities {capabilities!r} != {sorted(ctx.capabilities)!r}")
+    return mismatches
+
+
+def _check_offline_status(stdout: str, exit_code: int, ctx: SuiteContext) -> list[str]:
+    """Check an offline ``status`` reply: stopped instance, offline identity."""
+    problems = _producer_problems(stdout, exit_code)
+    if problems:
+        return problems
+    doc = json.loads(stdout)
+    if doc.get("ok") is not True:
+        return [f"status answered ok:false: {stdout.strip()}"]
+    snapshot = doc.get("result")
+    if not isinstance(snapshot, dict):
+        return ["status result must be an object"]
+    problems = documents.validate_status(snapshot)
+    if problems:
+        return problems
+    mismatches = []
+    identity = snapshot.get("identity")
+    if not isinstance(identity, dict):
+        return ["status identity must be an object"]
+    if identity.get("repository") != ctx.repository:
+        mismatches.append(f"repository {identity.get('repository')!r} != {ctx.repository!r}")
+    if identity.get("mode") != "offline":
+        mismatches.append(f"mode {identity.get('mode')!r} != 'offline'")
+    if identity.get("process_started_at") is not None:
+        mismatches.append("process_started_at must be null offline")
+    contract = identity.get("contract")
+    if not isinstance(contract, dict) or contract.get("major") != CONTRACT_MAJOR:
+        mismatches.append(f"contract {contract!r} is not major {CONTRACT_MAJOR}")
+    capabilities = identity.get("capabilities")
+    if not isinstance(capabilities, list) or capabilities != sorted(capabilities):
+        mismatches.append(f"capabilities {capabilities!r} are not sorted")
+    elif capabilities != sorted(ctx.capabilities):
+        mismatches.append(f"capabilities {capabilities!r} != {sorted(ctx.capabilities)!r}")
+    instance = snapshot.get("instance")
+    if not isinstance(instance, dict):
+        return [*mismatches, "status instance must be an object"]
+    if instance.get("state") != "stopped":
+        mismatches.append(f"instance state {instance.get('state')!r} != 'stopped'")
+    if snapshot.get("current_attempt") is not None:
+        mismatches.append("offline status must carry no current_attempt")
     return mismatches
 
 
@@ -1358,6 +1486,29 @@ def _drain_export(
         argv += ["--path", path]
     try:
         proc = _popen_export(ctx.docker, ctx.container, ctx.exec_user, argv)
+    except OSError as exc:
+        return None, ScenarioOutcome(scenario_id, "failed", f"export did not start: {exc}")
+    try:
+        data, _ = proc.communicate(timeout=ctx.timeout)
+    except subprocess.TimeoutExpired:
+        _stop_export(proc)
+        return None, ScenarioOutcome(scenario_id, "failed", "export did not finish")
+    if proc.returncode != 0:
+        return None, ScenarioOutcome(scenario_id, "failed", f"export exited {proc.returncode}")
+    return data, None
+
+
+def _drain_export_offline(
+    ctx: SuiteContext, scenario_id: str, attempt_id: str, paths: Sequence[str] = ()
+) -> tuple[bytes | None, ScenarioOutcome | None]:
+    """Drain one offline ``attempts export`` tar through ``docker run``."""
+    argv = ["--contract", "1", "--offline", "attempts", "export", attempt_id]
+    for path in paths:
+        argv += ["--path", path]
+    if not ctx.image:
+        return None, ScenarioOutcome(scenario_id, "failed", "no image for the offline read")
+    try:
+        proc = _popen_run(ctx, argv)
     except OSError as exc:
         return None, ScenarioOutcome(scenario_id, "failed", f"export did not start: {exc}")
     try:
@@ -2839,6 +2990,43 @@ def scenario_halt_records_last_halt(
     ]
     if not halted or halted[-1].get("reason") != "stub-halt-test":
         return ScenarioOutcome(scenario_id, "failed", "a halted event must be recorded")
+    if ctx.image:
+        _, outcome = _harness(ctx, harness_cmd, scenario_id, "stop-container", {})
+        if outcome is not None:
+            return outcome
+        answered = _exec_offline(ctx, scenario_id, ["--contract", "1", "--offline", "status"])
+        if isinstance(answered, ScenarioOutcome):
+            _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+            if restart_outcome is not None:
+                return restart_outcome
+            return answered
+        problems = _check_offline_status(answered.stdout, answered.exit_code, ctx)
+        if problems:
+            _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+            if restart_outcome is not None:
+                return restart_outcome
+            return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+        try:
+            offline_snapshot = json.loads(answered.stdout)["result"]
+        except ValueError:
+            _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+            if restart_outcome is not None:
+                return restart_outcome
+            return ScenarioOutcome(scenario_id, "failed", "offline status is not valid JSON")
+        offline_halt = offline_snapshot["instance"]["last_halt"]
+        if not isinstance(offline_halt, dict) or offline_halt.get("reason") != "stub-halt-test":
+            _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+            if restart_outcome is not None:
+                return restart_outcome
+            return ScenarioOutcome(
+                scenario_id, "failed", f"offline read must report last_halt, got {offline_halt!r}"
+            )
+        _, outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if outcome is not None:
+            return outcome
+        _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+        if outcome is not None:
+            return outcome
     _, outcome = _harness(
         ctx, harness_cmd, scenario_id, "set-issue", {"issue": 105, "eligible": False}
     )
@@ -2847,6 +3035,296 @@ def scenario_halt_records_last_halt(
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def _exec_offline(
+    ctx: SuiteContext, scenario_id: str, agentctl_argv: list[str]
+) -> DockerResult | ScenarioOutcome:
+    """Run one Offline Read through ``docker run``; transport failure is an outcome."""
+    if not ctx.image:
+        return ScenarioOutcome(scenario_id, "failed", "no image for the offline read")
+    try:
+        return _docker_run(ctx, agentctl_argv)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return ScenarioOutcome(scenario_id, "failed", f"docker run failed: {exc}")
+
+
+def _offline_unsupported_checks(
+    ctx: SuiteContext, scenario_id: str
+) -> tuple[ScenarioOutcome | None, list[str]]:
+    """Check every mutation answers ``unsupported`` offline; return their IDs.
+
+    Storage is checked after the restart (``docker exec`` cannot reach a
+    stopped container), so the caller verifies each returned request ID is
+    still ``not_found`` online.
+    """
+    mutations: list[list[str]] = [
+        ["stop"],
+        ["resume"],
+        ["stop", "--after", "2"],
+        ["next", "issue", "7"],
+        ["handoff", "now"],
+        ["recovery", "retry", "attempt-1"],
+        ["recovery", "release", "attempt-1", "--saved-at", "somewhere"],
+        ["errors", "reset"],
+    ]
+    request_ids: list[str] = []
+    for operation in mutations:
+        request_id = _new_request_id()
+        argv = ["--contract", "1", "--offline", *operation]
+        argv += ["--request-id", request_id, "--expect-repo", ctx.repository]
+        answered = _exec_offline(ctx, scenario_id, argv)
+        if isinstance(answered, ScenarioOutcome):
+            return answered, []
+        problems = _check_error(answered.stdout, answered.exit_code, "unsupported")
+        if problems:
+            return ScenarioOutcome(scenario_id, "failed", "; ".join(problems)), []
+        try:
+            doc = json.loads(answered.stdout)
+        except ValueError:
+            return ScenarioOutcome(scenario_id, "failed", "unsupported is not JSON"), []
+        details = doc.get("error", {}).get("details")
+        if details != {"mode": "offline"}:
+            return (
+                ScenarioOutcome(
+                    scenario_id,
+                    "failed",
+                    f"offline details must be mode offline, got {details!r}",
+                ),
+                [],
+            )
+        if doc.get("error", {}).get("request_id") != request_id:
+            return (
+                ScenarioOutcome(
+                    scenario_id, "failed", "offline unsupported must echo the request ID"
+                ),
+                [],
+            )
+        request_ids.append(request_id)
+    return None, request_ids
+
+
+def scenario_offline_reads(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
+    """Offline Read of a stopped instance serves every read and refuses mutations.
+
+    The container is stopped, then every read of section 6 (``identity``,
+    ``status``, ``command``, ``attempts list|show|export``) is served offline
+    from the volume with ``instance.state`` stopped; mutations offline answer
+    ``unsupported`` and store nothing.
+    """
+    scenario_id = "offline-reads"
+    if not ctx.image:
+        return ScenarioOutcome(scenario_id, "not_run", "harness setup did not report an image")
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return settled
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 115, "eligible": True}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status for the claim")
+    current = snapshot.get("current_attempt")
+    if not isinstance(current, dict) or not isinstance(current.get("attempt_id"), str):
+        return ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim")
+    attempt_id = str(current["attempt_id"])
+    stop_id = _new_request_id()
+    record, outcome = _submit(ctx, scenario_id, "stop", stop_id)
+    if outcome is not None or record is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "stop committed nothing")
+    if record.get("acknowledgement") != "accepted":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"stop with an active attempt must be accepted, got {record.get('acknowledgement')!r}",
+        )
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "stop-container", {})
+    if outcome is not None:
+        return outcome
+    # Every read offline, from the stopped volume.
+    answered = _exec_offline(ctx, scenario_id, ["--contract", "1", "--offline", "identity"])
+    if isinstance(answered, ScenarioOutcome):
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return answered
+    problems = _check_offline_identity(answered.stdout, answered.exit_code, ctx)
+    if problems:
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    answered = _exec_offline(ctx, scenario_id, ["--contract", "1", "--offline", "status"])
+    if isinstance(answered, ScenarioOutcome):
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return answered
+    problems = _check_offline_status(answered.stdout, answered.exit_code, ctx)
+    if problems:
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    answered = _exec_offline(ctx, scenario_id, ["--contract", "1", "--offline", "command", stop_id])
+    if isinstance(answered, ScenarioOutcome):
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return answered
+    problems = _check_command(answered.stdout, answered.exit_code, request_id=stop_id, kind="stop")
+    if problems:
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    listed = _exec_offline(ctx, scenario_id, ["--contract", "1", "--offline", "attempts", "list"])
+    if isinstance(listed, ScenarioOutcome):
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return listed
+    problems = _check_attempts_list_result(listed.stdout, listed.exit_code)
+    if problems:
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    shown = _exec_offline(
+        ctx, scenario_id, ["--contract", "1", "--offline", "attempts", "show", attempt_id]
+    )
+    if isinstance(shown, ScenarioOutcome):
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return shown
+    problems = _check_attempts_show_result(shown.stdout, shown.exit_code, attempt_id)
+    if problems:
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    data, outcome = _drain_export_offline(ctx, scenario_id, attempt_id)
+    if outcome is not None or data is None:
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no export stream")
+    problems = _check_export_stream(data, attempt_id)
+    if problems:
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    unsupported, offline_ids = _offline_unsupported_checks(ctx, scenario_id)
+    if unsupported is not None:
+        _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+        if restart_outcome is not None:
+            return restart_outcome
+        return unsupported
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    if outcome is not None:
+        return outcome
+    for offline_id in offline_ids:
+        stored_check = _exec(scenario_id, ["--contract", "1", "command", offline_id], ctx)
+        if isinstance(stored_check, ScenarioOutcome):
+            return stored_check
+        nothing = _check_error(stored_check.stdout, stored_check.exit_code, "not_found")
+        if nothing:
+            return ScenarioOutcome(scenario_id, "failed", f"offline mutation stored {offline_id}")
+    stored, outcome = _read_command(ctx, scenario_id, stop_id)
+    if outcome is not None or stored is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "stop record is missing")
+    resume_id = _new_request_id()
+    _, outcome = _submit(ctx, scenario_id, "resume", resume_id)
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "finish-attempt", {"native_outcome": "complete"}
+    )
+    if outcome is not None:
+        return outcome
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 115, "eligible": False}
+    )
+    if outcome is not None:
+        return outcome
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return settled
+    return ScenarioOutcome(scenario_id, "passed")
+
+
+def scenario_offline_while_running(
+    ctx: SuiteContext,
+    harness_cmd: Sequence[str],
+    *,
+    duration_ms: int = 5000,
+    settle_s: float = 1.0,
+) -> ScenarioOutcome:
+    """Offline Read while the container runs is refused with ``instance_running``.
+
+    The harness holds the engine lock while an offline ``identity`` (and
+    ``status``) read is attempted; the producer must answer ``rejected`` with
+    ``details.reason`` ``instance_running`` instead of serving the volume.
+    """
+    scenario_id = "offline-while-running"
+    if not ctx.image:
+        return ScenarioOutcome(scenario_id, "not_run", "harness setup did not report an image")
+    settled = _settle(ctx, harness_cmd, scenario_id)
+    if settled is not None:
+        return settled
+    held: list[HarnessResult] = []
+
+    def _hold() -> None:
+        held.append(
+            _call_harness(harness_cmd, "hold-lock", {"duration_ms": duration_ms}, ctx.timeout)
+        )
+
+    holder = threading.Thread(target=_hold, daemon=True)
+    holder.start()
+    time.sleep(min(settle_s, duration_ms / 1000.0 / 4))
+    refused = _exec_offline(ctx, scenario_id, ["--contract", "1", "--offline", "identity"])
+    still_held = holder.is_alive()
+    holder.join(timeout=max(ctx.timeout, duration_ms / 1000.0 + 5.0))
+    if isinstance(refused, ScenarioOutcome):
+        return refused
+    if not held:
+        return ScenarioOutcome(scenario_id, "failed", "hold-lock never answered")
+    if held[0].status == "unsupported":
+        return ScenarioOutcome(
+            scenario_id, "not_run", f"harness verb is not supported ({held[0].detail})"
+        )
+    if held[0].status != "ok":
+        return ScenarioOutcome(scenario_id, "failed", f"harness hold-lock failed: {held[0].detail}")
+    problems = _check_error(refused.stdout, refused.exit_code, "rejected")
+    if problems:
+        return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+    try:
+        doc = json.loads(refused.stdout)
+    except ValueError:
+        return ScenarioOutcome(scenario_id, "failed", "rejected is not JSON")
+    if doc.get("error", {}).get("details", {}).get("reason") != "instance_running":
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"details.reason must be instance_running: {refused.stdout.strip()}",
+        )
+    if not still_held:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            "hold-lock finished before the offline read; the lock was not held during the read",
+        )
     return ScenarioOutcome(scenario_id, "passed")
 
 
@@ -3044,6 +3522,14 @@ SCENARIOS: tuple[Scenario, ...] = (
         "publication-pending-recovery",
         "a pending publication recovers before new claims; the verdict sticks",
     ),
+    Scenario(
+        "offline-reads",
+        "offline read of a stopped instance serves every read and refuses mutations",
+    ),
+    Scenario(
+        "offline-while-running",
+        "offline read while the container runs is refused with instance_running",
+    ),
 )
 """Every scenario of this suite version, with stable identifiers."""
 
@@ -3090,6 +3576,8 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_export_torn_read(ctx, harness_cmd),
         scenario_halt_records_last_halt(ctx, harness_cmd),
         scenario_publication_pending_recovery(ctx, harness_cmd),
+        scenario_offline_reads(ctx, harness_cmd),
+        scenario_offline_while_running(ctx, harness_cmd),
     ]
 
 
@@ -3184,6 +3672,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if setup.status != "ok" or setup.result is None:
         print(f"FAIL setup: {setup.detail}")
         return 1
+    raw_volumes = setup.result.get("volumes", ())
+    volumes = tuple(
+        {"name": str(item.get("name", "")), "path": str(item.get("path", ""))}
+        for item in raw_volumes
+        if isinstance(item, dict)
+    )
     ctx = SuiteContext(
         container=str(setup.result.get("container", "")),
         exec_user=str(setup.result.get("exec_user", "")),
@@ -3191,6 +3685,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         capabilities=list(setup.result.get("capabilities", capabilities)),
         docker=args.docker,
         timeout=args.timeout,
+        image=str(setup.result.get("image", "")),
+        volumes=volumes,
     )
     try:
         outcomes = run_all(ctx, harness_cmd)

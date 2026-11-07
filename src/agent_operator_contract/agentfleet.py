@@ -11,7 +11,11 @@ generated before submission from a cryptographically secure source (or taken
 from ``--request-id``), ``--expect-repo`` is always supplied by the caller and
 never derived from the instance's identity, and an ``identity`` read precedes
 every mutation to check the contract major and the required capability before
-anything is sent. The client's own failures (unknown instance, duplicate
+anything is sent. Reads of a stopped instance go through Offline Read
+automatically (``docker run`` of the stopped container's image with every
+volume and bind mount re-mounted read-only and no network, spec section 3.2);
+mutations on a stopped instance are refused client-side and never sent. The
+client's own failures (unknown instance, duplicate
 instance, Docker unavailable, malformed producer stdout, usage, local contract
 or capability refusal) print an envelope-shaped document with an
 ``error.code`` in the ``client.`` namespace and exit with the matching class
@@ -142,6 +146,29 @@ def _human_identity(identity: object) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _run_read(
+    docker: str,
+    instance: client.Instance,
+    agentctl_argv: list[str],
+    timeout: float | None = None,
+) -> client.ExecResult:
+    """Run one read: online ``exec`` when running, Offline Read ``run`` when stopped.
+
+    A stopped instance is re-inspected for its Offline Read target; when the
+    container runs after all the read is refused. Raises
+    :class:`client.ClientError` when the target cannot be built or the
+    transport fails.
+    """
+    if instance.state == "running":
+        if timeout is None:
+            return client.invoke(docker, instance, agentctl_argv)
+        return client.invoke(docker, instance, agentctl_argv, timeout=timeout)
+    target = client.inspect_offline_target(docker, instance)
+    if timeout is None:
+        return client.invoke_offline(docker, target, agentctl_argv)
+    return client.invoke_offline(docker, target, agentctl_argv, timeout=timeout)
+
+
 def _run_identity(docker: str, name: str, use_json: bool) -> int:
     try:
         fleet = client.discover(docker)
@@ -154,7 +181,7 @@ def _run_identity(docker: str, name: str, use_json: bool) -> int:
     except client.DuplicateInstanceError as exc:
         return _print_client_error(exc, use_json, {"instance": name})
     try:
-        result = client.invoke(docker, instance, ["identity"])
+        result = _run_read(docker, instance, ["identity"])
     except client.ClientError as exc:
         return _print_client_error(exc, use_json)
     try:
@@ -294,7 +321,7 @@ def _run_status(docker: str, name: str, use_json: bool) -> int:
     except client.DuplicateInstanceError as exc:
         return _print_client_error(exc, use_json, {"instance": name})
     try:
-        result = client.invoke(docker, instance, ["status"])
+        result = _run_read(docker, instance, ["status"])
     except client.ClientError as exc:
         return _print_client_error(exc, use_json)
     try:
@@ -406,6 +433,8 @@ def _run_mutation(
         return _print_client_error(exc, use_json, {"instance": name})
     except client.DuplicateInstanceError as exc:
         return _print_client_error(exc, use_json, {"instance": name})
+    if instance.state != "running":
+        return _print_client_error(client.InstanceStoppedError(name), use_json, {"instance": name})
     try:
         identity_result = client.invoke(docker, instance, ["identity"])
     except client.ClientError as exc:
@@ -574,14 +603,25 @@ def _run_attempts_export(
         return _print_client_error(exc, False, {"instance": name})
     delivered: list[bytes] = []
     try:
-        client.export_attempt(
-            docker,
-            instance,
-            attempt_id,
-            paths=paths,
-            sink=delivered.append,
-            timeout=timeout,
-        )
+        if instance.state == "running":
+            client.export_attempt(
+                docker,
+                instance,
+                attempt_id,
+                paths=paths,
+                sink=delivered.append,
+                timeout=timeout,
+            )
+        else:
+            target = client.inspect_offline_target(docker, instance)
+            client.export_attempt_offline(
+                docker,
+                target,
+                attempt_id,
+                paths=paths,
+                sink=delivered.append,
+                timeout=timeout,
+            )
     except client.ExportProducerError as exc:
         return _print_producer_failure(exc.envelope, exc.exit_code, False, b"")
     except client.ClientError as exc:
@@ -615,7 +655,7 @@ def _run_command(docker: str, name: str, request_id: str, use_json: bool) -> int
     except client.DuplicateInstanceError as exc:
         return _print_client_error(exc, use_json, {"instance": name})
     try:
-        result = client.invoke(docker, instance, ["command", request_id])
+        result = _run_read(docker, instance, ["command", request_id])
     except client.ClientError as exc:
         return _print_client_error(exc, use_json)
     try:
@@ -661,7 +701,7 @@ def _run_attempts_list(
     if before is not None:
         argv += ["--before", before]
     try:
-        result = client.invoke(docker, instance, argv, timeout=client.timeout_for("attempts-list"))
+        result = _run_read(docker, instance, argv, timeout=client.timeout_for("attempts-list"))
     except client.ClientError as exc:
         return _print_client_error(exc, use_json)
     try:
@@ -696,7 +736,7 @@ def _run_attempts_show(docker: str, name: str, attempt_id: str, use_json: bool) 
     except client.DuplicateInstanceError as exc:
         return _print_client_error(exc, use_json, {"instance": name})
     try:
-        result = client.invoke(
+        result = _run_read(
             docker,
             instance,
             ["attempts", "show", attempt_id],

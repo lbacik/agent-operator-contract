@@ -497,6 +497,183 @@ def test_stub_intake_is_durable_offline(tmp_path: Path) -> None:
     assert state_files, "the stub keeps its Intake and command store on its volume"
 
 
+@pytest.mark.parametrize(
+    ("operation", "request_id"),
+    [
+        (["stop"], "req-000000000041"),
+        (["resume"], "req-000000000042"),
+        (["stop", "--after", "2"], "req-000000000043"),
+        (["next", "issue", "7"], "req-000000000044"),
+        (["handoff", "now"], "req-000000000046"),
+        (["recovery", "retry", "attempt-1"], "req-000000000047"),
+        (
+            ["recovery", "release", "attempt-1", "--saved-at", "somewhere"],
+            "req-000000000048",
+        ),
+        (["errors", "reset"], "req-000000000049"),
+    ],
+)
+def test_stub_offline_mutations_are_unsupported_and_store_nothing(
+    tmp_path: Path, operation: list[str], request_id: str
+) -> None:
+    env = _durable_env(tmp_path)
+    argv = [
+        "--contract",
+        "1",
+        "--offline",
+        *operation,
+        "--request-id",
+        request_id,
+        "--expect-repo",
+        "example-owner/example-repo",
+    ]
+    refused = _run_agentctl(argv, env)
+
+    assert refused.returncode == 3, refused.stdout + refused.stderr
+    doc = json.loads(refused.stdout)
+    assert documents.validate_envelope(doc) == []
+    assert doc["error"]["code"] == "unsupported"
+    assert doc["error"]["details"] == {"mode": "offline"}
+    assert doc["error"]["request_id"] == request_id
+
+    missing = _run_agentctl(["--contract", "1", "command", request_id], env)
+    assert missing.returncode == 5
+    assert json.loads(missing.stdout)["error"]["code"] == "not_found"
+
+
+def test_stub_offline_reads_serve_every_read_from_the_volume(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 302, True)
+    claimed = _status(env)
+    current = claimed["current_attempt"]
+    assert isinstance(current, dict)
+    assert isinstance(current["attempt_id"], str)
+    attempt_id: str = current["attempt_id"]
+    assert _stop("example-owner/example-repo", "req-000000000045", env).returncode == 0
+
+    identity = _run_agentctl(["--contract", "1", "--offline", "identity"], env)
+    assert identity.returncode == 0, identity.stdout + identity.stderr
+    identity_doc = json.loads(identity.stdout)
+    assert documents.validate_envelope(identity_doc) == []
+    assert documents.validate_identity(identity_doc["result"]) == []
+    assert identity_doc["result"]["mode"] == "offline"
+    assert identity_doc["result"]["process_started_at"] is None
+
+    offline_status = _run_agentctl(["--contract", "1", "--offline", "status"], env)
+    assert offline_status.returncode == 0, offline_status.stdout + offline_status.stderr
+    snapshot = json.loads(offline_status.stdout)["result"]
+    assert documents.validate_status(snapshot) == []
+    assert snapshot["identity"]["mode"] == "offline"
+    assert snapshot["identity"]["process_started_at"] is None
+    assert snapshot["instance"]["state"] == "stopped"
+    assert snapshot["current_attempt"] is None
+
+    read = _run_agentctl(["--contract", "1", "--offline", "command", "req-000000000045"], env)
+    assert read.returncode == 0, read.stdout + read.stderr
+    assert json.loads(read.stdout)["result"]["command"]["kind"] == "stop"
+
+    listed = _run_agentctl(["--contract", "1", "--offline", "attempts", "list"], env)
+    assert listed.returncode == 0, listed.stdout + listed.stderr
+    listed_doc = json.loads(listed.stdout)
+    assert documents.validate_envelope(listed_doc) == []
+    assert attempt_id in [entry["attempt_id"] for entry in listed_doc["result"]["attempts"]]
+
+    shown = _run_agentctl(["--contract", "1", "--offline", "attempts", "show", attempt_id], env)
+    assert shown.returncode == 0, shown.stdout + shown.stderr
+    shown_doc = json.loads(shown.stdout)
+    assert documents.validate_envelope(shown_doc) == []
+    assert shown_doc["result"]["attempt"]["attempt_id"] == attempt_id
+
+    exported = _run_agentctl_raw(
+        ["--contract", "1", "--offline", "attempts", "export", attempt_id], env
+    )
+    assert exported.returncode == 0, exported.stderr.decode("utf-8", "replace")
+    with tarfile.open(fileobj=io.BytesIO(exported.stdout), mode="r:") as archive:
+        names = archive.getnames()
+        assert names
+        assert names[0] == "manifest.json"
+        manifest_file = archive.extractfile("manifest.json")
+        assert manifest_file is not None
+        manifest = json.loads(manifest_file.read())
+        assert manifest["attempt"]["attempt_id"] == attempt_id
+
+
+def test_stub_offline_reads_write_nothing(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 303, True)
+    claimed = _status(env)
+    current = claimed["current_attempt"]
+    assert isinstance(current, dict)
+    assert isinstance(current["attempt_id"], str)
+    attempt_id: str = current["attempt_id"]
+    assert _stop("example-owner/example-repo", "req-000000000046", env).returncode == 0
+
+    # Prime one offline read: probing the engine lock may create the lock file.
+    assert _run_agentctl(["--contract", "1", "--offline", "identity"], env).returncode == 0
+    volume = tmp_path / "volume"
+
+    def _tree() -> dict[str, bytes]:
+        tree: dict[str, bytes] = {}
+        for path in sorted(volume.rglob("*")):
+            key = str(path.relative_to(volume))
+            tree[key] = path.read_bytes() if path.is_file() else b"<dir>"
+        return tree
+
+    before = _tree()
+
+    assert _run_agentctl(["--contract", "1", "--offline", "identity"], env).returncode == 0
+    assert _run_agentctl(["--contract", "1", "--offline", "status"], env).returncode == 0
+    assert (
+        _run_agentctl(
+            ["--contract", "1", "--offline", "command", "req-000000000046"], env
+        ).returncode
+        == 0
+    )
+    assert _run_agentctl(["--contract", "1", "--offline", "attempts", "list"], env).returncode == 0
+    assert (
+        _run_agentctl(
+            ["--contract", "1", "--offline", "attempts", "show", attempt_id], env
+        ).returncode
+        == 0
+    )
+    assert (
+        _run_agentctl_raw(
+            ["--contract", "1", "--offline", "attempts", "export", attempt_id], env
+        ).returncode
+        == 0
+    )
+
+    after = _tree()
+    assert after == before, "offline reads must not write to the volume"
+
+
+def test_stub_offline_read_refused_while_engine_holds_the_lock(tmp_path: Path) -> None:
+    fcntl = pytest.importorskip("fcntl")
+    env = _durable_env(tmp_path)
+    lock_path = tmp_path / "volume" / "agent-operator-contract.lock"
+    with open(lock_path, "a", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        try:
+            refused = _run_agentctl(["--contract", "1", "--offline", "identity"], env)
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    fixture_path = (
+        REPO_ROOT
+        / "src"
+        / "agent_operator_contract"
+        / "fixtures"
+        / "agentctl"
+        / "offline-identity-running.json"
+    )
+    fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+
+    assert refused.returncode == 1
+    assert refused.returncode == fixture["exit_code"]
+    assert refused.stdout == fixture["stdout"]
+    assert refused.stderr == fixture["stderr"]
+
+
 def test_stub_crash_between_commit_and_reply_replays_on_retry(tmp_path: Path) -> None:
     env = _durable_env(tmp_path)
     _patch_state(env, "doc['crash_armed'] = {'point': 'between-commit-and-reply'}")

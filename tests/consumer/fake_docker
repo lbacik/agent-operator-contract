@@ -11,10 +11,17 @@ Fleet description (JSON file, `FAKE_DOCKER_FLEET`):
 
     {"containers": [{"id": "...", "name": "...", "backend": "...",
                      "contract": "1", "exec_user": "...",
-                     "state": "running", "oneoff": false}]}
+                     "state": "running", "oneoff": false,
+                     "image": "sha256:abc",
+                     "volumes": [{"name": "stub-data", "path": "/data"}],
+                     "binds": [{"source": "/host/cfg", "path": "/cfg"}]}]}
 
 `oneoff: true` sets the Compose one-off label
-`com.docker.compose.oneoff=True`, which the consumer must ignore.
+`com.docker.compose.oneoff=True`, which the consumer must ignore. `image` is
+the image ID reported by `inspect`; `volumes` and `binds` are the durable
+mounts reported as `Mounts` entries so Offline Read (`docker run` of the
+stopped container's image with every mount re-mounted read-only) can be
+staged. A stopped container is read through `run`, never `exec`.
 
 Fixtures (`FAKE_DOCKER_FIXTURES`, default: the checkout's
 `src/agent_operator_contract/fixtures/agentctl/`): files shaped
@@ -36,14 +43,18 @@ test stages an ambiguous reply followed by a replayed success as two files
 with the same masked argv. A fixture may also carry `delay_seconds` (a
 number): the fake sleeps that long before replying, so a delay longer than
 the consumer timeout is staged the same way; `FAKE_DOCKER_DELAY` adds the
-same sleep to every `exec` reply.
+same sleep to every `exec`/`run` reply.
 
 Recording (`FAKE_DOCKER_LOG`): every docker invocation appends one JSON line
 `{"argv": [...]}` (args after the `docker` name itself).
 
 Supported commands: `ps` (one container ID per line), `inspect <id>...`
 (docker-inspect-shaped JSON array), `exec --user <user> <id>
-/usr/local/bin/agentctl <agentctl-argv...>`. Anything else exits 125.
+/usr/local/bin/agentctl <agentctl-argv...>`, and Offline Read `run --rm
+--network none --user <user> --mount <spec,readonly> ...
+--entrypoint /usr/local/bin/agentctl <image> --contract 1 --offline ...`
+(matched to its container by image; every mount must carry `readonly`).
+Anything else exits 125.
 """
 
 from __future__ import annotations
@@ -129,10 +140,37 @@ def _inspect_entry(container_id: str, desc: dict[str, object]) -> dict[str, obje
     if desc.get("oneoff") is True:
         labels[ONEOFF_LABEL] = "True"
     state = str(desc.get("state", "running"))
+    mounts: list[dict[str, object]] = []
+    volumes = desc.get("volumes")
+    if isinstance(volumes, list):
+        for volume in volumes:
+            if not isinstance(volume, dict):
+                continue
+            name = volume.get("name")
+            path = volume.get("path")
+            if isinstance(name, str) and name and isinstance(path, str) and path:
+                mounts.append(
+                    {
+                        "Type": "volume",
+                        "Name": name,
+                        "Source": name,
+                        "Destination": path,
+                    }
+                )
+    binds = desc.get("binds")
+    if isinstance(binds, list):
+        for bind in binds:
+            if not isinstance(bind, dict):
+                continue
+            source = bind.get("source")
+            path = bind.get("path")
+            if isinstance(source, str) and source and isinstance(path, str) and path:
+                mounts.append({"Type": "bind", "Source": source, "Destination": path})
     return {
         "Id": container_id,
         "Image": str(desc.get("image", "example-image")),
         "Config": {"Labels": labels},
+        "Mounts": mounts,
         "State": {"Status": state, "Running": state == "running"},
     }
 
@@ -193,14 +231,26 @@ def _request_id_of(argv: list[str]) -> str | None:
 
 
 def _agentctl_argv_of(docker_argv: list[str]) -> list[str] | None:
-    """Return the agentctl args of a recorded ``exec`` docker argv, if any."""
-    if not docker_argv or docker_argv[0] != "exec":
+    """Return the agentctl args of a recorded ``exec`` or ``run`` docker argv."""
+    if not docker_argv:
         return None
-    try:
-        binary = docker_argv.index(AGENTCTL_PATH)
-    except ValueError:
-        return None
-    return docker_argv[binary + 1 :]
+    if docker_argv[0] == "exec":
+        try:
+            binary = docker_argv.index(AGENTCTL_PATH)
+        except ValueError:
+            return None
+        return docker_argv[binary + 1 :]
+    if docker_argv[0] == "run":
+        try:
+            entrypoint = docker_argv.index("--entrypoint")
+        except ValueError:
+            return None
+        if len(docker_argv) <= entrypoint + 2:
+            return None
+        if docker_argv[entrypoint + 1] != AGENTCTL_PATH:
+            return None
+        return docker_argv[entrypoint + 3 :]
+    return None
 
 
 def _prior_matches(key: tuple[str, ...]) -> int:
@@ -254,32 +304,8 @@ def _sleep_before_reply(fixture: dict[str, object]) -> None:
         time.sleep(delay)
 
 
-def _cmd_exec(
-    fleet: dict[str, dict[str, object]], args: list[str]
-) -> int:
-    try:
-        user_index = args.index("--user")
-        exec_user = args[user_index + 1]
-        container_id = args[user_index + 2]
-        rest = args[user_index + 3 :]
-    except (ValueError, IndexError):
-        sys.stderr.write("fake_docker: exec expects --user <user> <container> ...\n")
-        return 125
-    if not rest or rest[0] != AGENTCTL_PATH:
-        sys.stderr.write(
-            f"fake_docker: exec expects {AGENTCTL_PATH} after the container\n"
-        )
-        return 125
-    agentctl_argv = rest[1:]
-    desc = fleet.get(container_id)
-    if desc is None:
-        sys.stderr.write(f"fake_docker: no such container: {container_id}\n")
-        return 125
-    if exec_user != str(desc.get("exec_user", "")):
-        sys.stderr.write(
-            f"fake_docker: wrong exec user {exec_user!r} for {container_id}\n"
-        )
-        return 125
+def _replay_fixture(agentctl_argv: list[str]) -> int:
+    """Replay the first fixture whose argv matches ``agentctl_argv``."""
     key = _mask_request_id(agentctl_argv)
     matches: list[dict[str, object]] = []
     for fixture in _load_fixtures():
@@ -330,6 +356,100 @@ def _cmd_exec(
     return 2
 
 
+def _cmd_exec(
+    fleet: dict[str, dict[str, object]], args: list[str]
+) -> int:
+    try:
+        user_index = args.index("--user")
+        exec_user = args[user_index + 1]
+        container_id = args[user_index + 2]
+        rest = args[user_index + 3 :]
+    except (ValueError, IndexError):
+        sys.stderr.write("fake_docker: exec expects --user <user> <container> ...\n")
+        return 125
+    if not rest or rest[0] != AGENTCTL_PATH:
+        sys.stderr.write(
+            f"fake_docker: exec expects {AGENTCTL_PATH} after the container\n"
+        )
+        return 125
+    agentctl_argv = rest[1:]
+    desc = fleet.get(container_id)
+    if desc is None:
+        sys.stderr.write(f"fake_docker: no such container: {container_id}\n")
+        return 125
+    if exec_user != str(desc.get("exec_user", "")):
+        sys.stderr.write(
+            f"fake_docker: wrong exec user {exec_user!r} for {container_id}\n"
+        )
+        return 125
+    return _replay_fixture(agentctl_argv)
+
+
+def _cmd_run(
+    fleet: dict[str, dict[str, object]], args: list[str]
+) -> int:
+    """Serve one Offline Read ``run``: match the image, check it is read-only."""
+    if "--rm" not in args:
+        sys.stderr.write("fake_docker: run expects --rm\n")
+        return 125
+    try:
+        network_index = args.index("--network")
+        network = args[network_index + 1]
+    except (ValueError, IndexError):
+        sys.stderr.write("fake_docker: run expects --network <name>\n")
+        return 125
+    if network != "none":
+        sys.stderr.write(f"fake_docker: run expects --network none, got {network!r}\n")
+        return 125
+    try:
+        user_index = args.index("--user")
+        exec_user = args[user_index + 1]
+    except (ValueError, IndexError):
+        sys.stderr.write("fake_docker: run expects --user <user>\n")
+        return 125
+    try:
+        entrypoint_index = args.index("--entrypoint")
+        entrypoint = args[entrypoint_index + 1]
+        image = args[entrypoint_index + 2]
+        agentctl_argv = args[entrypoint_index + 3 :]
+    except IndexError:
+        sys.stderr.write("fake_docker: run expects --entrypoint <path> <image> ...\n")
+        return 125
+    except ValueError:
+        sys.stderr.write("fake_docker: run expects --entrypoint <path> <image> ...\n")
+        return 125
+    if entrypoint != AGENTCTL_PATH:
+        sys.stderr.write(f"fake_docker: run expects entrypoint {AGENTCTL_PATH!r}\n")
+        return 125
+    if "-t" in args or "--tty" in args or "-i" in args:
+        sys.stderr.write("fake_docker: run must not allocate a TTY\n")
+        return 125
+    mounts: list[str] = []
+    for index, arg in enumerate(args):
+        if arg == "--mount" and index + 1 < len(args):
+            mounts.append(args[index + 1])
+    for mount in mounts:
+        options = mount.split(",")
+        if "readonly" not in options:
+            sys.stderr.write(f"fake_docker: run mount is not read-only: {mount!r}\n")
+            return 125
+    if not agentctl_argv or agentctl_argv[:2] != ["--contract", "1"]:
+        sys.stderr.write("fake_docker: run expects --contract 1 after the image\n")
+        return 125
+    desc: dict[str, object] | None = None
+    for entry in fleet.values():
+        if str(entry.get("image", "example-image")) == image:
+            desc = entry
+            break
+    if desc is None:
+        sys.stderr.write(f"fake_docker: no container with image {image!r}\n")
+        return 125
+    if exec_user != str(desc.get("exec_user", "")):
+        sys.stderr.write(f"fake_docker: wrong exec user {exec_user!r} for {image!r}\n")
+        return 125
+    return _replay_fixture(agentctl_argv)
+
+
 def main(argv: list[str]) -> int:
     _record(list(argv))
     if not argv:
@@ -344,6 +464,8 @@ def main(argv: list[str]) -> int:
         return _cmd_inspect(fleet, ids)
     if command == "exec":
         return _cmd_exec(fleet, rest)
+    if command == "run":
+        return _cmd_run(fleet, rest)
     sys.stderr.write(f"fake_docker: unsupported docker command {command!r}\n")
     return 125
 

@@ -1,0 +1,11 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "--offline",
+    "identity"
+  ],
+  "exit_code": 1,
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"rejected\",\"details\":{\"reason\":\"instance_running\"},\"message\":\"a live engine holds the volume; refusing the offline read\",\"retryable\":false},\"ok\":false}\n",
+  "stderr": ""
+}

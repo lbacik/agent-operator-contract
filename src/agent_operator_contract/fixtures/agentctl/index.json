@@ -59,6 +59,10 @@
       "classification": "success",
       "note": "Exit 0, ok:true with an offline status snapshot carrying last_halt."
     },
+    "offline-identity-running": {
+      "classification": "rejection",
+      "note": "Exit 1, rejected with details.reason instance_running: an offline call reached a live engine holding the volume."
+    },
     "payload-mismatch": {
       "classification": "rejection",
       "note": "Exit 1, payload_mismatch: the request ID is already used with a different payload."
