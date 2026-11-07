@@ -236,9 +236,7 @@ def _docker_run(
     return DockerResult(completed.returncode, completed.stdout, completed.stderr)
 
 
-def _popen_run(
-    ctx: SuiteContext, agentctl_argv: list[str]
-) -> subprocess.Popen[bytes]:
+def _popen_run(ctx: SuiteContext, agentctl_argv: list[str]) -> subprocess.Popen[bytes]:
     """Start one offline ``attempts export`` streaming through ``docker run``."""
     return subprocess.Popen(
         _docker_run_argv(ctx, agentctl_argv),
@@ -493,7 +491,7 @@ def _check_offline_status(stdout: str, exit_code: int, ctx: SuiteContext) -> lis
         mismatches.append(f"capabilities {capabilities!r} != {sorted(ctx.capabilities)!r}")
     instance = snapshot.get("instance")
     if not isinstance(instance, dict):
-        return mismatches + ["status instance must be an object"]
+        return [*mismatches, "status instance must be an object"]
     if instance.get("state") != "stopped":
         mismatches.append(f"instance state {instance.get('state')!r} != 'stopped'")
     if snapshot.get("current_attempt") is not None:
@@ -2998,34 +2996,26 @@ def scenario_halt_records_last_halt(
             return outcome
         answered = _exec_offline(ctx, scenario_id, ["--contract", "1", "--offline", "status"])
         if isinstance(answered, ScenarioOutcome):
-            _, restart_outcome = _harness(
-                ctx, harness_cmd, scenario_id, "start-container", {}
-            )
+            _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
             if restart_outcome is not None:
                 return restart_outcome
             return answered
         problems = _check_offline_status(answered.stdout, answered.exit_code, ctx)
         if problems:
-            _, restart_outcome = _harness(
-                ctx, harness_cmd, scenario_id, "start-container", {}
-            )
+            _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
             if restart_outcome is not None:
                 return restart_outcome
             return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
         try:
             offline_snapshot = json.loads(answered.stdout)["result"]
         except ValueError:
-            _, restart_outcome = _harness(
-                ctx, harness_cmd, scenario_id, "start-container", {}
-            )
+            _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
             if restart_outcome is not None:
                 return restart_outcome
             return ScenarioOutcome(scenario_id, "failed", "offline status is not valid JSON")
         offline_halt = offline_snapshot["instance"]["last_halt"]
         if not isinstance(offline_halt, dict) or offline_halt.get("reason") != "stub-halt-test":
-            _, restart_outcome = _harness(
-                ctx, harness_cmd, scenario_id, "start-container", {}
-            )
+            _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
             if restart_outcome is not None:
                 return restart_outcome
             return ScenarioOutcome(
@@ -3121,9 +3111,7 @@ def scenario_offline_reads(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
     """
     scenario_id = "offline-reads"
     if not ctx.image:
-        return ScenarioOutcome(
-            scenario_id, "not_run", "harness setup did not report an image"
-        )
+        return ScenarioOutcome(scenario_id, "not_run", "harness setup did not report an image")
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
@@ -3180,25 +3168,19 @@ def scenario_offline_reads(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
         if restart_outcome is not None:
             return restart_outcome
         return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
-    answered = _exec_offline(
-        ctx, scenario_id, ["--contract", "1", "--offline", "command", stop_id]
-    )
+    answered = _exec_offline(ctx, scenario_id, ["--contract", "1", "--offline", "command", stop_id])
     if isinstance(answered, ScenarioOutcome):
         _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
         if restart_outcome is not None:
             return restart_outcome
         return answered
-    problems = _check_command(
-        answered.stdout, answered.exit_code, request_id=stop_id, kind="stop"
-    )
+    problems = _check_command(answered.stdout, answered.exit_code, request_id=stop_id, kind="stop")
     if problems:
         _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
         if restart_outcome is not None:
             return restart_outcome
         return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
-    listed = _exec_offline(
-        ctx, scenario_id, ["--contract", "1", "--offline", "attempts", "list"]
-    )
+    listed = _exec_offline(ctx, scenario_id, ["--contract", "1", "--offline", "attempts", "list"])
     if isinstance(listed, ScenarioOutcome):
         _, restart_outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
         if restart_outcome is not None:
@@ -3249,14 +3231,12 @@ def scenario_offline_reads(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
     if outcome is not None:
         return outcome
     for offline_id in offline_ids:
-        stored_check = _exec(ctx, scenario_id, ["--contract", "1", "command", offline_id])
+        stored_check = _exec(scenario_id, ["--contract", "1", "command", offline_id], ctx)
         if isinstance(stored_check, ScenarioOutcome):
             return stored_check
         nothing = _check_error(stored_check.stdout, stored_check.exit_code, "not_found")
         if nothing:
-            return ScenarioOutcome(
-                scenario_id, "failed", f"offline mutation stored {offline_id}"
-            )
+            return ScenarioOutcome(scenario_id, "failed", f"offline mutation stored {offline_id}")
     stored, outcome = _read_command(ctx, scenario_id, stop_id)
     if outcome is not None or stored is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "stop record is missing")
@@ -3295,9 +3275,7 @@ def scenario_offline_while_running(
     """
     scenario_id = "offline-while-running"
     if not ctx.image:
-        return ScenarioOutcome(
-            scenario_id, "not_run", "harness setup did not report an image"
-        )
+        return ScenarioOutcome(scenario_id, "not_run", "harness setup did not report an image")
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
@@ -3333,7 +3311,9 @@ def scenario_offline_while_running(
         return ScenarioOutcome(scenario_id, "failed", "rejected is not JSON")
     if doc.get("error", {}).get("details", {}).get("reason") != "instance_running":
         return ScenarioOutcome(
-            scenario_id, "failed", f"details.reason must be instance_running: {refused.stdout.strip()}"
+            scenario_id,
+            "failed",
+            f"details.reason must be instance_running: {refused.stdout.strip()}",
         )
     if not still_held:
         return ScenarioOutcome(
@@ -3538,6 +3518,14 @@ SCENARIOS: tuple[Scenario, ...] = (
         "publication-pending-recovery",
         "a pending publication recovers before new claims; the verdict sticks",
     ),
+    Scenario(
+        "offline-reads",
+        "offline read of a stopped instance serves every read and refuses mutations",
+    ),
+    Scenario(
+        "offline-while-running",
+        "offline read while the container runs is refused with instance_running",
+    ),
 )
 """Every scenario of this suite version, with stable identifiers."""
 
@@ -3584,6 +3572,8 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
         scenario_export_torn_read(ctx, harness_cmd),
         scenario_halt_records_last_halt(ctx, harness_cmd),
         scenario_publication_pending_recovery(ctx, harness_cmd),
+        scenario_offline_reads(ctx, harness_cmd),
+        scenario_offline_while_running(ctx, harness_cmd),
     ]
 
 
@@ -3678,6 +3668,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     if setup.status != "ok" or setup.result is None:
         print(f"FAIL setup: {setup.detail}")
         return 1
+    raw_volumes = setup.result.get("volumes", ())
+    volumes = tuple(
+        {"name": str(item.get("name", "")), "path": str(item.get("path", ""))}
+        for item in raw_volumes
+        if isinstance(item, dict)
+    )
     ctx = SuiteContext(
         container=str(setup.result.get("container", "")),
         exec_user=str(setup.result.get("exec_user", "")),
@@ -3685,6 +3681,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         capabilities=list(setup.result.get("capabilities", capabilities)),
         docker=args.docker,
         timeout=args.timeout,
+        image=str(setup.result.get("image", "")),
+        volumes=volumes,
     )
     try:
         outcomes = run_all(ctx, harness_cmd)

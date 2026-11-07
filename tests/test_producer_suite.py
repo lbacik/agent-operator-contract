@@ -24,6 +24,8 @@ CTX = producer_suite.SuiteContext(
     exec_user="agent",
     repository="example-owner/example-repo",
     capabilities=["next-issue", "stop-after"],
+    image="sha256:abc",
+    volumes=({"name": "stub-data", "path": "/data"},),
 )
 
 IDENTITY = {
@@ -352,7 +354,10 @@ class _FakeProducer:
                     1, _fail_with_request("rejected", request_id), ""
                 )
             self.intake = "closed"
-            record = self._record(request_id, "stop", "completed")
+            # Like the stub, a stop with an active attempt only closes the
+            # intake: it is accepted and finishes with the attempt.
+            acknowledgement = "accepted" if self.active_attempt is not None else "completed"
+            record = self._record(request_id, "stop", acknowledgement)
         elif operation == "resume":
             if self.intake == "open":
                 return producer_suite.DockerResult(
@@ -527,6 +532,76 @@ class _FakeProducer:
             return producer_suite.DockerResult(0, _ok({"command": stored["record"]}), "")
         raise AssertionError(f"unexpected agentctl argv: {argv!r}")
 
+    def _offline_identity_doc(self) -> dict[str, Any]:
+        """The offline identity: the setup document with no running process."""
+        identity = dict(IDENTITY)
+        identity["mode"] = "offline"
+        identity["process_started_at"] = None
+        return identity
+
+    def _offline_status_doc(self) -> dict[str, Any]:
+        """The offline status: stopped, no current attempt, and no clock tick."""
+        observed_at = f"2026-11-06T09:12:{5 + self.tick:02d}Z"
+        records = sorted(
+            (entry["record"] for entry in self.commands.values()),
+            key=lambda record: record["sequence"],
+        )
+        return {
+            "generated_at": observed_at,
+            "identity": self._offline_identity_doc(),
+            "instance": {
+                "state": "stopped",
+                "startup_check": None,
+                "last_halt": None,
+                "observed_at": observed_at,
+            },
+            "intake": {
+                "state": self.intake,
+                "pending_stop": None,
+                "stop_plan": None,
+                "priority": None,
+                "observed_at": observed_at,
+            },
+            "current_attempt": None,
+            "last_finished": self.finished_attempts[-1] if self.finished_attempts else None,
+            "recent_commands": records[-20:],
+            "recent_events": list(self.extra_events),
+            "truncated": False,
+        }
+
+    def handle_offline(self, argv: list[str]) -> producer_suite.DockerResult:
+        """Serve one Offline Read ``docker run`` argv without touching the volume.
+
+        While the fake engine lock is held a live engine owns the volume, so the
+        read is refused with ``rejected``/``instance_running`` like the stub.
+        Mutations answer ``unsupported`` with the offline mode and store nothing;
+        every other read is served from memory with no clock tick.
+        """
+        if self.engine_lock.acquire(blocking=False):
+            self.engine_lock.release()
+        else:
+            return producer_suite.DockerResult(
+                1, _fail("rejected", {"reason": "instance_running"}), ""
+            )
+        if argv == ["--contract", "1", "--offline", "identity"]:
+            return producer_suite.DockerResult(0, _ok(self._offline_identity_doc()), "")
+        if argv == ["--contract", "1", "--offline", "status"]:
+            return producer_suite.DockerResult(0, _ok(self._offline_status_doc()), "")
+        if len(argv) >= 4 and argv[:3] == ["--contract", "1", "--offline"]:
+            tail = argv[3:]
+            is_mutation = (
+                tail[:1] == ["stop"] or tail[:1] == ["resume"] or tail[:2] == ["next", "issue"]
+            )
+            if is_mutation:
+                request_id = _probe_request_id(argv)
+                return producer_suite.DockerResult(
+                    3,
+                    _fail_with_request("unsupported", request_id, {"mode": "offline"}),
+                    "",
+                )
+            return self.handle("", "", "", [*argv[:2], *argv[3:]], 0.0)
+        raise AssertionError(f"unexpected offline argv: {argv!r}")
+
 
 def _fake_harness(
     cmd: Any, verb: str, params: dict[str, Any], timeout: float
@@ -608,6 +683,8 @@ def test_scenario_ids_are_stable() -> None:
         "export-torn-read",
         "halt-records-last-halt",
         "publication-pending-recovery",
+        "offline-reads",
+        "offline-while-running",
     ]
 
 
@@ -652,6 +729,8 @@ def test_run_all_passes_with_hold_lock_not_run(fakes: _FakeProducer) -> None:
     assert by_id["export-torn-read"].status == "not_run"
     assert by_id["halt-records-last-halt"].status == "not_run"
     assert by_id["publication-pending-recovery"].status == "not_run"
+    assert by_id["offline-reads"].status == "not_run"
+    assert by_id["offline-while-running"].status == "not_run"
 
 
 def test_mutation_scenarios_fail_when_replay_changes_the_record(
@@ -1576,3 +1655,108 @@ def test_snapshot_bounds_fails_when_truncated_keeps_events(
 
     assert outcome.status == "failed"
     assert "recent_events" in outcome.detail
+
+
+def _serve_export_offline(producer: _FakeProducer, argv: list[str]) -> _FakeExportProc:
+    """Serve one offline export: strip ``--offline`` and stream the same tar."""
+    return _serve_export(producer, [*argv[:2], *argv[3:]])
+
+
+def _support_offline(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) -> None:
+    """Harness plus ``docker run`` fakes for the two offline scenarios.
+
+    The claims lifecycle comes from ``_support_claims``; ``stop-container`` and
+    ``start-container`` answer ok, ``hold-lock`` really holds the fake engine
+    lock, and Offline Reads dispatch to the fake without touching a volume.
+    """
+    _support_claims(monkeypatch, producer)
+    inner = producer_suite._call_harness
+
+    def harness(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        if verb == "hold-lock":
+            with producer.engine_lock:
+                time.sleep(params["duration_ms"] / 1000.0)
+            return producer_suite.HarnessResult("ok", {"held_ms": params["duration_ms"]}, "")
+        if verb in ("stop-container", "start-container"):
+            return producer_suite.HarnessResult("ok", {verb: True}, "")
+        return inner(cmd, verb, params, timeout)
+
+    monkeypatch.setattr(producer_suite, "_call_harness", harness)
+
+    def fake_run(
+        ctx: producer_suite.SuiteContext,
+        agentctl_argv: list[str],
+        timeout: float | None = None,
+    ) -> producer_suite.DockerResult:
+        return producer.handle_offline(agentctl_argv)
+
+    def fake_popen_run(
+        ctx: producer_suite.SuiteContext, agentctl_argv: list[str]
+    ) -> _FakeExportProc:
+        return _serve_export_offline(producer, agentctl_argv)
+
+    monkeypatch.setattr(producer_suite, "_docker_run", fake_run)
+    monkeypatch.setattr(producer_suite, "_popen_run", fake_popen_run)
+
+
+def test_offline_reads_passes_with_a_stopped_container(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_offline(monkeypatch, fakes)
+
+    outcome = producer_suite.scenario_offline_reads(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.eligible == set()
+
+
+def test_offline_reads_is_not_run_without_an_image(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_offline(monkeypatch, fakes)
+    ctx = producer_suite.SuiteContext(
+        container=CTX.container,
+        exec_user=CTX.exec_user,
+        repository=CTX.repository,
+        capabilities=list(CTX.capabilities),
+    )
+
+    outcome = producer_suite.scenario_offline_reads(ctx, ["fake-harness"])
+
+    assert outcome.status == "not_run"
+
+
+def test_offline_while_running_passes_with_a_held_lock(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_offline(monkeypatch, fakes)
+
+    outcome = producer_suite.scenario_offline_while_running(
+        CTX, ["fake-harness"], duration_ms=800, settle_s=0.05
+    )
+
+    assert outcome.status == "passed", outcome.detail
+
+
+def test_offline_while_running_fails_when_the_read_is_served(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_offline(monkeypatch, fakes)
+
+    def serve_despite_lock(
+        ctx: producer_suite.SuiteContext,
+        agentctl_argv: list[str],
+        timeout: float | None = None,
+    ) -> producer_suite.DockerResult:
+        del ctx, timeout
+        return producer_suite.DockerResult(0, _ok(IDENTITY), "")
+
+    monkeypatch.setattr(producer_suite, "_docker_run", serve_despite_lock)
+
+    outcome = producer_suite.scenario_offline_while_running(
+        CTX, ["fake-harness"], duration_ms=800, settle_s=0.05
+    )
+
+    assert outcome.status == "failed"
