@@ -1269,7 +1269,7 @@ def _do_recovery_release(
 
     An unknown Attempt is ``not_found``. The recorded verdict is never
     recomputed: an active Attempt finalizes with its recorded outcome (or
-    ``complete`` when none was recorded) and a finished Attempt keeps its
+    ``handoff`` when none was recorded) and a finished Attempt keeps its
     outcome while its lifecycle moves to ``released``. No automatic requeue.
     """
     attempt_id = str(arguments["attempt_id"])
