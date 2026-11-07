@@ -39,6 +39,16 @@
     "retryable": false,
     "meaning": "Malformed agentfleet argv."
   },
+  "client.instance_stopped": {
+    "exit_code": 1,
+    "retryable": false,
+    "meaning": "The instance is stopped; a mutation is never sent to a stopped instance. Read it offline instead."
+  },
+  "client.instance_running": {
+    "exit_code": 1,
+    "retryable": false,
+    "meaning": "The container is still running; an Offline Read of a running container is refused."
+  },
   "client.export_torn": {
     "exit_code": 7,
     "retryable": true,

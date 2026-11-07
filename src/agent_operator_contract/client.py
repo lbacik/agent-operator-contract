@@ -252,6 +252,34 @@ class Fleet:
     duplicates: frozenset[str]
 
 
+@dataclass(frozen=True)
+class VolumeMount:
+    """One durable mount of a container, re-mounted read-only for Offline Read."""
+
+    kind: str
+    """``"volume"`` or ``"bind"`` (spec section 12 covers both)."""
+
+    source: str
+    """The volume name or the host path to re-mount."""
+
+    destination: str
+    """The in-container path, kept identical for the Offline Read."""
+
+
+@dataclass(frozen=True)
+class OfflineTarget:
+    """Where one Offline Read runs: the stopped container's image and mounts.
+
+    Built from a fresh ``docker inspect`` of the stopped container (spec
+    sections 3.2 and 12): the image ID, every volume and bind mount at the
+    same destination, and the exec user.
+    """
+
+    image: str
+    mounts: tuple[VolumeMount, ...]
+    exec_user: str
+
+
 class ClientError(Exception):
     """An agentfleet client failure with a ``client.`` code and exit class."""
 
@@ -292,6 +320,37 @@ class DuplicateInstanceError(ClientError):
         super().__init__(
             "client.duplicate_instance",
             f"instance name {name!r} is duplicated across {count} containers; refusing",
+        )
+        self.name = name
+
+
+class InstanceStoppedError(ClientError):
+    """A mutation was addressed to a stopped instance.
+
+    Mutations are never sent to a stopped instance (spec section 12); the
+    caller should read it offline instead.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            "client.instance_stopped",
+            f"instance {name!r} is stopped; mutations are never sent to a stopped instance",
+        )
+        self.name = name
+
+
+class InstanceRunningError(ClientError):
+    """An Offline Read was addressed to a running container.
+
+    The consumer must never start an Offline Read while the container runs
+    (spec section 12); a live engine owns the volume.
+    """
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            "client.instance_running",
+            f"container for instance {name!r} is still running; "
+            "refusing an Offline Read of a running container",
         )
         self.name = name
 
@@ -454,6 +513,135 @@ def resolve(fleet: Fleet, name: str) -> Instance:
     if len(matches) > 1 or name in fleet.duplicates:
         raise DuplicateInstanceError(name, len(matches))
     return matches[0]
+
+
+def _entry_is_running(entry: dict[str, Any]) -> bool:
+    """Decide liveness from one ``docker inspect`` entry; unknown means running.
+
+    The consumer must never read a maybe-running container offline (spec
+    section 12), so an entry without a readable ``State`` refuses the
+    Offline Read.
+    """
+    state = entry.get("State")
+    if not isinstance(state, dict):
+        return True
+    if state.get("Running") is True:
+        return True
+    status = state.get("Status")
+    if isinstance(status, str):
+        return status == "running"
+    return state.get("Running") is not False
+
+
+def _mounts_of(entry: dict[str, Any]) -> tuple[VolumeMount, ...]:
+    """Read the durable mounts of one ``docker inspect`` entry.
+
+    Every volume and bind mount is kept with its in-container destination so
+    the Offline Read re-mounts it read-only at the same path (spec section
+    3.2); ephemeral mount types carry no durable state and are skipped.
+    """
+    raw = entry.get("Mounts")
+    if not isinstance(raw, list):
+        return ()
+    mounts: list[VolumeMount] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("Type", "")).lower()
+        destination = item.get("Destination")
+        if not isinstance(destination, str) or not destination:
+            continue
+        if kind == "volume":
+            name = item.get("Name")
+            source = name if isinstance(name, str) and name else item.get("Source")
+            if not isinstance(source, str) or not source:
+                continue
+            mounts.append(VolumeMount("volume", source, destination))
+        elif kind == "bind":
+            source = item.get("Source")
+            if not isinstance(source, str) or not source:
+                continue
+            mounts.append(VolumeMount("bind", source, destination))
+    return tuple(mounts)
+
+
+def inspect_offline_target(
+    docker: str, instance: Instance, timeout: float = DEFAULT_TIMEOUT
+) -> OfflineTarget:
+    """Build the Offline Read target from a fresh ``docker inspect``.
+
+    The container is re-inspected (spec section 12): a running container
+    refuses with :class:`InstanceRunningError` and nothing is started. The
+    returned target carries the image ID, every volume and bind mount and
+    the exec user for the ``docker run`` argv.
+    """
+    completed = _run_docker(docker, ["inspect", instance.container_id], timeout)
+    if completed.returncode != 0:
+        raise DockerUnavailableError(
+            f"docker inspect exited {completed.returncode}: "
+            f"{completed.stderr.decode('utf-8', 'replace').strip()}"
+        )
+    try:
+        entries = json.loads(completed.stdout.decode("utf-8", "replace"))
+    except ValueError as exc:
+        raise DockerUnavailableError(f"docker inspect output is not JSON: {exc}") from exc
+    if not isinstance(entries, list) or not entries or not isinstance(entries[0], dict):
+        raise DockerUnavailableError("docker inspect output is not an array")
+    entry = entries[0]
+    if _entry_is_running(entry):
+        raise InstanceRunningError(instance.name)
+    image = entry.get("Image")
+    if not isinstance(image, str) or not image:
+        raise DockerUnavailableError(
+            f"docker inspect has no image for instance {instance.name!r}"
+        )
+    return OfflineTarget(image=image, mounts=_mounts_of(entry), exec_user=instance.exec_user)
+
+
+def offline_docker_argv(target: OfflineTarget, agentctl_argv: Sequence[str]) -> list[str]:
+    """Build the ``docker run`` argv for one Offline Read (spec section 3.2).
+
+    The stopped container's image runs removed (``--rm``) with no network,
+    every volume and bind mount re-mounted read-only at the same destination,
+    and ``agentctl --contract <major> --offline`` as the entrypoint command.
+    No TTY is allocated (no ``-t``/``--tty``/``-i``) and stdin is not used.
+    """
+    argv = ["run", "--rm", "--network", "none", "--user", target.exec_user]
+    for mount in target.mounts:
+        argv += [
+            "--mount",
+            f"type={mount.kind},src={mount.source},dst={mount.destination},readonly",
+        ]
+    argv += [
+        "--entrypoint",
+        AGENTCTL_PATH,
+        target.image,
+        "--contract",
+        str(CONTRACT_MAJOR),
+        "--offline",
+        *agentctl_argv,
+    ]
+    return argv
+
+
+def invoke_offline(
+    docker: str,
+    target: OfflineTarget,
+    agentctl_argv: list[str],
+    timeout: float = DEFAULT_TIMEOUT,
+) -> ExecResult:
+    """Run one Offline Read exactly as spec section 3.2.
+
+    The agentctl argv carries the read operation (``--offline`` is inserted
+    by :func:`offline_docker_argv`); the reply is interpreted with
+    :func:`interpret` exactly like an online read.
+    """
+    completed = _run_docker(docker, offline_docker_argv(target, agentctl_argv), timeout)
+    return ExecResult(
+        exit_code=completed.returncode,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+    )
 
 
 @dataclass(frozen=True)
@@ -726,6 +914,57 @@ def _verify_export_stream(data: bytes, attempt_id: str) -> tuple[dict[str, objec
     return manifest, None
 
 
+def _popen_offline(
+    docker: str, target: OfflineTarget, agentctl_argv: list[str]
+) -> subprocess.Popen[bytes]:
+    """Start an offline ``attempts export`` with piped stdout (spec section 3.2)."""
+    try:
+        return subprocess.Popen(
+            [docker, *offline_docker_argv(target, agentctl_argv)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        raise DockerUnavailableError(f"cannot run {docker!r}: {exc.strerror or exc}") from exc
+    except OSError as exc:
+        raise DockerUnavailableError(f"cannot run {docker!r}: {exc}") from exc
+
+
+def _drain_verified_export(
+    make_proc: Callable[[], subprocess.Popen[bytes]],
+    attempt_id: str,
+    effective_timeout: float,
+    attempts: int,
+) -> tuple[dict[str, object], bytes]:
+    """Drain one export tar per attempt with torn-read refetch; return manifest and bytes.
+
+    Every drained tar is verified (size and ``sha256`` against its manifest)
+    before it is trusted; a torn read of an unsealed archive is fetched again
+    within the bound. An envelope answered before streaming starts (for
+    example ``not_found``) raises :class:`ExportProducerError`; a tar that
+    stays torn raises :class:`TornExportError` and the caller discards the
+    output. Nothing is cached, so an unsealed moving snapshot is never
+    mistaken for a sealed archive.
+    """
+    torn_detail: str | None = None
+    for _attempt in range(1, attempts + 1):
+        proc = make_proc()
+        data, _stderr = _drain_with_progress(proc, effective_timeout)
+        exit_code = proc.returncode if proc.returncode is not None else 1
+        if exit_code != 0:
+            envelope = _parse_export_envelope(data)
+            if envelope is not None and envelope.get("ok") is False:
+                raise ExportProducerError(envelope, exit_code)
+            raise MalformedStdoutError(
+                f"export exited {exit_code} after streaming started; discarding the output"
+            )
+        manifest, torn_detail = _verify_export_stream(data, attempt_id)
+        if torn_detail is None:
+            return manifest, data
+    raise TornExportError(attempt_id, attempts, torn_detail or "sha256 mismatch")
+
+
 def export_attempt(
     docker: str,
     instance: Instance,
@@ -758,21 +997,39 @@ def export_attempt(
     attempts = max_attempts if max_attempts is not None else EXPORT_MAX_ATTEMPTS
     if attempts < 1:
         attempts = 1
-    torn_detail: str | None = None
-    for _attempt in range(1, attempts + 1):
-        proc = _popen(docker, instance, argv)
-        data, _stderr = _drain_with_progress(proc, effective_timeout)
-        exit_code = proc.returncode if proc.returncode is not None else 1
-        if exit_code != 0:
-            envelope = _parse_export_envelope(data)
-            if envelope is not None and envelope.get("ok") is False:
-                raise ExportProducerError(envelope, exit_code)
-            raise MalformedStdoutError(
-                f"export exited {exit_code} after streaming started; discarding the output"
-            )
-        manifest, torn_detail = _verify_export_stream(data, attempt_id)
-        if torn_detail is None:
-            if sink is not None:
-                sink(data)
-            return manifest
-    raise TornExportError(attempt_id, attempts, torn_detail or "sha256 mismatch")
+    manifest, data = _drain_verified_export(
+        lambda: _popen(docker, instance, argv), attempt_id, effective_timeout, attempts
+    )
+    if sink is not None:
+        sink(data)
+    return manifest
+
+
+def export_attempt_offline(
+    docker: str,
+    target: OfflineTarget,
+    attempt_id: str,
+    paths: Sequence[str] | None = None,
+    sink: Callable[[bytes], object] | None = None,
+    timeout: float | None = None,
+    max_attempts: int | None = None,
+) -> dict[str, object]:
+    """Stream one offline ``attempts export`` tar to ``sink`` (spec section 12).
+
+    The same torn-read refetch and verification as :func:`export_attempt`,
+    streamed through a ``docker run`` Offline Read instead of ``exec``.
+    """
+    wanted = list(paths) if paths else []
+    argv = ["attempts", "export", attempt_id]
+    for path in wanted:
+        argv += ["--path", path]
+    effective_timeout = timeout_for("attempts-export", timeout)
+    attempts = max_attempts if max_attempts is not None else EXPORT_MAX_ATTEMPTS
+    if attempts < 1:
+        attempts = 1
+    manifest, data = _drain_verified_export(
+        lambda: _popen_offline(docker, target, argv), attempt_id, effective_timeout, attempts
+    )
+    if sink is not None:
+        sink(data)
+    return manifest

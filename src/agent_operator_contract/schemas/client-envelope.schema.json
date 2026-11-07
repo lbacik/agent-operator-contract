@@ -36,6 +36,8 @@
             "client.contract_mismatch",
             "client.unsupported_capability",
             "client.usage",
+            "client.instance_stopped",
+            "client.instance_running",
             "client.export_torn"
           ]
         },
