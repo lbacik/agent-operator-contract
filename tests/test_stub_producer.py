@@ -1393,12 +1393,16 @@ def _stub_stack(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
         "#!/usr/bin/env python3\n"
         "import os\n"
         "import sys\n"
+        "if len(sys.argv) > 1 and sys.argv[1] == 'inspect':\n"
+        "    print('sha256:fake-image')\n"
         "if len(sys.argv) < 2 or sys.argv[1] != 'exec':\n"
         "    sys.exit(0)\n"
         "state = os.environ['FAKE_ENGINE_STATE']\n"
         "archives = os.environ['FAKE_ENGINE_ARCHIVES']\n"
+        "config = os.environ['FAKE_ENGINE_CONFIG']\n"
         "script = sys.stdin.read()\n"
         "script = script.replace('/data/archives', archives)\n"
+        "script = script.replace('/data/agent-operator-contract.config.json', config)\n"
         "script = script.replace('/data/agent-operator-contract.json', state)\n"
         "exec(compile(script, '<engine>', 'exec'), {})\n",
         encoding="utf-8",
@@ -1414,7 +1418,35 @@ def _stub_stack(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
     harness_env["STUB_HARNESS_STATE"] = str(harness_state)
     harness_env["FAKE_ENGINE_STATE"] = str(volume / "agent-operator-contract.json")
     harness_env["FAKE_ENGINE_ARCHIVES"] = str(volume / "archives")
+    harness_env["FAKE_ENGINE_CONFIG"] = str(volume / "agent-operator-contract.config.json")
     return agentctl_env, harness_env
+
+
+def test_harness_setup_honors_startup_hold_and_stores_the_configuration(tmp_path: Path) -> None:
+    agentctl_env, harness_env = _stub_stack(tmp_path)
+    Path(harness_env["STUB_HARNESS_STATE"]).write_text("{}", encoding="utf-8")
+
+    _harness_verb(
+        harness_env,
+        "setup",
+        {
+            "repository": "acme/widgets",
+            "capabilities": ["stop-after"],
+            "config": {"native.startup_hold": True},
+        },
+    )
+
+    instance = _status(agentctl_env)["instance"]
+    assert isinstance(instance, dict)
+    assert instance["state"] == "starting"
+    offline_env = dict(agentctl_env)
+    offline_env.pop("CONTRACT_CAPABILITIES", None)
+    offline_env.pop("CONTRACT_REPOSITORY", None)
+    identity = json.loads(
+        _run_agentctl(["--contract", "1", "--offline", "identity"], offline_env).stdout
+    )["result"]
+    assert identity["repository"] == "acme/widgets"
+    assert identity["capabilities"] == ["stop-after"]
 
 
 def _harness_verb(harness_env: dict[str, str], verb: str, params: dict[str, Any]) -> dict[str, Any]:

@@ -269,14 +269,13 @@ def test_harness_verb_enums_match_library() -> None:
     expected = list(documents.HARNESS_VERBS)
 
     assert HARNESS_REQUEST_SCHEMA["properties"]["verb"]["enum"] == expected
-    # A usage reply may echo an unknown verb, so the enum binds ok:true replies only.
-    (ok_true_rule,) = [
+    # Only a usage reply may echo an unknown verb, so the enum binds every other reply.
+    (verb_rule,) = [
         rule
         for rule in HARNESS_REPLY_SCHEMA["allOf"]
-        if rule["if"] == {"required": ["ok"], "properties": {"ok": {"const": True}}}
-        and "verb" in rule["then"].get("properties", {})
+        if "verb" in rule.get("else", {}).get("properties", {})
     ]
-    assert ok_true_rule["then"]["properties"]["verb"]["enum"] == expected
+    assert verb_rule["else"]["properties"]["verb"]["enum"] == expected
 
 
 def test_harness_point_enums_match_library() -> None:
@@ -724,3 +723,58 @@ def test_export_manifest_accepts_any_major_1_minor() -> None:
     manifest = {"contract": "1.3", "attempt": sealed["attempt"], "files": sealed["manifest"]}
     assert Draft202012Validator(documents.load_schema("export-manifest")).is_valid(manifest)
     assert documents.validate_export_manifest(manifest) == []
+
+
+def test_status_unit_tables_match_library() -> None:
+    budget = STATUS_SCHEMA["$defs"]["budget"]
+    for key in ("raw_tokens", "effective_tokens"):
+        assert budget["properties"][key]["properties"]["unit"]["const"] == "tokens"
+    limit_units = {
+        rule["if"]["properties"]["name"]["const"]: rule["then"]["properties"]["used"]["properties"][
+            "unit"
+        ]["const"]
+        for rule in budget["properties"]["limits"]["items"]["allOf"]
+    }
+    assert limit_units == documents.LIMIT_UNITS
+    figures = STATUS_SCHEMA["properties"]["current_attempt"]["properties"]["figures"]
+    figure_units = {
+        name: entry["properties"]["unit"]["const"] for name, entry in figures["properties"].items()
+    }
+    assert figure_units == documents.FIGURE_NAME_UNITS
+
+
+@pytest.mark.parametrize("schema_name", ["command", "mutation-result", "status"])
+def test_command_argument_rules_match_library(schema_name: str) -> None:
+    record = documents.load_schema(schema_name)["$defs"]["command_record"]
+    required = {
+        rule["if"]["properties"]["kind"]["const"]: tuple(
+            rule["then"]["properties"]["arguments"]["required"]
+        )
+        for rule in record["allOf"]
+    }
+    assert required == documents.COMMAND_ARGUMENTS
+
+
+def test_export_manifest_contract_pattern_matches_library() -> None:
+    schema = documents.load_schema("export-manifest")
+    assert schema["properties"]["contract"]["pattern"] == documents.EXPORT_CONTRACT_PATTERN
+
+
+def test_only_a_usage_reply_may_echo_an_unknown_verb() -> None:
+    failed = {
+        "harness": "1.0",
+        "verb": "fly",
+        "ok": False,
+        "error": {"code": "failed", "message": "no instance"},
+    }
+    assert not HARNESS_REPLY_VALIDATOR.is_valid(failed)
+    assert documents.validate_harness_reply(failed) != []
+
+
+def test_attempts_show_requires_events_jsonl_by_path() -> None:
+    show = json.loads(documents.load_fixture("attempts-show-sealed")["stdout"])["result"]
+    for entry in show["manifest"]:
+        if entry["kind"] == "events":
+            entry["path"] = "foo.ndjson"
+    assert not ATTEMPTS_SHOW_VALIDATOR.is_valid(show)
+    assert documents.validate_attempts_show(show) != []

@@ -57,8 +57,11 @@
       "then": {"required": ["result"], "not": {"required": ["error"]}}
     },
     {
-      "if": {"required": ["ok"], "properties": {"ok": {"const": true}}},
-      "then": {"properties": {"verb": {"enum": [
+      "if": {
+        "required": ["ok", "error"],
+        "properties": {"ok": {"const": false}, "error": {"required": ["code"], "properties": {"code": {"const": "usage"}}}}
+      },
+      "else": {"properties": {"verb": {"enum": [
             "setup",
             "teardown",
             "set-issue",

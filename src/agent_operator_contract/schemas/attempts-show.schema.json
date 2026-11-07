@@ -9,7 +9,11 @@
     "manifest": {
       "type": "array",
       "items": {"$ref": "#/$defs/manifest_entry"},
-      "contains": {"type": "object", "required": ["kind"], "properties": {"kind": {"const": "events"}}},
+      "contains": {
+        "type": "object",
+        "required": ["path", "kind"],
+        "properties": {"path": {"const": "events.jsonl"}, "kind": {"const": "events"}}
+      },
       "description": "Every Attempt Archive holds events.jsonl with kind events (spec section 11.1)."
     }
   },

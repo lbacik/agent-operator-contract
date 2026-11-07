@@ -370,60 +370,60 @@
               "limit": {"$ref": "#/$defs/figure"}
             },
             "allOf": [
-                {
-                  "if": {"properties": {"name": {"const": "raw_tokens"}}, "required": ["name"]},
-                  "then": {
-                    "properties": {
-                      "used": {"properties": {"unit": {"const": "tokens"}}},
-                      "limit": {"properties": {"unit": {"const": "tokens"}}}
-                    }
-                  }
-                },
-                {
-                  "if": {"properties": {"name": {"const": "effective_tokens"}}, "required": ["name"]},
-                  "then": {
-                    "properties": {
-                      "used": {"properties": {"unit": {"const": "tokens"}}},
-                      "limit": {"properties": {"unit": {"const": "tokens"}}}
-                    }
-                  }
-                },
-                {
-                  "if": {"properties": {"name": {"const": "cost_usd"}}, "required": ["name"]},
-                  "then": {
-                    "properties": {
-                      "used": {"properties": {"unit": {"const": "usd"}}},
-                      "limit": {"properties": {"unit": {"const": "usd"}}}
-                    }
-                  }
-                },
-                {
-                  "if": {"properties": {"name": {"const": "wall_clock_seconds"}}, "required": ["name"]},
-                  "then": {
-                    "properties": {
-                      "used": {"properties": {"unit": {"const": "seconds"}}},
-                      "limit": {"properties": {"unit": {"const": "seconds"}}}
-                    }
-                  }
-                },
-                {
-                  "if": {"properties": {"name": {"const": "tool_calls"}}, "required": ["name"]},
-                  "then": {
-                    "properties": {
-                      "used": {"properties": {"unit": {"const": "count"}}},
-                      "limit": {"properties": {"unit": {"const": "count"}}}
-                    }
-                  }
-                },
-                {
-                  "if": {"properties": {"name": {"const": "turns"}}, "required": ["name"]},
-                  "then": {
-                    "properties": {
-                      "used": {"properties": {"unit": {"const": "count"}}},
-                      "limit": {"properties": {"unit": {"const": "count"}}}
-                    }
+              {
+                "if": {"properties": {"name": {"const": "raw_tokens"}}, "required": ["name"]},
+                "then": {
+                  "properties": {
+                    "used": {"properties": {"unit": {"const": "tokens"}}},
+                    "limit": {"properties": {"unit": {"const": "tokens"}}}
                   }
                 }
+              },
+              {
+                "if": {"properties": {"name": {"const": "effective_tokens"}}, "required": ["name"]},
+                "then": {
+                  "properties": {
+                    "used": {"properties": {"unit": {"const": "tokens"}}},
+                    "limit": {"properties": {"unit": {"const": "tokens"}}}
+                  }
+                }
+              },
+              {
+                "if": {"properties": {"name": {"const": "cost_usd"}}, "required": ["name"]},
+                "then": {
+                  "properties": {
+                    "used": {"properties": {"unit": {"const": "usd"}}},
+                    "limit": {"properties": {"unit": {"const": "usd"}}}
+                  }
+                }
+              },
+              {
+                "if": {"properties": {"name": {"const": "wall_clock_seconds"}}, "required": ["name"]},
+                "then": {
+                  "properties": {
+                    "used": {"properties": {"unit": {"const": "seconds"}}},
+                    "limit": {"properties": {"unit": {"const": "seconds"}}}
+                  }
+                }
+              },
+              {
+                "if": {"properties": {"name": {"const": "tool_calls"}}, "required": ["name"]},
+                "then": {
+                  "properties": {
+                    "used": {"properties": {"unit": {"const": "count"}}},
+                    "limit": {"properties": {"unit": {"const": "count"}}}
+                  }
+                }
+              },
+              {
+                "if": {"properties": {"name": {"const": "turns"}}, "required": ["name"]},
+                "then": {
+                  "properties": {
+                    "used": {"properties": {"unit": {"const": "count"}}},
+                    "limit": {"properties": {"unit": {"const": "count"}}}
+                  }
+                }
+              }
             ]
           }
         }

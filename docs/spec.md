@@ -240,7 +240,7 @@ truncated             bool
 | `paused` | Intake closed, no active Attempt. |
 | `stopped` | Offline only: the process is not running. |
 
-`Halt` is `{ "reason": string, "detail": string, "at": timestamp }`, recorded durably by the engine before it exits and reported on the next start and offline.
+`Halt` is `{ "reason": string, "detail": string, "at": timestamp }` with a non-empty `reason`, recorded durably by the engine before it exits and reported on the next start and offline.
 
 `CurrentAttempt`:
 

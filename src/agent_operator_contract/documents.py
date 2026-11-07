@@ -67,6 +67,9 @@ REPOSITORY_PATTERN = r"^[^/\s]+/[^/\s]+$"
 """Target Repository written owner/name."""
 
 CONTRACT_MAJOR_PATTERN = r"^[0-9]+$"
+
+EXPORT_CONTRACT_PATTERN = r"^1\.[0-9]+$"
+"""The export manifest's ``contract``: a major-1 ``major.minor`` (spec section 11.3)."""
 """Contract major from the discovery label, e.g. 1 (spec section 2.1)."""
 
 CLIENT_CODE_PATTERN = r"^client\.[a-z_]+$"
@@ -548,10 +551,10 @@ def validate_figure(doc: object, prefix: str = "figure") -> list[str]:
     return errors
 
 
-def _validate_figure_unit(doc: object, unit: str, prefix: str) -> list[str]:
-    """A Figure whose name fixes its unit (spec sections 7.2 and 9.2)."""
+def _validate_figure_unit(doc: object, unit: str | None, prefix: str) -> list[str]:
+    """A Figure whose name may fix its unit (spec sections 7.2 and 9.2); None leaves it open."""
     errors = validate_figure(doc, prefix)
-    if isinstance(doc, dict) and "unit" in doc and doc["unit"] != unit:
+    if unit is not None and isinstance(doc, dict) and "unit" in doc and doc["unit"] != unit:
         errors.append(f"{prefix}.unit must be {unit!r}")
     return errors
 
@@ -616,11 +619,7 @@ def _validate_budget(doc: object, prefix: str = "budget") -> list[str]:
                         errors.append(f"{item_prefix}.name {name!r} is not a known 1.0 limit")
                 unit = LIMIT_UNITS.get(name) if isinstance(name, str) else None
                 for key in ("used", "limit"):
-                    if key not in entry:
-                        continue
-                    if unit is None:
-                        errors.extend(validate_figure(entry[key], f"{item_prefix}.{key}"))
-                    else:
+                    if key in entry:
                         errors.extend(
                             _validate_figure_unit(entry[key], unit, f"{item_prefix}.{key}")
                         )
@@ -682,13 +681,11 @@ def _validate_current_attempt(doc: object) -> list[str]:
             errors.append("current_attempt.figures must be an object")
         else:
             for name, figure in figures.items():
-                figure_prefix = f"current_attempt.figures.{name}"
-                if name in FIGURE_NAME_UNITS:
-                    errors.extend(
-                        _validate_figure_unit(figure, FIGURE_NAME_UNITS[name], figure_prefix)
+                errors.extend(
+                    _validate_figure_unit(
+                        figure, FIGURE_NAME_UNITS.get(name), f"current_attempt.figures.{name}"
                     )
-                else:
-                    errors.extend(validate_figure(figure, figure_prefix))
+                )
     return errors
 
 
@@ -891,7 +888,10 @@ def validate_attempts_show(doc: object) -> list[str]:
         for index, entry in enumerate(doc["manifest"]):
             errors.extend(validate_manifest_entry(entry, f"attempts show result.manifest[{index}]"))
         if not any(
-            isinstance(entry, dict) and entry.get("kind") == "events" for entry in doc["manifest"]
+            isinstance(entry, dict)
+            and entry.get("kind") == "events"
+            and entry.get("path") == "events.jsonl"
+            for entry in doc["manifest"]
         ):
             errors.append("attempts show result.manifest must list events.jsonl (kind events)")
     return errors
@@ -909,7 +909,7 @@ def validate_export_manifest(doc: object) -> list[str]:
     errors: list[str] = []
     if "contract" not in doc:
         errors.append("export manifest is missing required property: 'contract'")
-    elif not _matches(r"^1\.[0-9]+$", doc["contract"]):
+    elif not _matches(EXPORT_CONTRACT_PATTERN, doc["contract"]):
         errors.append("export manifest contract must be a major-1 '1.<minor>' version")
     if "attempt" not in doc:
         errors.append("export manifest is missing required property: 'attempt'")
@@ -1545,6 +1545,11 @@ def _validate_grow_archive_params(params: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _is_usage_reply(doc: dict[str, Any]) -> bool:
+    error = doc.get("error")
+    return doc.get("ok") is False and isinstance(error, dict) and error.get("code") == "usage"
+
+
 def validate_harness_reply(doc: object) -> list[str]:
     """Check a harness reply document; the empty list means valid (spec section 15.1)."""
     if not isinstance(doc, dict):
@@ -1557,8 +1562,8 @@ def validate_harness_reply(doc: object) -> list[str]:
     verb = doc.get("verb")
     if "verb" in doc and (not isinstance(verb, str) or not verb):
         errors.append("harness reply verb must be a non-empty string")
-    elif "verb" in doc and doc.get("ok") is True and verb not in HARNESS_VERBS:
-        # A usage reply may echo an unknown verb; a success names a known one.
+    elif "verb" in doc and verb not in HARNESS_VERBS and not _is_usage_reply(doc):
+        # Only a usage reply may echo an unknown verb (spec section 15.1).
         errors.append(f"harness reply verb {verb!r} is not a known 1.0 verb")
     if "ok" not in doc:
         errors.append("harness reply is missing required property: 'ok'")

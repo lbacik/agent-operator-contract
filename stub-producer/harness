@@ -349,8 +349,8 @@ def _do_setup(verb: str, params: dict[str, Any]) -> tuple[str, int]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return _error(verb, "failed", f"docker is unavailable: {exc}")
     _write_state({"container": name, "volume": volume, "data_path": "/data"})
-    config = json.dumps({"repository": repository, "capabilities": sorted(capabilities)})
-    written = _write_volume_config(name, config)
+    volume_config = json.dumps({"repository": repository, "capabilities": sorted(capabilities)})
+    written = _write_volume_config(name, volume_config)
     if written is not None:
         return _error(verb, "failed", written)
     startup_hold = False
