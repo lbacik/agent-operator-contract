@@ -93,6 +93,8 @@ def _negative_schema(name: str) -> Draft202012Validator:
         return Draft202012Validator(documents.load_schema("export-manifest"))
     if name.startswith("contract-event-"):
         return Draft202012Validator(documents.load_schema("contract-event"))
+    if name.startswith("command-"):
+        return Draft202012Validator(documents.load_schema("command"))
     raise AssertionError(f"negative example without a schema: {name}")
 
 
@@ -127,6 +129,8 @@ def _negative_library_errors(name: str, doc: Any) -> list[str]:
         return documents.validate_export_manifest(doc)
     if name.startswith("contract-event-"):
         return documents.validate_contract_event(doc)
+    if name.startswith("command-"):
+        return documents.validate_command_result(doc)
     raise AssertionError(f"negative example without a schema: {name}")
 
 
@@ -265,7 +269,14 @@ def test_harness_verb_enums_match_library() -> None:
     expected = list(documents.HARNESS_VERBS)
 
     assert HARNESS_REQUEST_SCHEMA["properties"]["verb"]["enum"] == expected
-    assert HARNESS_REPLY_SCHEMA["properties"]["verb"]["enum"] == expected
+    # A usage reply may echo an unknown verb, so the enum binds ok:true replies only.
+    (ok_true_rule,) = [
+        rule
+        for rule in HARNESS_REPLY_SCHEMA["allOf"]
+        if rule["if"] == {"required": ["ok"], "properties": {"ok": {"const": True}}}
+        and "verb" in rule["then"].get("properties", {})
+    ]
+    assert ok_true_rule["then"]["properties"]["verb"]["enum"] == expected
 
 
 def test_harness_point_enums_match_library() -> None:
@@ -680,3 +691,36 @@ def test_status_recent_events_validate_as_contract_events() -> None:
         for event in snapshot.get("recent_events", []):
             assert CONTRACT_EVENT_VALIDATOR.is_valid(event), (name, event)
             assert documents.validate_contract_event(event) == [], (name, event)
+
+
+def test_manifest_path_forbids_a_dotdot_segment_not_a_dotdot_substring() -> None:
+    entry = {
+        "path": "notes/a..b.txt",
+        "kind": "other",
+        "media_type": "text/plain",
+        "size": 1,
+        "sha256": "0" * 64,
+    }
+    assert MANIFEST_ENTRY_VALIDATOR.is_valid(entry)
+    assert documents.validate_manifest_entry(entry) == []
+    for bad in ("..", "../a", "a/..", "a/../b", "/a"):
+        assert not MANIFEST_ENTRY_VALIDATOR.is_valid(dict(entry, path=bad)), bad
+        assert documents.validate_manifest_entry(dict(entry, path=bad)) != [], bad
+
+
+def test_usage_reply_may_echo_an_unknown_verb() -> None:
+    reply = {
+        "harness": "1.0",
+        "verb": "fly",
+        "ok": False,
+        "error": {"code": "usage", "message": "unknown verb 'fly'"},
+    }
+    assert HARNESS_REPLY_VALIDATOR.is_valid(reply)
+    assert documents.validate_harness_reply(reply) == []
+
+
+def test_export_manifest_accepts_any_major_1_minor() -> None:
+    sealed = json.loads(documents.load_fixture("attempts-show-sealed")["stdout"])["result"]
+    manifest = {"contract": "1.3", "attempt": sealed["attempt"], "files": sealed["manifest"]}
+    assert Draft202012Validator(documents.load_schema("export-manifest")).is_valid(manifest)
+    assert documents.validate_export_manifest(manifest) == []

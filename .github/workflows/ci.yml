@@ -33,11 +33,22 @@ jobs:
       - run: uv sync --locked
       - name: Build the stub producer image (test-only, never published)
         run: docker build -f stub-producer/Dockerfile -t stub-producer:ci .
-      - name: Run the producer suite against the stub producer
+      # Every capability advertised: every scenario must run and pass, with no
+      # expected failures (release gate for v1.0.0, issue #17).
+      - name: Producer suite, every capability, every scenario required
         run: |
           STUB_PRODUCER_IMAGE=stub-producer:ci \
             uv run --locked python -m agent_operator_contract.producer_suite \
-              --harness ./stub-producer/harness
+              --harness ./stub-producer/harness \
+              --capabilities stop-after,next-issue,operator-handoff,recovery-retry,recovery-release,errors-reset,pool \
+              --require-all
+      # Core only: unsupported-capability probes every optional operation.
+      - name: Producer suite, core only
+        run: |
+          STUB_PRODUCER_IMAGE=stub-producer:ci \
+            uv run --locked python -m agent_operator_contract.producer_suite \
+              --harness ./stub-producer/harness \
+              --capabilities ""
 
   package:
     runs-on: ubuntu-latest

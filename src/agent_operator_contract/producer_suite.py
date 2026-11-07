@@ -12,7 +12,9 @@ identifiers; output is one line per scenario (passed, failed or not run with a
 reason) plus a summary, and the exit code is non-zero when any scenario
 fails. An engine can pass ``--expect-fail`` scenario IDs for known failures:
 a listed scenario that fails does not fail the run, while a listed scenario
-that passes (or is missing) is reported and fails the run.
+that passes (or is missing) is reported and fails the run. ``--require-all``
+also fails the run when a scenario does not run (an unadvertised capability
+or an unsupported harness verb).
 
 Standard library only.
 """
@@ -185,11 +187,17 @@ def _docker_exec(
 def _popen_export(
     docker: str, container: str, exec_user: str, agentctl_argv: list[str]
 ) -> subprocess.Popen[bytes]:
-    """Start ``agentctl attempts export`` streaming; the caller times first bytes."""
+    """Start ``agentctl attempts export`` streaming; the caller times first bytes.
+
+    Unbuffered (``bufsize=0``): ``_read_first_byte`` then takes exactly one
+    byte from the pipe, and ``communicate`` reads the rest from the same file
+    descriptor without losing bytes to a read-ahead buffer.
+    """
     return subprocess.Popen(
         [docker, "exec", "--user", exec_user, container, AGENTCTL, *agentctl_argv],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        bufsize=0,
     )
 
 
@@ -237,11 +245,15 @@ def _docker_run(
 
 
 def _popen_run(ctx: SuiteContext, agentctl_argv: list[str]) -> subprocess.Popen[bytes]:
-    """Start one offline ``attempts export`` streaming through ``docker run``."""
+    """Start one offline ``attempts export`` streaming through ``docker run``.
+
+    Unbuffered for the same reason as ``_popen_export``.
+    """
     return subprocess.Popen(
         _docker_run_argv(ctx, agentctl_argv),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        bufsize=0,
     )
 
 
@@ -596,6 +608,19 @@ def _intake_state(ctx: SuiteContext, scenario_id: str) -> tuple[str | None, Scen
         return None, ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
     doc = json.loads(answered.stdout)
     return str(doc["result"]["intake"]["state"]), None
+
+
+def _require_capability(
+    ctx: SuiteContext, scenario_id: str, capability: str
+) -> ScenarioOutcome | None:
+    """Skip a scenario whose Operator Capability the producer does not advertise.
+
+    The ``unsupported-capability`` scenario covers the unadvertised side; the
+    capability's own scenario runs only where the capability is advertised.
+    """
+    if capability in ctx.capabilities:
+        return None
+    return ScenarioOutcome(scenario_id, "not_run", f"capability {capability!r} is not advertised")
 
 
 def _ensure_intake(ctx: SuiteContext, scenario_id: str, want: str) -> ScenarioOutcome | None:
@@ -2011,9 +2036,10 @@ def scenario_crash_between_commit_and_reply(
     """Mutation commits, the process dies before replying, the retry replays it.
 
     The harness arms a one-shot crash between commit and reply; the first
-    mutation gets no reply, and the retry with the same request ID returns
-    the stored record with ``replayed: true`` while the command store shows
-    the single committed effect.
+    mutation gets no reply. The suite restarts the instance (spec section 14:
+    the consumer retries "after restart"), and the retry with the same
+    request ID returns the stored record with ``replayed: true`` while the
+    command store shows the single committed effect.
     """
     scenario_id = "crash-between-commit-and-reply"
     steer = _ensure_intake(ctx, scenario_id, "open")
@@ -2047,6 +2073,9 @@ def scenario_crash_between_commit_and_reply(
             "failed",
             f"expected no reply to the crash, got: {first.stdout.strip()}",
         )
+    restarted = _restart_after_crash(ctx, harness_cmd, scenario_id)
+    if restarted is not None:
+        return restarted
     second = _exec(scenario_id, argv, ctx)
     if isinstance(second, ScenarioOutcome):
         return second
@@ -2181,6 +2210,29 @@ def _submit(
     if problems:
         return None, ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
     return json.loads(answered.stdout)["result"]["command"], None
+
+
+def _restart_after_crash(
+    ctx: SuiteContext, harness_cmd: Sequence[str], scenario_id: str
+) -> ScenarioOutcome | None:
+    """Start the crashed instance again and wait until it is ready (spec 2.3).
+
+    Releases the startup hold the harness may keep after a start, so the next
+    call reaches a ready engine and later scenarios inherit a live instance.
+    """
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+    if outcome is not None:
+        return outcome
+    for _ in range(3):
+        snapshot, outcome = _snapshot(ctx, scenario_id)
+        if outcome is not None or snapshot is None:
+            return outcome or ScenarioOutcome(scenario_id, "failed", "no status after restart")
+        if snapshot["instance"]["state"] not in ("starting", "recovering"):
+            return None
+        _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+        if outcome is not None:
+            return outcome
+    return ScenarioOutcome(scenario_id, "failed", "the instance did not become ready after restart")
 
 
 def _settle(
@@ -2412,11 +2464,6 @@ def scenario_stop_during_starting(ctx: SuiteContext, harness_cmd: Sequence[str])
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
-    _, outcome = _harness(
-        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 103, "eligible": True}
-    )
-    if outcome is not None:
-        return outcome
     before, outcome = _snapshot(ctx, scenario_id)
     if outcome is not None or before is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "no status before restart")
@@ -2425,6 +2472,13 @@ def scenario_stop_during_starting(ctx: SuiteContext, harness_cmd: Sequence[str])
     if outcome is not None:
         return outcome
     _, outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
+    if outcome is not None:
+        return outcome
+    # The issue becomes eligible only once the instance is starting, so a
+    # running engine cannot open a Claim before the restart.
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 103, "eligible": True}
+    )
     if outcome is not None:
         return outcome
     snapshot, outcome = _snapshot(ctx, scenario_id)
@@ -2491,6 +2545,12 @@ def scenario_resume_supersedes_stop(
         return outcome or ScenarioOutcome(scenario_id, "failed", "no status for the claim")
     if snapshot["current_attempt"] is None:
         return ScenarioOutcome(scenario_id, "failed", "an eligible issue must open a claim")
+    # Ineligible again at once, so finishing this Attempt opens no next Claim.
+    _, outcome = _harness(
+        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 104, "eligible": False}
+    )
+    if outcome is not None:
+        return outcome
     stop_id = _new_request_id()
     record, outcome = _submit(ctx, scenario_id, "stop", stop_id)
     if outcome is not None or record is None:
@@ -2541,17 +2601,15 @@ def scenario_resume_supersedes_stop(
         return outcome or ScenarioOutcome(scenario_id, "failed", "no status after finishing")
     if snapshot["current_attempt"] is not None:
         return ScenarioOutcome(scenario_id, "failed", "the attempt must finish")
-    _, outcome = _harness(
-        ctx, harness_cmd, scenario_id, "set-issue", {"issue": 104, "eligible": False}
-    )
-    if outcome is not None:
-        return outcome
     return ScenarioOutcome(scenario_id, "passed")
 
 
 def scenario_stop_after_invalid(ctx: SuiteContext) -> ScenarioOutcome:
     """``stop --after 0`` is ``invalid_argument``; nothing stored, ID reusable."""
     scenario_id = "stop-after-invalid"
+    gated = _require_capability(ctx, scenario_id, "stop-after")
+    if gated is not None:
+        return gated
     steer = _ensure_intake(ctx, scenario_id, "open")
     if steer is not None:
         return steer
@@ -2612,6 +2670,9 @@ def scenario_stop_after_invalid(ctx: SuiteContext) -> ScenarioOutcome:
 def scenario_stop_after_restart(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """``stop --after N`` in progress, restart: the counter survives and continues."""
     scenario_id = "stop-after-restart"
+    gated = _require_capability(ctx, scenario_id, "stop-after")
+    if gated is not None:
+        return gated
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
@@ -2772,6 +2833,9 @@ def scenario_stop_after_restart(ctx: SuiteContext, harness_cmd: Sequence[str]) -
 def scenario_next_issue_restart(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """``next issue N`` committed, restart before Claim: priority survives and applies."""
     scenario_id = "next-issue-restart"
+    gated = _require_capability(ctx, scenario_id, "next-issue")
+    if gated is not None:
+        return gated
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
@@ -3468,6 +3532,9 @@ def _expect_rejection(
 def scenario_handoff(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """``handoff now`` completes the active Attempt and seals it as handoff."""
     scenario_id = "handoff"
+    gated = _require_capability(ctx, scenario_id, "operator-handoff")
+    if gated is not None:
+        return gated
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
@@ -3592,6 +3659,9 @@ def scenario_handoff(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioO
 def scenario_handoff_crash(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """``handoff now`` in progress, crash: ``not_fulfilled``, partial work retained."""
     scenario_id = "handoff-crash"
+    gated = _require_capability(ctx, scenario_id, "operator-handoff")
+    if gated is not None:
+        return gated
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
@@ -3706,6 +3776,9 @@ def scenario_handoff_crash(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
 def scenario_recovery_retry(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """``recovery retry`` retries safe finalization without touching the verdict."""
     scenario_id = "recovery-retry"
+    gated = _require_capability(ctx, scenario_id, "recovery-retry")
+    if gated is not None:
+        return gated
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
@@ -3801,6 +3874,9 @@ def scenario_recovery_retry(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sc
 def scenario_recovery_release(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """``recovery release`` records ``--saved-at``, releases and finalizes."""
     scenario_id = "recovery-release"
+    gated = _require_capability(ctx, scenario_id, "recovery-release")
+    if gated is not None:
+        return gated
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
@@ -3978,6 +4054,9 @@ def scenario_recovery_release(ctx: SuiteContext, harness_cmd: Sequence[str]) -> 
 def scenario_errors_reset(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
     """``errors reset`` resets the durable infrastructure-error guard."""
     scenario_id = "errors-reset"
+    gated = _require_capability(ctx, scenario_id, "errors-reset")
+    if gated is not None:
+        return gated
     settled = _settle(ctx, harness_cmd, scenario_id)
     if settled is not None:
         return settled
@@ -4198,6 +4277,59 @@ def scenario_ids() -> list[str]:
     return [scenario.id for scenario in SCENARIOS]
 
 
+SECTION_14_COVERAGE: dict[str, tuple[str, ...]] = {
+    "Mutation commits, the process dies before replying": ("crash-between-commit-and-reply",),
+    "Same request ID, different payload": ("payload-mismatch",),
+    "`stop` before the Claim boundary, then a crash": ("stop-before-claim-crash",),
+    "`stop` after the Claim boundary, then SIGTERM": ("stop-after-claim-sigterm",),
+    "`stop` during `starting`": ("stop-during-starting",),
+    "`resume` while a stop is `accepted`": ("resume-supersedes-stop",),
+    "`next issue N` committed, restart before Claim": ("next-issue-restart",),
+    "`stop --after N` in progress, restart": ("stop-after-restart",),
+    "`handoff now` in progress, crash": ("handoff-crash",),
+    "Unadvertised capability invoked": ("unsupported-capability",),
+    "`--contract 2` against a major-1 producer": ("contract-mismatch",),
+    "Wrong `--expect-repo` on any mutation": ("repository-mismatch",),
+    "Status during a long-held engine lock": ("status-during-lock",),
+    "Outcome recorded, finalization still writing": ("sealed-after-outcome",),
+    "Export of an unsealed archive while a file grows": ("export-torn-read",),
+    "Halt (process exit by engine decision)": ("halt-records-last-halt",),
+    "Offline Read while the container is running": ("offline-while-running",),
+    "Publication effect pending at restart": ("publication-pending-recovery",),
+}
+"""Which scenarios cover each row of spec section 14, keyed by the row's first cell.
+
+A coverage gate in this repository's CI pins the keys to the rows of the
+spec table, so a new row without a scenario fails the build.
+"""
+
+OPERATION_COVERAGE: dict[str, tuple[str, ...]] = {
+    "identity": ("identity", "offline-reads"),
+    "status": ("status", "status-during-lock", "snapshot-bounds", "offline-reads"),
+    "command <request-id>": ("command-found", "command-not-found", "offline-reads"),
+    "attempts list [--limit N] [--before <cursor>]": ("attempts-list-paging", "offline-reads"),
+    "attempts show <attempt-id>": ("attempts-show", "attempts-not-found", "offline-reads"),
+    "attempts export <attempt-id> [--path <path>]...": (
+        "budget-export",
+        "export-torn-read",
+        "offline-reads",
+    ),
+    "stop": ("stop-replay", "stop-before-claim-crash", "stop-after-claim-sigterm"),
+    "stop --after N": ("stop-after-invalid", "stop-after-restart"),
+    "resume": ("resume", "resume-supersedes-stop"),
+    "next issue N": ("next-issue-restart",),
+    "handoff now": ("handoff", "handoff-crash"),
+    "recovery retry <attempt-id>": ("recovery-retry",),
+    "recovery release <attempt-id> --saved-at <location>": ("recovery-release",),
+    "errors reset": ("errors-reset",),
+}
+"""Which scenarios exercise each operation of spec section 6, keyed by its table cell.
+
+``unsupported-capability`` additionally covers every optional operation whose
+capability the producer does not advertise.
+"""
+
+
 def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutcome]:
     """Run every scenario against the instance in ``ctx``."""
     return [
@@ -4246,13 +4378,17 @@ def run_all(ctx: SuiteContext, harness_cmd: Sequence[str]) -> list[ScenarioOutco
 
 
 def apply_expect_fail(
-    outcomes: Sequence[ScenarioOutcome], expect_fail: Sequence[str]
+    outcomes: Sequence[ScenarioOutcome],
+    expect_fail: Sequence[str],
+    *,
+    require_all: bool = False,
 ) -> tuple[list[str], int]:
     """Render the report lines and the suite exit code.
 
     A listed scenario that fails becomes an expected failure and does not
     fail the run. A listed scenario that passes, does not run or does not
-    exist is reported as unexpected and fails the run.
+    exist is reported as unexpected and fails the run. With ``require_all``
+    a scenario that does not run fails the run too.
     """
     expected = set(expect_fail)
     titles = {scenario.id: scenario.title for scenario in SCENARIOS}
@@ -4274,6 +4410,8 @@ def apply_expect_fail(
         else:
             reason = f": {outcome.detail}" if outcome.detail else ""
             lines.append(f"NOT RUN {outcome.scenario_id}: {scenario}{reason}")
+            if require_all and outcome.scenario_id not in expected:
+                failed += 1
             if outcome.scenario_id in expected:
                 lines.append(
                     f"UNEXPECTED PASS {outcome.scenario_id}: listed in --expect-fail "
@@ -4309,6 +4447,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         help="scenario ID expected to fail (repeatable, comma-separated)",
+    )
+    parser.add_argument(
+        "--require-all",
+        action="store_true",
+        help="fail the run when any scenario does not run",
     )
     parser.add_argument("--timeout", type=float, default=30.0, help="per-call timeout")
     return parser
@@ -4356,7 +4499,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         outcomes = run_all(ctx, harness_cmd)
     finally:
         teardown = _call_harness(harness_cmd, "teardown", {}, args.timeout)
-    lines, exit_code = apply_expect_fail(outcomes, _parse_expect_fail(args.expect_fail))
+    lines, exit_code = apply_expect_fail(
+        outcomes, _parse_expect_fail(args.expect_fail), require_all=args.require_all
+    )
     for line in lines:
         print(line)
     if teardown.status != "ok":

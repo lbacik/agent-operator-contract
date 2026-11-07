@@ -76,15 +76,44 @@ def _utc_now() -> str:
     )
 
 
+CONFIG_FILENAME = "agent-operator-contract.config.json"
+"""Instance configuration on the volume, written by the harness at setup.
+
+An Offline Read runs the image with ``docker run`` and no environment
+(spec section 3.2), so the stub reads its Target Repository and Operator
+Capabilities from the volume, as a real engine reads its own configuration.
+The environment wins when it is set (direct invocations in unit tests).
+"""
+
+
+def _volume_config() -> dict[str, Any]:
+    directory = os.environ.get("CONTRACT_STATE_DIR", "/data")
+    try:
+        with open(os.path.join(directory, CONFIG_FILENAME), encoding="utf-8") as handle:
+            doc = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return doc if isinstance(doc, dict) else {}
+
+
 def _advertised_capabilities() -> set[str]:
     raw = os.environ.get("CONTRACT_CAPABILITIES")
-    if raw is None:
-        return set(shared.OPERATOR_CAPABILITIES) - {"pool"}
-    return {piece.strip() for piece in raw.split(",") if piece.strip()}
+    if raw is not None:
+        return {piece.strip() for piece in raw.split(",") if piece.strip()}
+    configured = _volume_config().get("capabilities")
+    if isinstance(configured, list) and all(isinstance(item, str) for item in configured):
+        return set(configured)
+    return set(shared.OPERATOR_CAPABILITIES) - {"pool"}
 
 
 def _repository() -> str:
-    return os.environ.get("CONTRACT_REPOSITORY", "example-owner/example-repo")
+    raw = os.environ.get("CONTRACT_REPOSITORY")
+    if raw is not None:
+        return raw
+    configured = _volume_config().get("repository")
+    if isinstance(configured, str) and configured:
+        return configured
+    return "example-owner/example-repo"
 
 
 def _state_path() -> str | None:
@@ -384,21 +413,22 @@ def _release_lock(handle: io.TextIO | None) -> None:
 def _live_holder_present() -> bool:
     """Probe whether a live engine holds the volume lock (spec section 12).
 
-    An Offline Read mounts the volume read-only, so opening the lock file for
-    writing fails and there is no live holder in this mount: serve the read.
-    When another process holds the exclusive lock, a live engine owns the
-    volume and the offline read must be refused. A free lock means no engine
-    is running: serve the read.
+    An Offline Read mounts the volume read-only (spec section 3.2), so the
+    lock file is opened for reading only; ``flock`` does not need write
+    access and sees a holder in the running container through the shared
+    inode. The probe asks for a shared lock without waiting: it conflicts
+    only with an engine's exclusive lock, never with another offline reader,
+    and is released at once. A missing lock file means no engine ever ran.
     """
     lock_path = _lock_path()
     if _FCNTL is None or lock_path is None:
         return False
     try:
-        handle = open(lock_path, "a", encoding="utf-8")
+        handle = open(lock_path, encoding="utf-8")
     except OSError:
         return False
     try:
-        _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_EX | _FCNTL.LOCK_NB)
+        _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_SH | _FCNTL.LOCK_NB)
     except OSError:
         handle.close()
         return True

@@ -1,6 +1,6 @@
 # Operator contract, major version 1
 
-**Status:** draft for `v1.0.0`. The `v1.0.0` tag is cut when the JSON Schemas, conformance suite, shared library and `agentfleet` exist (adoption step 1 in [the adoption plan](./adoption-plan.md)). Until then this prose is the normative source.
+**Status:** final for `v1.0.0`. The tag `v1.0.0` carries this text together with the JSON Schemas, fixtures, conformance suite, shared library and `agentfleet` (adoption step 1 in [the adoption plan](./adoption-plan.md)). From `v1.0.0` on, the [JSON Schemas](../src/agent_operator_contract/schemas/) are normative for document shape and this prose is normative for semantics; where they would disagree on shape, the schema wins and the disagreement is a defect to fix in a patch release.
 
 **Provenance.** Agreed with the owner in [What versioned operator contract and adoption plan should all four repositories implement?](https://github.com/lbacik/coding-agent/issues/192), building on [What common operator capabilities define an Agent Forge-compatible agent?](https://github.com/lbacik/coding-agent/issues/190#issuecomment-6680989084) (the capability surface) and [Where should the shared agent interface live, and what should it own?](https://github.com/lbacik/coding-agent/issues/191#issuecomment-6681592096) (the repository allocation). Source facts were read at simple-coding-agent `38aaee1`, coding-agent `9a13c34`, agent-forge `04d6eff` and agent-dashboard `b1e5ff4`.
 
@@ -111,7 +111,7 @@ Every operation except a successful `attempts export` writes **exactly one JSON 
 - `error.code` is the machine-readable cause. `message` is for humans and MUST NOT be parsed.
 - `retryable: true` means the same request (same request ID, same payload) may be sent again.
 - `request_id` is present when the failed call was a mutation that carried one.
-- `details` is an object of code-specific fields; consumers MUST ignore unknown keys.
+- `details` is an object of code-specific fields; consumers MUST ignore unknown keys. `contract_mismatch` MUST carry `details.supported`; the other codes carry `details` where this text names a key.
 
 | Exit | `error.code` | Meaning | `retryable` |
 | --- | --- | --- | --- |
@@ -246,7 +246,7 @@ truncated             bool
 
 ```text
 attempt_id            string            native, opaque
-issue                 { number, title }
+issue                 { number, title|null }
 native_phase          string            engine-native phase name, displayed as-is
 started_at            timestamp
 last_activity_at      timestamp|null
@@ -264,7 +264,7 @@ enforced_tokens       "raw"|"effective"|"none"
 limits                [ { name, used: Figure, limit: Figure } ]
 ```
 
-`limits[].name` is one of `raw_tokens`, `effective_tokens`, `cost_usd`, `wall_clock_seconds`, `tool_calls`, `turns`, or `native.<name>`. Only ceilings the engine enforces are listed.
+`limits[].name` is one of `raw_tokens`, `effective_tokens`, `cost_usd`, `wall_clock_seconds`, `tool_calls`, `turns`, or `native.<name>`. Only ceilings the engine enforces are listed. A named limit fixes the unit of its `used` and `limit` figures: `tokens` for `raw_tokens` and `effective_tokens`, `usd` for `cost_usd`, `seconds` for `wall_clock_seconds`, `count` for `tool_calls` and `turns`; `native.<name>` limits choose their own.
 
 ### 7.3 Figure
 
@@ -286,13 +286,13 @@ started_at            timestamp
 finished_at           timestamp|null
 lifecycle_state       string            native (e.g. "finished", "released")
 outcome               { native: string, reason: string|null, label: string }|null
-delivery              { pull_request: { number, url } }|null
+delivery              { pull_request: { number, url }|null }|null
 attention_required    bool              work retained or a human decision pending
 sealed                bool
 sealed_at             timestamp|null
 ```
 
-There is no shared outcome enum. `outcome.label` is a backend-supplied display text. Consumers use `outcome`, `delivery` and `attention_required` for display and alerting only, never to drive behavior.
+`delivery` is `null` when nothing was delivered; `delivery.pull_request` is `null` when the delivery has no pull request (a minor may add other delivery kinds). There is no shared outcome enum. `outcome.label` is a backend-supplied display text. Consumers use `outcome`, `delivery` and `attention_required` for display and alerting only, never to drive behavior.
 
 ### 7.5 CommandRecord
 
@@ -301,7 +301,7 @@ request_id            string
 sequence              int               per-volume, strictly increasing in commit order
 kind                  "stop"|"stop_after"|"resume"|"next_issue"|"handoff"
                       |"recovery_retry"|"recovery_release"|"errors_reset"
-arguments             object            e.g. {"after": 3}, {"issue": 42}, {"attempt_id": "...", "saved_at": "..."}
+arguments             object            kind-specific, see below
 repository            string
 acknowledgement       "accepted"|"completed"|"superseded"|"not_fulfilled"
 detail                string            human-readable effect or reason, single line
@@ -309,12 +309,22 @@ created_at            timestamp
 updated_at            timestamp
 ```
 
+`arguments` is the command's idempotency payload. Its required keys depend on `kind`:
+
+| `kind` | `arguments` |
+| --- | --- |
+| `stop`, `resume`, `handoff`, `errors_reset` | `{}` |
+| `stop_after` | `{"after": int}`, `1 ≤ after ≤ 999` |
+| `next_issue` | `{"issue": int}`, `issue ≥ 1` |
+| `recovery_retry` | `{"attempt_id": string}` |
+| `recovery_release` | `{"attempt_id": string, "saved_at": string}` |
+
 `CommandRef` is `{ "request_id", "sequence" }`.
 
 ### 7.6 ManifestEntry
 
 ```text
-path                  relative POSIX path, no "..", no leading "/"
+path                  relative POSIX path, no ".." segment, no leading "/"
 kind                  "events"|"transcript"|"tool_call"|"tool_result"|"model_output"
                       |"command_output"|"record"|"other"
 media_type            e.g. "application/x-ndjson", "application/json", "text/plain"
@@ -393,10 +403,10 @@ A Contract Event is `{ "at", "level", "event", "attempt_id"?, "phase"?, "text" }
 | `process_started` | Process start, before startup checks | `agent_version` |
 | `startup_check` | Each startup check begins or ends | `check`, `result: started\|ok\|skipped\|failed` |
 | `ready` | First state other than `starting` | |
-| `halted` | Engine decides to exit (recorded before exit) | `reason` |
+| `halted` | Engine decides to exit (recorded before exit) | `reason` (non-empty, as in `Halt`) |
 | `claim_opened` | A Claim opens | `attempt_id`, `issue` |
 | `phase_changed` | Native phase changes | `attempt_id`, `phase` |
-| `outcome_recorded` | Engine records the Attempt's outcome | `attempt_id`, `outcome`, `reason` |
+| `outcome_recorded` | Engine records the Attempt's outcome | `attempt_id`, `outcome`, `reason` (string or `null`) |
 | `attempt_finished` | Attempt reaches its final lifecycle state with an outcome | `attempt_id` |
 | `attempt_released` | Attempt ends without a Terminal Outcome | `attempt_id` |
 | `sealed` | Attempt Archive becomes Sealed | `attempt_id` |
@@ -426,7 +436,7 @@ An archive is **Sealed** when its evidence set is complete and immutable: the At
 
 `attempts export` is the only operation whose successful stdout is not a JSON envelope.
 
-- The stream is an uncompressed POSIX tar (pax). Its first member is `manifest.json`: `{"contract": "1.0", "attempt": AttemptSummary, "files": [ManifestEntry]}`. The files follow under their manifest paths.
+- The stream is an uncompressed POSIX tar (pax). Its first member is `manifest.json`: `{"contract": "1.0", "attempt": AttemptSummary, "files": [ManifestEntry]}`, where `contract` is the producer's `major.minor`. The files follow under their manifest paths.
 - With `--path`, only the named files are exported, and `files` lists only those. An unknown path is `not_found` before streaming starts.
 - An error detected before streaming starts produces the JSON envelope and a non-zero exit. A non-zero exit after streaming started means the consumer MUST discard the output.
 - A file whose content does not match its manifest `sha256` (possible only for an unsealed archive) MUST be treated by the consumer as a torn read and fetched again.
@@ -478,8 +488,9 @@ Each row is a conformance scenario (§15).
 
 A producer or consumer is compatible when it passes the conformance suite of the tag it pins, whether or not it uses the shared library.
 
-- **Producer suite.** Black-box scenarios run against a producer container. Each engine supplies a **Conformance Harness** that drives its own fakes (provider, GitHub) and its own container through the control API in §15.1: make an issue eligible, hold an Attempt at a named point, finish an Attempt with a given native outcome, crash the process, stop the container, and the rest. The suite covers every row of §14, every operation in §6 including `unsupported` for each unadvertised capability, Offline Read, and validates every reply against the JSON Schemas.
+- **Producer suite.** Black-box scenarios run against a producer container, shipped as `python -m agent_operator_contract.producer_suite --harness <harness>`. Each engine supplies a **Conformance Harness** that drives its own fakes (provider, GitHub) and its own container through the control API in §15.1: make an issue eligible, hold an Attempt at a named point, finish an Attempt with a given native outcome, crash the process, stop the container, and the rest. The suite covers every row of §14, every operation in §6 including `unsupported` for each unadvertised capability, Offline Read, and validates every reply against the JSON Schemas. Each scenario has a stable identifier and reports `PASS`, `FAIL` or `NOT RUN` with a reason; a scenario that needs an unadvertised capability or an `unsupported` harness verb does not run. `--capabilities` selects the capabilities requested at `setup`. `--expect-fail <id>` lists a known failure: it does not fail the run while it fails, and fails the run once it passes. `--require-all` makes a scenario that does not run fail the run.
 - **Consumer suite.** Recorded fixtures `{argv, exit_code, stdout, stderr}` (see [`fixtures/agentctl/`](../src/agent_operator_contract/fixtures/agentctl/), shipped as package data so consumers load them from the installed package) and a fake `agentctl` that replays them. A consumer passes when it classifies every fixture correctly: success, replay, rejection, `unsupported`, contract mismatch, not found, ambiguous outcome, malformed stdout. The expected classification of each fixture is recorded in the `index.json` next to them.
+- **Coverage gates.** This repository's CI keeps both suites complete: every `error.code` and every exit code of §4 appears in at least one fixture; every `instance.state` has a Status Snapshot fixture; every row of §14 and every operation of §6 maps to a producer scenario; and the producer suite passes against the stub producer in this repository with every capability advertised, `--require-all` and no expected failures.
 - Engines and consumers run both from the same pinned tag in their own CI, without copying fixtures.
 
 ### 15.1 Conformance harness protocol
@@ -509,8 +520,8 @@ Each engine supplies a **Conformance Harness**: an executable that runs on the h
 ```
 
 - `harness` is the harness protocol's `major.minor`, currently `1.0`. A minor adds verbs or optional parameters; it never removes or retypes a field, never changes a meaning, and never makes an optional parameter required.
-- `verb` echoes the invoked verb. It is absent only when the invocation named no verb.
-- The request and reply shapes below are normative in prose; [`harness-request.schema.json`](../src/agent_operator_contract/schemas/harness-request.schema.json) and [`harness-reply.schema.json`](../src/agent_operator_contract/schemas/harness-reply.schema.json) are the machine-readable form. The examples under [`fixtures/harness/`](../src/agent_operator_contract/fixtures/harness/) and the negatives under [`fixtures/negative/`](../src/agent_operator_contract/fixtures/negative/) (`harness-request-*`, `harness-reply-*`) are checked against both the schemas and the shared library in CI, like the other documents.
+- `verb` echoes the invoked verb. It is absent only when the invocation named no verb; a `usage` reply to an unknown verb echoes it as given.
+- The request and reply shapes below are described in prose; [`harness-request.schema.json`](../src/agent_operator_contract/schemas/harness-request.schema.json) and [`harness-reply.schema.json`](../src/agent_operator_contract/schemas/harness-reply.schema.json) are their normative machine-readable form. The examples under [`fixtures/harness/`](../src/agent_operator_contract/fixtures/harness/) and the negatives under [`fixtures/negative/`](../src/agent_operator_contract/fixtures/negative/) (`harness-request-*`, `harness-reply-*`) are checked against both the schemas and the shared library in CI, like the other documents.
 - Requests are strict and replies are lenient: a harness MUST reject unknown parameters with `usage`, so suite typos fail loudly, while the suite MUST ignore unknown `result` and `details` keys, so a minor can add fields.
 
 #### Errors
@@ -534,14 +545,14 @@ The harness manages one current instance: `setup` fails with `failed` while one 
 | `set-issue` | `{issue, eligible, title?}` | `{issue, eligible}` |
 | `hold` | `{point, phase?, scope?}` | `{point, attempt_id}` |
 | `release` | `{}` | `{released}` |
-| `finish-attempt` | `{native_outcome, reason?}` | `{attempt_id, native_outcome}` |
+| `finish-attempt` | `{native_outcome, reason?}` (`reason` may be `null`) | `{attempt_id, native_outcome}` |
 | `hold-lock` | `{duration_ms}` | `{held_ms}` |
 | `crash` | `{point}` | `{point}` |
 | `terminate` | `{}` | `{signal: "SIGTERM"}` |
 | `stop-container` | `{}` | `{running: false}` |
 | `start-container` | `{}` | `{running: true}` |
 | `halt` | `{reason, detail?}` | `{reason}` |
-| `grow-archive` | `{attempt_id?, append_bytes}` | `{path, appended_bytes}` |
+| `grow-archive` | `{attempt_id?, append_bytes}` (`attempt_id` may be `null`) | `{path, appended_bytes}` |
 | `defer-publication` | `{}` | `{armed: true}` |
 
 - **`setup`** creates a fresh state volume and starts the instance from the engine's image with its fakes: no active Attempt, Intake open. It reports the six discovery facts: the container (name or ID), the image ID (as used for Offline Read), every volume as `{name, path}` with the in-container mount path, the exec user (never `root`), the Target Repository, and the advertised Operator Capabilities. `capabilities` asks the harness to enable that subset when the engine can toggle capabilities; an engine-fixed set is reported as-is. A request the harness cannot honour answers `unsupported` with `details.what: "capability"`. `config` carries opaque engine knobs; only `native.*` keys are allowed.

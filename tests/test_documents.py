@@ -278,7 +278,7 @@ def test_classify_rejections() -> None:
     ],
 )
 def test_classify_special_codes(code: str, exit_code: int, expected: str) -> None:
-    doc = {
+    doc: dict[str, Any] = {
         "contract": "1.0",
         "ok": False,
         "error": {
@@ -287,6 +287,8 @@ def test_classify_special_codes(code: str, exit_code: int, expected: str) -> Non
             "retryable": code in ("agent_unreachable", "internal"),
         },
     }
+    if code == "contract_mismatch":
+        doc["error"]["details"] = {"supported": [1]}
 
     assert documents.classify_fixture(_fixture(exit_code, doc)) == expected
 

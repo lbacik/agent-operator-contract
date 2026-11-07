@@ -6,7 +6,12 @@
   "required": ["attempt", "manifest"],
   "properties": {
     "attempt": {"$ref": "#/$defs/attempt_summary"},
-    "manifest": {"type": "array", "items": {"$ref": "#/$defs/manifest_entry"}}
+    "manifest": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/manifest_entry"},
+      "contains": {"type": "object", "required": ["kind"], "properties": {"kind": {"const": "events"}}},
+      "description": "Every Attempt Archive holds events.jsonl with kind events (spec section 11.1)."
+    }
   },
   "$defs": {
     "attempt_summary": {
@@ -90,7 +95,7 @@
         "path": {
           "type": "string",
           "minLength": 1,
-          "pattern": "^(?!/)(?!.*\\.\\.).+$"
+          "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$)).+$"
         },
         "kind": {
           "type": "string",

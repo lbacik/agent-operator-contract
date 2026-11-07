@@ -5,7 +5,11 @@
   "type": "object",
   "required": ["attempts", "next_cursor"],
   "properties": {
-    "attempts": {"type": "array", "items": {"$ref": "#/$defs/attempt_summary"}},
+    "attempts": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {"$ref": "#/$defs/attempt_summary"}
+    },
     "next_cursor": {"type": ["string", "null"], "minLength": 1}
   },
   "$defs": {

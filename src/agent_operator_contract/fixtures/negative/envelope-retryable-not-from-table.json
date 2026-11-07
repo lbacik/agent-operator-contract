@@ -1,0 +1,9 @@
+{
+  "contract": "1.0",
+  "error": {
+    "code": "agent_unreachable",
+    "message": "no",
+    "retryable": false
+  },
+  "ok": false
+}

@@ -1,0 +1,35 @@
+{
+  "attempt": {
+    "attempt_id": "#41/1",
+    "attention_required": false,
+    "delivery": {
+      "pull_request": {
+        "number": 77,
+        "url": "https://github.com/example-owner/example-repo/pull/77"
+      }
+    },
+    "finished_at": "2026-11-06T08:44:52Z",
+    "issue": {
+      "number": 41,
+      "title": "Fix pagination"
+    },
+    "lifecycle_state": "finished",
+    "outcome": {
+      "label": "Delivered",
+      "native": "delivered",
+      "reason": null
+    },
+    "sealed": true,
+    "sealed_at": "2026-11-06T08:45:01Z",
+    "started_at": "2026-11-06T08:01:10Z"
+  },
+  "manifest": [
+    {
+      "kind": "transcript",
+      "media_type": "application/x-ndjson",
+      "path": "transcript.jsonl",
+      "sha256": "4b1d000000000000000000000000000000000000000000000000000000000000",
+      "size": 2210431
+    }
+  ]
+}

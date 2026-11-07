@@ -8,7 +8,7 @@
     "path": {
       "type": "string",
       "minLength": 1,
-      "pattern": "^(?!/)(?!.*\\.\\.).+$",
+      "pattern": "^(?!/)(?!(.*/)?\\.\\.(/|$)).+$",
       "description": "Relative POSIX path: no leading slash, no '..' segment."
     },
     "kind": {

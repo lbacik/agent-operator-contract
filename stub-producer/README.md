@@ -37,8 +37,21 @@ Build and run the suite (needs Docker):
 docker build -f stub-producer/Dockerfile -t stub-producer:ci .
 STUB_PRODUCER_IMAGE=stub-producer:ci \
   uv run python -m agent_operator_contract.producer_suite \
-    --harness ./stub-producer/harness
+    --harness ./stub-producer/harness \
+    --capabilities stop-after,next-issue,operator-handoff,recovery-retry,recovery-release,errors-reset,pool \
+    --require-all
 ```
+
+CI runs exactly this (every scenario must pass, no expected failures) and a
+second, core-only run with `--capabilities ""` that exercises `unsupported`
+for every optional operation.
+
+`setup` writes the instance configuration (Target Repository and Operator
+Capabilities) to `agent-operator-contract.config.json` on the volume: an
+Offline Read runs the image with `docker run` and no environment, so the stub
+reads its configuration from the volume, as a real engine would. The image
+creates `/data` owned by `agent`, so the fresh named volume Docker mounts
+there is writable by the exec user.
 
 `STUB_PRODUCER_IMAGE` selects the image the harness starts;
 `STUB_HARNESS_STATE` selects where the harness tracks its instance;

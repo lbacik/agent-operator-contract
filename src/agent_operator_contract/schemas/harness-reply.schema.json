@@ -12,23 +12,8 @@
     },
     "verb": {
       "type": "string",
-      "enum": [
-        "setup",
-        "teardown",
-        "set-issue",
-        "hold",
-        "release",
-        "finish-attempt",
-        "hold-lock",
-        "crash",
-        "terminate",
-        "stop-container",
-        "start-container",
-        "halt",
-        "grow-archive",
-        "defer-publication"
-      ],
-      "description": "The invoked verb, echoed from argv."
+      "minLength": 1,
+      "description": "The invoked verb, echoed from argv. A usage reply echoes an unknown verb as given."
     },
     "ok": {
       "type": "boolean"
@@ -70,6 +55,25 @@
     {
       "if": {"required": ["ok"], "properties": {"ok": {"const": true}}},
       "then": {"required": ["result"], "not": {"required": ["error"]}}
+    },
+    {
+      "if": {"required": ["ok"], "properties": {"ok": {"const": true}}},
+      "then": {"properties": {"verb": {"enum": [
+            "setup",
+            "teardown",
+            "set-issue",
+            "hold",
+            "release",
+            "finish-attempt",
+            "hold-lock",
+            "crash",
+            "terminate",
+            "stop-container",
+            "start-container",
+            "halt",
+            "grow-archive",
+            "defer-publication"
+          ]}}}
     },
     {
       "if": {"required": ["ok"], "properties": {"ok": {"const": false}}},
