@@ -434,9 +434,7 @@ def _run_mutation(
     except client.DuplicateInstanceError as exc:
         return _print_client_error(exc, use_json, {"instance": name})
     if instance.state != "running":
-        return _print_client_error(
-            client.InstanceStoppedError(name), use_json, {"instance": name}
-        )
+        return _print_client_error(client.InstanceStoppedError(name), use_json, {"instance": name})
     try:
         identity_result = client.invoke(docker, instance, ["identity"])
     except client.ClientError as exc:
@@ -703,9 +701,7 @@ def _run_attempts_list(
     if before is not None:
         argv += ["--before", before]
     try:
-        result = _run_read(
-            docker, instance, argv, timeout=client.timeout_for("attempts-list")
-        )
+        result = _run_read(docker, instance, argv, timeout=client.timeout_for("attempts-list"))
     except client.ClientError as exc:
         return _print_client_error(exc, use_json)
     try:

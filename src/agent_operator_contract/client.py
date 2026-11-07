@@ -592,9 +592,7 @@ def inspect_offline_target(
         raise InstanceRunningError(instance.name)
     image = entry.get("Image")
     if not isinstance(image, str) or not image:
-        raise DockerUnavailableError(
-            f"docker inspect has no image for instance {instance.name!r}"
-        )
+        raise DockerUnavailableError(f"docker inspect has no image for instance {instance.name!r}")
     return OfflineTarget(image=image, mounts=_mounts_of(entry), exec_user=instance.exec_user)
 
 

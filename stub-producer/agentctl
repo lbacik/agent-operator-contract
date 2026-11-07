@@ -376,6 +376,31 @@ def _release_lock(handle: io.TextIO | None) -> None:
         handle.close()
 
 
+def _live_holder_present() -> bool:
+    """Probe whether a live engine holds the volume lock (spec section 12).
+
+    An Offline Read mounts the volume read-only, so opening the lock file for
+    writing fails and there is no live holder in this mount: serve the read.
+    When another process holds the exclusive lock, a live engine owns the
+    volume and the offline read must be refused. A free lock means no engine
+    is running: serve the read.
+    """
+    lock_path = _lock_path()
+    if _FCNTL is None or lock_path is None:
+        return False
+    try:
+        handle = open(lock_path, "a", encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        _FCNTL.flock(handle.fileno(), _FCNTL.LOCK_EX | _FCNTL.LOCK_NB)
+    except OSError:
+        handle.close()
+        return True
+    _release_lock(handle)
+    return False
+
+
 def _snapshot_size_bytes(snapshot: dict[str, Any]) -> int:
     """Measure a snapshot the way spec section 9.1 bounds it: compact JSON."""
     return len(json.dumps(snapshot, sort_keys=True, separators=(",", ":")).encode("utf-8"))
@@ -1225,12 +1250,19 @@ def _read_archive_bytes(attempt_id: str, filename: str) -> bytes | None:
         return None
 
 
-def _fresh_manifest(state: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, Any]]:
-    """Compute the current manifest for one attempt from the volume and state."""
+def _fresh_manifest(
+    state: dict[str, Any], summary: dict[str, Any], offline: bool = False
+) -> list[dict[str, Any]]:
+    """Compute the current manifest for one attempt from the volume and state.
+
+    Offline the volume is mounted read-only, so no archive file is created or
+    rewritten: entries fall back to the state alone.
+    """
     attempt_id = summary.get("attempt_id")
     if not isinstance(attempt_id, str) or not attempt_id:
         return []
-    _write_archives(state)
+    if not offline:
+        _write_archives(state)
     events_payload = _read_archive_bytes(attempt_id, "events.jsonl")
     if events_payload is None:
         lines: list[str] = []
@@ -1264,7 +1296,9 @@ def _fresh_manifest(state: dict[str, Any], summary: dict[str, Any]) -> list[dict
     ]
 
 
-def _manifest_for(state: dict[str, Any], summary: dict[str, Any]) -> list[dict[str, Any]]:
+def _manifest_for(
+    state: dict[str, Any], summary: dict[str, Any], offline: bool = False
+) -> list[dict[str, Any]]:
     """Return the manifest for one attempt, preferring a stored snapshot.
 
     An unsealed attempt paused after its outcome carries ``manifest_snapshot``
@@ -1283,7 +1317,7 @@ def _manifest_for(state: dict[str, Any], summary: dict[str, Any]) -> list[dict[s
         snapshot = active.get("manifest_snapshot")
         if isinstance(snapshot, list) and snapshot and all(isinstance(e, dict) for e in snapshot):
             return [dict(entry) for entry in snapshot]
-        return _fresh_manifest(state, summary)
+        return _fresh_manifest(state, summary, offline)
     attempts = state.get("attempts")
     if isinstance(attempts, dict) and isinstance(attempt_id, str):
         stored = attempts.get(attempt_id)
@@ -1293,17 +1327,19 @@ def _manifest_for(state: dict[str, Any], summary: dict[str, Any]) -> list[dict[s
                 isinstance(e, dict) for e in snapshot
             ):
                 return [dict(entry) for entry in snapshot]
-            return _fresh_manifest(state, summary)
-    return _fresh_manifest(state, summary)
+            return _fresh_manifest(state, summary, offline)
+    return _fresh_manifest(state, summary, offline)
 
 
-def _do_attempts_show(state: dict[str, Any], attempt_id: str) -> int:
+def _do_attempts_show(state: dict[str, Any], attempt_id: str, offline: bool = False) -> int:
     active = state.get("active_attempt")
     if isinstance(active, dict) and active.get("attempt_id") == attempt_id:
         summary = _active_summary(state)
         assert summary is not None
         sys.stdout.write(
-            shared.render_success({"attempt": summary, "manifest": _manifest_for(state, summary)})
+            shared.render_success(
+                {"attempt": summary, "manifest": _manifest_for(state, summary, offline)}
+            )
         )
         return 0
     attempts = state.get("attempts")
@@ -1312,7 +1348,7 @@ def _do_attempts_show(state: dict[str, Any], attempt_id: str) -> int:
         if isinstance(summary, dict):
             sys.stdout.write(
                 shared.render_success(
-                    {"attempt": summary, "manifest": _manifest_for(state, summary)}
+                    {"attempt": summary, "manifest": _manifest_for(state, summary, offline)}
                 )
             )
             return 0
@@ -1386,7 +1422,9 @@ def _run_locked_mutation(parsed: shared.ParsedCall) -> int:
         _release_lock(handle)
 
 
-def _do_attempts_export(state: dict[str, Any], arguments: dict[str, Any]) -> int:
+def _do_attempts_export(
+    state: dict[str, Any], arguments: dict[str, Any], offline: bool = False
+) -> int:
     """Stream an ``attempts export`` tar (spec section 11.3).
 
     The stream starts at once with ``manifest.json``; an unknown attempt or
@@ -1395,6 +1433,7 @@ def _do_attempts_export(state: dict[str, Any], arguments: dict[str, Any]) -> int
     while the file bytes are current: a file that grew while unsealed no
     longer matches its snapshot, the torn read of spec section 14. A
     non-zero exit after streaming started means the consumer discards output.
+    Offline the volume is mounted read-only, so no archive file is written.
     """
     attempt_id = arguments.get("attempt_id")
     assert isinstance(attempt_id, str)
@@ -1414,7 +1453,7 @@ def _do_attempts_export(state: dict[str, Any], arguments: dict[str, Any]) -> int
         )
         sys.stdout.write(text)
         return exit_code
-    files = _manifest_for(state, summary)
+    files = _manifest_for(state, summary, offline)
     wanted = arguments.get("paths")
     assert isinstance(wanted, list)
     if wanted:
@@ -1430,7 +1469,8 @@ def _do_attempts_export(state: dict[str, Any], arguments: dict[str, Any]) -> int
     manifest = {"contract": "1.0", "attempt": summary, "files": files}
     manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode("utf-8")
     # Stream current bytes (which may have grown past a snapshot manifest).
-    _write_archives(state)
+    if not offline:
+        _write_archives(state)
     payloads: dict[str, bytes] = {}
     for entry in files:
         name = str(entry["path"])
@@ -1475,6 +1515,14 @@ def main(argv: list[str]) -> int:
         )
         sys.stdout.write(text)
         return exit_code
+    if parsed.offline and _live_holder_present():
+        text, exit_code = shared.render_error(
+            "rejected",
+            "a live engine holds the volume; refusing the offline read",
+            details={"reason": "instance_running"},
+        )
+        sys.stdout.write(text)
+        return exit_code
     if parsed.operation == "identity":
         state, _ = _load_state()
         if not parsed.offline and state.get("engine_alive") is not True:
@@ -1498,9 +1546,9 @@ def main(argv: list[str]) -> int:
     if parsed.operation == "attempts-show":
         attempt_id = parsed.arguments.get("attempt_id")
         assert isinstance(attempt_id, str)
-        return _do_attempts_show(state, attempt_id)
+        return _do_attempts_show(state, attempt_id, parsed.offline)
     if parsed.operation == "attempts-export":
-        return _do_attempts_export(state, parsed.arguments)
+        return _do_attempts_export(state, parsed.arguments, parsed.offline)
     if parsed.operation in ("stop", "resume", "next-issue"):
         assert parsed.request_id is not None and parsed.expect_repo is not None
         return _run_locked_mutation(parsed)

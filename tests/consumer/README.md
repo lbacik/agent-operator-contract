@@ -10,7 +10,9 @@ running agent container.
 
 - `fake_docker`: the fake executable (stdlib only, `chmod +x`). It serves a
   described Fleet for listing and inspection, answers `exec` of `agentctl`
-  by replaying fixtures matched on argv, and records every invocation.
+  by replaying fixtures matched on argv, answers Offline Read `run` of a
+  stopped container's image (matched by image, every mount read-only,
+  `--network none`, `--rm`) the same way, and records every invocation.
 - `example-fleet.json`: an example Fleet description with a duplicate name
   and a Compose one-off container.
 - `../test_consumer.py`: the suite that runs `agentfleet` against the fake.
@@ -26,12 +28,18 @@ discovery labels plus container state:
     {"id": "abc123", "name": "web-1", "backend": "coding-agent",
      "contract": "1", "exec_user": "agent", "state": "running"},
     {"id": "def456", "name": "web-1", "backend": "coding-agent",
-     "contract": "1", "exec_user": "agent", "state": "exited"},
+     "contract": "1", "exec_user": "agent", "state": "exited",
+     "image": "sha256:abc", "volumes": [{"name": "stub-data", "path": "/data"}],
+     "binds": [{"source": "/host/cfg", "path": "/cfg"}]},
     {"id": "oneoff9", "name": "worker-run-1", "backend": "coding-agent",
      "contract": "1", "exec_user": "agent", "state": "running", "oneoff": true}
   ]
 }
 ```
+
+A stopped container carries `image` plus its `volumes`/`binds`: `inspect`
+reports them as `Mounts`, and `run` replays the Offline Read of that image
+with every mount re-mounted read-only at the same destination.
 
 `oneoff: true` sets `com.docker.compose.oneoff=True`, which the consumer
 drops even when labelled. Two containers with the same `name` model a
