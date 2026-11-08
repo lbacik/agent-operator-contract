@@ -2372,3 +2372,22 @@ def test_stub_errors_reset_unsupported_without_capability(tmp_path: Path) -> Non
 
     assert completed.returncode == 3
     assert json.loads(completed.stdout)["error"]["code"] == "unsupported"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["frobnicate", json.dumps({"verb": "frobnicate", "params": {}})],
+        ["release", json.dumps({"verb": "hold", "params": {}})],
+        ["release", "not json"],
+    ],
+)
+def test_harness_usage_error_echoes_the_argv_verb(argv: list[str]) -> None:
+    """Spec section 15.1: ``verb`` is absent only when argv named no verb."""
+    completed = _run_harness(argv)
+
+    assert completed.returncode == 2
+    doc = json.loads(completed.stdout)
+    assert doc["verb"] == argv[0]
+    assert doc["error"]["code"] == "usage"
+    assert documents.validate_harness_reply(doc) == []

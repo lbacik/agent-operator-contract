@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 jobs:
@@ -62,6 +63,12 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: uv build
+      - name: A release tag equals the distribution version (one version line)
+        if: github.ref_type == 'tag'
+        run: |
+          version="$(uv run --locked python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          test "${GITHUB_REF_NAME}" = "v${version}" \
+            || { echo "tag ${GITHUB_REF_NAME} is not v${version}"; exit 1; }
       - name: Wheel carries every schema, fixture and negative example
         run: |
           uv run --locked python - <<'EOF'

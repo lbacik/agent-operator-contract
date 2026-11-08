@@ -920,12 +920,12 @@ def main(argv: list[str]) -> int:
     try:
         request = json.loads(raw)
     except ValueError:
-        text, exit_code = _error(None, "usage", "the request document is not valid JSON")
+        text, exit_code = _error(verb or None, "usage", "the request document is not valid JSON")
         sys.stdout.write(text)
         return exit_code
     if not isinstance(request, dict) or request.get("verb") != verb:
         text, exit_code = _error(
-            None, "usage", "the argv verb and the document verb must agree"
+            verb or None, "usage", "the argv verb and the document verb must agree"
         )
         sys.stdout.write(text)
         return exit_code

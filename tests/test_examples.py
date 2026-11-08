@@ -8,6 +8,7 @@ files themselves stay byte-exact.
 """
 
 import json
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -101,3 +102,17 @@ def test_library_classification_matches_index(name: str) -> None:
     expected: str = _fixture_index()[name]["classification"]
 
     assert documents.classify_fixture(_load_fixture(name)) == expected
+
+
+def test_fixture_readme_names_every_fixture() -> None:
+    """The examples README describes the full fixture set (issue #17)."""
+    readme = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "agent_operator_contract"
+        / "fixtures"
+        / "agentctl"
+        / "README.md"
+    ).read_text(encoding="utf-8")
+
+    assert [name for name in FIXTURE_NAMES if f"`{name}`" not in readme] == []
