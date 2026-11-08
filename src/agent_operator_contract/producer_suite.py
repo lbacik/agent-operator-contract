@@ -70,6 +70,9 @@ LOCK_HOLD_MS = 5000
 LOCK_SETTLE_S = 1.0
 """How long ``status-during-lock`` waits for the hold to take effect."""
 
+RESTART_RELEASES = 3
+"""Harness ``release`` calls a restart may need: the startup hold, then recovery."""
+
 
 @dataclass(frozen=True)
 class HarnessResult:
@@ -2223,7 +2226,7 @@ def _restart_after_crash(
     _, outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
     if outcome is not None:
         return outcome
-    for _ in range(3):
+    for _ in range(RESTART_RELEASES):
         snapshot, outcome = _snapshot(ctx, scenario_id)
         if outcome is not None or snapshot is None:
             return outcome or ScenarioOutcome(scenario_id, "failed", "no status after restart")

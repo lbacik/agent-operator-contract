@@ -35,7 +35,7 @@ Schemas, fixtures and the error table ship as package data, so everything below 
 
 ## Use the library
 
-- `agent_operator_contract.shared`: the producer side. `parse_argv` parses `agentctl` argv in the §4.1 check order and `render_success` / `render_error` write the envelope and return the exit code.
+- `agent_operator_contract.shared`: the producer side. `parse_argv` parses `agentctl` argv in the §4.1 check order `render_success` returns the success envelope as one line of JSON, and `render_error` returns the error envelope together with its §4 exit code.
 - `agent_operator_contract.client`: the consumer side over the `docker` CLI. `discover` lists the Fleet from labels, `resolve` addresses one instance, `invoke` / `invoke_offline` run one operation (§3), `interpret` classifies the reply on `error.code`, `invoke_mutation_with_retry` retries ambiguous mutations with the same request ID.
 - `agent_operator_contract.status`: typed Status Snapshot parsing, strict or lenient (unknown enum values become "unknown").
 - `agent_operator_contract.documents`: stdlib validators that agree with the JSON Schemas, `load_schema`, and the fixture loaders.
@@ -46,8 +46,11 @@ from agent_operator_contract import client, status
 docker = client.docker_bin()
 instance = client.resolve(client.discover(docker), "web-1")
 envelope = client.interpret(client.invoke(docker, instance, ["status"]))
-snapshot = status.parse_status_lenient(envelope["result"])
-print(snapshot.instance.state)
+if envelope["ok"] is True:
+    snapshot = status.parse_status_lenient(envelope["result"])
+    print(snapshot.instance.state)
+else:
+    print(envelope["error"])  # decide on error["code"], never on the message
 ```
 
 ## Install `agentfleet`

@@ -66,6 +66,30 @@ def _fixture_docs() -> list[tuple[str, dict[str, Any], Any]]:
     return docs
 
 
+def _spec_error_codes() -> set[str]:
+    """The ``error.code`` column of the spec section 4 table."""
+    codes = set()
+    for line in _section("4. ").splitlines():
+        cells = [cell.strip() for cell in line.split("|")[1:-1]]
+        if len(cells) >= 2 and cells[0].isdigit() and cells[1].startswith("`"):
+            codes.add(cells[1].strip("`"))
+    return codes
+
+
+def _spec_instance_states() -> set[str]:
+    """The ``instance.state`` table of spec section 7.2."""
+    section = _section("7. ")
+    table = section[section.index("`instance.state` is one of:") :].split("\n\n")[1]
+    return {cell.strip("`") for cell in _table_rows(table, "State")}
+
+
+def test_spec_tables_are_read() -> None:
+    """Guard the parsers: an empty spec list would let a gate pass vacuously."""
+    assert len(_spec_error_codes()) == 10
+    assert "stopped" in _spec_instance_states()
+    assert len(_spec_instance_states()) == 7
+
+
 def test_every_error_code_appears_in_a_fixture() -> None:
     seen = {
         doc["error"].get("code")
@@ -73,7 +97,8 @@ def test_every_error_code_appears_in_a_fixture() -> None:
         if isinstance(doc, dict) and isinstance(doc.get("error"), dict)
     }
 
-    assert set(documents.error_table()) - seen == set()
+    assert _spec_error_codes() == set(documents.error_table())
+    assert _spec_error_codes() - seen == set()
 
 
 def test_every_exit_code_appears_in_a_fixture() -> None:
@@ -98,7 +123,8 @@ def test_every_instance_state_has_a_status_snapshot_fixture() -> None:
         and "state" in doc["result"]["instance"]
     }
 
-    assert set(documents.STATUS_STATES) - seen == set()
+    assert _spec_instance_states() == set(documents.STATUS_STATES)
+    assert _spec_instance_states() - seen == set()
 
 
 def test_every_section_14_row_has_a_producer_scenario() -> None:

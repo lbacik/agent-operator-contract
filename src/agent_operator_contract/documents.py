@@ -67,13 +67,14 @@ REPOSITORY_PATTERN = r"^[^/\s]+/[^/\s]+$"
 """Target Repository written owner/name."""
 
 CONTRACT_MAJOR_PATTERN = r"^[0-9]+$"
+"""Contract major from the discovery label, e.g. 1 (spec section 2.1)."""
 
 EXPORT_CONTRACT_PATTERN = r"^1\.[0-9]+$"
 """The export manifest's ``contract``: a major-1 ``major.minor`` (spec section 11.3)."""
-"""Contract major from the discovery label, e.g. 1 (spec section 2.1)."""
 
 CLIENT_CODE_PATTERN = r"^client\.[a-z_]+$"
 """Shape of an agentfleet client error.code; the exact codes live in client-table.json."""
+
 SCHEMA_NAMES: tuple[str, ...] = (
     "envelope",
     "identity",
