@@ -61,7 +61,217 @@
           "type": "object",
           "description": "Code-specific fields; consumers must ignore unknown keys."
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "rejected"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "repository_mismatch"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "payload_mismatch"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "invalid_argument"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "usage"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "unsupported"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "contract_mismatch"
+              }
+            }
+          },
+          "then": {
+            "required": [
+              "details"
+            ],
+            "properties": {
+              "retryable": {
+                "const": false
+              },
+              "details": {
+                "required": [
+                  "supported"
+                ],
+                "properties": {
+                  "supported": {
+                    "type": "array",
+                    "minItems": 1,
+                    "items": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "not_found"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": false
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "agent_unreachable"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": true
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": [
+              "code"
+            ],
+            "properties": {
+              "code": {
+                "const": "internal"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "retryable": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
     }
   },
   "allOf": [

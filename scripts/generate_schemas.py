@@ -27,10 +27,47 @@ CLIENT_TABLE = PACKAGE / "client-table.json"
 CLIENT_ENVELOPE_SCHEMA = PACKAGE / "schemas" / "client-envelope.schema.json"
 
 
+#: Code-specific ``error.details`` keys that spec section 4 makes required.
+REQUIRED_DETAILS: dict[str, dict[str, object]] = {
+    "contract_mismatch": {
+        "required": ["supported"],
+        "properties": {
+            "supported": {
+                "type": "array",
+                "minItems": 1,
+                "items": {"type": "integer", "minimum": 1},
+            }
+        },
+    },
+}
+
+
 def render_envelope_schema(table: dict[str, object]) -> str:
-    """Return the envelope schema with the error.code enum set to the table's keys."""
+    """Return the envelope schema with the error rules copied from the table.
+
+    The ``error.code`` enum is the table's keys; one ``if``/``then`` rule per
+    code pins ``retryable`` to the table's value and requires the code's
+    ``details`` keys from ``REQUIRED_DETAILS``.
+    """
     schema = json.loads(ENVELOPE_SCHEMA.read_text(encoding="utf-8"))
-    schema["properties"]["error"]["properties"]["code"]["enum"] = list(table)
+    error = schema["properties"]["error"]
+    error["properties"]["code"]["enum"] = list(table)
+    rules: list[dict[str, object]] = []
+    for code, entry in table.items():
+        assert isinstance(entry, dict)
+        then: dict[str, object] = {"properties": {"retryable": {"const": entry["retryable"]}}}
+        if code in REQUIRED_DETAILS:
+            then = {
+                "required": ["details"],
+                "properties": {
+                    "retryable": {"const": entry["retryable"]},
+                    "details": REQUIRED_DETAILS[code],
+                },
+            }
+        rules.append(
+            {"if": {"required": ["code"], "properties": {"code": {"const": code}}}, "then": then}
+        )
+    error["allOf"] = rules
     return json.dumps(schema, indent=2) + "\n"
 
 

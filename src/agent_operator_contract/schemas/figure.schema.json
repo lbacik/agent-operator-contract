@@ -46,6 +46,13 @@
           "value": {"type": "number"}
         }
       }
+    },
+    {
+      "if": {
+        "properties": {"unit": {"const": "ratio"}, "value": {"type": "number"}},
+        "required": ["unit", "value"]
+      },
+      "then": {"properties": {"value": {"minimum": 0, "maximum": 1}}}
     }
   ]
 }

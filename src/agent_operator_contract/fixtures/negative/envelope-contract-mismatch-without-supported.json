@@ -1,0 +1,9 @@
+{
+  "contract": "1.0",
+  "error": {
+    "code": "contract_mismatch",
+    "message": "no",
+    "retryable": false
+  },
+  "ok": false
+}

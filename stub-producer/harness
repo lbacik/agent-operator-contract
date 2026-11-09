@@ -69,6 +69,9 @@ CRASH_POINTS = (
 
 STATE_FILE = "/data/agent-operator-contract.json"
 
+CONFIG_FILE = "/data/agent-operator-contract.config.json"
+"""Instance configuration on the volume (must match the stub CONFIG_FILENAME)."""
+
 LOCK_FILE = "/data/agent-operator-contract.lock"
 """Engine lock file inside the container (must match the stub LOCK_FILENAME)."""
 
@@ -202,6 +205,32 @@ def _exec_mutation(
         return None, f"engine mutation returned non-JSON: {completed.stdout!r}"
 
 
+def _write_volume_config(container: str, config: str) -> str | None:
+    """Store the instance configuration on the volume for Offline Reads.
+
+    ``docker run`` for an Offline Read carries no environment, so the stub
+    ``agentctl`` reads repository and capabilities from this file instead.
+    Returns a problem description, or None on success.
+    """
+    script = (
+        "import os\n"
+        f"path={CONFIG_FILE!r}\n"
+        "tmp=path+'.tmp'\n"
+        f"open(tmp,'w').write({config!r})\n"
+        "os.replace(tmp,path)\n"
+    )
+    try:
+        completed = _run_docker(
+            ["exec", "-i", "--user", "agent", container, "python3", "-"],
+            stdin_text=script,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"docker is unavailable: {exc}"
+    if completed.returncode != 0:
+        return f"writing the instance configuration failed: {completed.stderr.strip()}"
+    return None
+
+
 def _archive_snapshot_snippet(aid_expr: str, target: str, indent: str = "") -> str:
     """Build the engine snippet computing archive manifest entries into ``target``.
 
@@ -320,6 +349,10 @@ def _do_setup(verb: str, params: dict[str, Any]) -> tuple[str, int]:
     except (OSError, subprocess.TimeoutExpired) as exc:
         return _error(verb, "failed", f"docker is unavailable: {exc}")
     _write_state({"container": name, "volume": volume, "data_path": "/data"})
+    volume_config = json.dumps({"repository": repository, "capabilities": sorted(capabilities)})
+    written = _write_volume_config(name, volume_config)
+    if written is not None:
+        return _error(verb, "failed", written)
     startup_hold = False
     if isinstance(config, dict) and config.get("native.startup_hold") is True:
         startup_hold = True
@@ -887,12 +920,12 @@ def main(argv: list[str]) -> int:
     try:
         request = json.loads(raw)
     except ValueError:
-        text, exit_code = _error(None, "usage", "the request document is not valid JSON")
+        text, exit_code = _error(verb or None, "usage", "the request document is not valid JSON")
         sys.stdout.write(text)
         return exit_code
     if not isinstance(request, dict) or request.get("verb") != verb:
         text, exit_code = _error(
-            None, "usage", "the argv verb and the document verb must agree"
+            verb or None, "usage", "the argv verb and the document verb must agree"
         )
         sys.stdout.write(text)
         return exit_code

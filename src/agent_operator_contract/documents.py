@@ -69,8 +69,12 @@ REPOSITORY_PATTERN = r"^[^/\s]+/[^/\s]+$"
 CONTRACT_MAJOR_PATTERN = r"^[0-9]+$"
 """Contract major from the discovery label, e.g. 1 (spec section 2.1)."""
 
+EXPORT_CONTRACT_PATTERN = r"^1\.[0-9]+$"
+"""The export manifest's ``contract``: a major-1 ``major.minor`` (spec section 11.3)."""
+
 CLIENT_CODE_PATTERN = r"^client\.[a-z_]+$"
 """Shape of an agentfleet client error.code; the exact codes live in client-table.json."""
+
 SCHEMA_NAMES: tuple[str, ...] = (
     "envelope",
     "identity",
@@ -132,6 +136,38 @@ LIMIT_NAMES: tuple[str, ...] = (
 )
 """Ceiling names that need no ``native.`` prefix (spec section 7.2)."""
 
+LIMIT_UNITS: dict[str, str] = {
+    "raw_tokens": "tokens",
+    "effective_tokens": "tokens",
+    "cost_usd": "usd",
+    "wall_clock_seconds": "seconds",
+    "tool_calls": "count",
+    "turns": "count",
+}
+"""The unit each named budget limit is measured in (spec section 7.2)."""
+
+FIGURE_NAME_UNITS: dict[str, str] = {
+    "cost_usd": "usd",
+    "cache_hit_rate": "ratio",
+    "context_used": "tokens",
+    "context_peak": "tokens",
+    "context_window": "tokens",
+    "turns": "count",
+    "tool_calls": "count",
+    "continuations": "count",
+    "review_seats_running": "count",
+    "elapsed_seconds": "seconds",
+}
+"""The unit of each optional figure of spec section 9.2; ``native.*`` names are open."""
+
+COMMAND_ARGUMENTS: dict[str, tuple[str, ...]] = {
+    "stop_after": ("after",),
+    "next_issue": ("issue",),
+    "recovery_retry": ("attempt_id",),
+    "recovery_release": ("attempt_id", "saved_at"),
+}
+"""Required ``CommandRecord.arguments`` keys per kind (spec section 7.5)."""
+
 INTAKE_STATES: tuple[str, ...] = ("open", "closed")
 """Every ``intake.state`` of a Status Snapshot (spec section 7.2)."""
 
@@ -173,7 +209,7 @@ MANIFEST_KINDS: tuple[str, ...] = (
 STARTUP_CHECK_RESULTS: tuple[str, ...] = ("started", "ok", "skipped", "failed")
 """Every ``startup_check`` event ``result`` of spec section 10."""
 
-MANIFEST_PATH_PATTERN = r"^(?!/)(?!.*\.\.).+$"
+MANIFEST_PATH_PATTERN = r"^(?!/)(?!(.*/)?\.\.(/|$)).+$"
 """Relative POSIX path: no leading slash, no ``..`` segment (spec section 7.6)."""
 
 SHA256_PATTERN = r"^[0-9a-f]{64}$"
@@ -389,10 +425,24 @@ def _validate_error(doc: dict[str, Any]) -> list[str]:
         errors.append("error is missing required property: 'retryable'")
     elif type(doc["retryable"]) is not bool:
         errors.append("error.retryable must be a boolean")
+    elif isinstance(code, str) and code in table and doc["retryable"] != table[code]["retryable"]:
+        errors.append(f"error.retryable must be {table[code]['retryable']!r} for {code!r}")
     if "request_id" in doc and not _matches(REQUEST_ID_PATTERN, doc["request_id"]):
         errors.append("error.request_id must match the request ID pattern")
     if "details" in doc and not isinstance(doc["details"], dict):
         errors.append("error.details must be an object")
+    if code == "contract_mismatch":
+        supported = (
+            doc.get("details", {}).get("supported")
+            if isinstance(doc.get("details"), dict)
+            else None
+        )
+        if (
+            not isinstance(supported, list)
+            or not supported
+            or any(type(major) is not int or major < 1 for major in supported)
+        ):
+            errors.append("contract_mismatch requires details.supported: a list of majors")
     return errors
 
 
@@ -497,6 +547,16 @@ def validate_figure(doc: object, prefix: str = "figure") -> list[str]:
                 errors.append(f"{prefix}.value must be null when basis is {basis!r}")
         elif not isinstance(value, (int, float)) or isinstance(value, bool):
             errors.append(f"{prefix}.value must be a number when basis is {basis!r}")
+        elif unit == "ratio" and not 0 <= value <= 1:
+            errors.append(f"{prefix}.value must be between 0 and 1 for unit 'ratio'")
+    return errors
+
+
+def _validate_figure_unit(doc: object, unit: str | None, prefix: str) -> list[str]:
+    """A Figure whose name may fix its unit (spec sections 7.2 and 9.2); None leaves it open."""
+    errors = validate_figure(doc, prefix)
+    if unit is not None and isinstance(doc, dict) and "unit" in doc and doc["unit"] != unit:
+        errors.append(f"{prefix}.unit must be {unit!r}")
     return errors
 
 
@@ -530,9 +590,11 @@ def _validate_budget(doc: object, prefix: str = "budget") -> list[str]:
         if key not in doc:
             errors.append(f"{prefix} is missing required property: {key!r}")
     if "raw_tokens" in doc:
-        errors.extend(validate_figure(doc["raw_tokens"], f"{prefix}.raw_tokens"))
+        errors.extend(_validate_figure_unit(doc["raw_tokens"], "tokens", f"{prefix}.raw_tokens"))
     if "effective_tokens" in doc:
-        errors.extend(validate_figure(doc["effective_tokens"], f"{prefix}.effective_tokens"))
+        errors.extend(
+            _validate_figure_unit(doc["effective_tokens"], "tokens", f"{prefix}.effective_tokens")
+        )
     if "enforced_tokens" in doc and doc["enforced_tokens"] not in ENFORCED_TOKENS:
         errors.append(f"{prefix}.enforced_tokens {doc['enforced_tokens']!r} is not known")
     if "limits" in doc:
@@ -556,10 +618,12 @@ def _validate_budget(doc: object, prefix: str = "budget") -> list[str]:
                         name.startswith("native.") and len(name) > len("native.")
                     ):
                         errors.append(f"{item_prefix}.name {name!r} is not a known 1.0 limit")
-                if "used" in entry:
-                    errors.extend(validate_figure(entry["used"], f"{item_prefix}.used"))
-                if "limit" in entry:
-                    errors.extend(validate_figure(entry["limit"], f"{item_prefix}.limit"))
+                unit = LIMIT_UNITS.get(name) if isinstance(name, str) else None
+                for key in ("used", "limit"):
+                    if key in entry:
+                        errors.extend(
+                            _validate_figure_unit(entry[key], unit, f"{item_prefix}.{key}")
+                        )
     return errors
 
 
@@ -618,7 +682,11 @@ def _validate_current_attempt(doc: object) -> list[str]:
             errors.append("current_attempt.figures must be an object")
         else:
             for name, figure in figures.items():
-                errors.extend(validate_figure(figure, f"current_attempt.figures.{name}"))
+                errors.extend(
+                    _validate_figure_unit(
+                        figure, FIGURE_NAME_UNITS.get(name), f"current_attempt.figures.{name}"
+                    )
+                )
     return errors
 
 
@@ -784,6 +852,8 @@ def validate_attempts_list(doc: object) -> list[str]:
         errors.append("attempts list result is missing required property: 'attempts'")
     elif not isinstance(doc["attempts"], list):
         errors.append("attempts list result.attempts must be an array")
+    elif len(doc["attempts"]) > 100:
+        errors.append("attempts list result.attempts holds at most 100 entries")
     else:
         for index, entry in enumerate(doc["attempts"]):
             errors.extend(
@@ -818,6 +888,13 @@ def validate_attempts_show(doc: object) -> list[str]:
     else:
         for index, entry in enumerate(doc["manifest"]):
             errors.extend(validate_manifest_entry(entry, f"attempts show result.manifest[{index}]"))
+        if not any(
+            isinstance(entry, dict)
+            and entry.get("kind") == "events"
+            and entry.get("path") == "events.jsonl"
+            for entry in doc["manifest"]
+        ):
+            errors.append("attempts show result.manifest must list events.jsonl (kind events)")
     return errors
 
 
@@ -825,16 +902,16 @@ def validate_export_manifest(doc: object) -> list[str]:
     """Check an export ``manifest.json``; the empty list means valid (spec section 11.3).
 
     The stream's first member is ``{"contract": "1.0", "attempt": AttemptSummary,
-    "files": [ManifestEntry]}``. The contract must be the ``1.0`` this library
-    speaks; unknown fields are ignored so a minor can add them.
+    "files": [ManifestEntry]}``. The contract must be a major-1 ``1.<minor>``;
+    unknown fields are ignored so a minor can add them.
     """
     if not isinstance(doc, dict):
         return ["export manifest must be an object"]
     errors: list[str] = []
     if "contract" not in doc:
         errors.append("export manifest is missing required property: 'contract'")
-    elif doc["contract"] != "1.0":
-        errors.append("export manifest contract must be '1.0'")
+    elif not _matches(EXPORT_CONTRACT_PATTERN, doc["contract"]):
+        errors.append("export manifest contract must be a major-1 '1.<minor>' version")
     if "attempt" not in doc:
         errors.append("export manifest is missing required property: 'attempt'")
     else:
@@ -873,18 +950,43 @@ def validate_command_record(doc: object, prefix: str = "command") -> list[str]:
         errors.append(f"{prefix}.sequence must be an integer >= 0")
     if "kind" in doc and doc["kind"] not in COMMAND_KINDS:
         errors.append(f"{prefix}.kind {doc['kind']!r} is not a known 1.0 kind")
-    if "arguments" in doc and not isinstance(doc["arguments"], dict):
-        errors.append(f"{prefix}.arguments must be an object")
+    if "arguments" in doc:
+        errors.extend(_validate_command_arguments(doc.get("kind"), doc["arguments"], prefix))
     if "repository" in doc and not _matches(REPOSITORY_PATTERN, doc["repository"]):
         errors.append(f"{prefix}.repository must be written owner/name")
     if "acknowledgement" in doc and doc["acknowledgement"] not in ACKNOWLEDGEMENTS:
         errors.append(f"{prefix}.acknowledgement {doc['acknowledgement']!r} is not known")
-    if "detail" in doc and not isinstance(doc["detail"], str):
-        errors.append(f"{prefix}.detail must be a string")
+    if "detail" in doc and (
+        not isinstance(doc["detail"], str) or "\n" in doc["detail"] or "\r" in doc["detail"]
+    ):
+        errors.append(f"{prefix}.detail must be a single-line string")
     if "created_at" in doc and not _validate_timestamp(doc["created_at"]):
         errors.append(f"{prefix}.created_at must be an RFC 3339 UTC timestamp")
     if "updated_at" in doc and not _validate_timestamp(doc["updated_at"]):
         errors.append(f"{prefix}.updated_at must be an RFC 3339 UTC timestamp")
+    return errors
+
+
+def _validate_command_arguments(kind: object, arguments: object, prefix: str) -> list[str]:
+    """Check the kind-specific ``arguments`` of a CommandRecord (spec section 7.5)."""
+    if not isinstance(arguments, dict):
+        return [f"{prefix}.arguments must be an object"]
+    errors: list[str] = []
+    for key in COMMAND_ARGUMENTS.get(kind, ()) if isinstance(kind, str) else ():
+        if key not in arguments:
+            errors.append(f"{prefix}.arguments is missing required property: {key!r}")
+    if kind == "stop_after" and "after" in arguments:
+        after = arguments["after"]
+        if type(after) is not int or not 1 <= after <= 999:
+            errors.append(f"{prefix}.arguments.after must be an integer from 1 to 999")
+    if kind == "next_issue" and "issue" in arguments:
+        issue = arguments["issue"]
+        if type(issue) is not int or issue < 1:
+            errors.append(f"{prefix}.arguments.issue must be an integer >= 1")
+    if kind in ("recovery_retry", "recovery_release"):
+        for key in COMMAND_ARGUMENTS[kind]:
+            if key in arguments and not _is_non_empty_string(arguments[key]):
+                errors.append(f"{prefix}.arguments.{key} must be a non-empty string")
     return errors
 
 
@@ -1057,6 +1159,19 @@ def validate_contract_event(doc: object) -> list[str]:
     return _validate_contract_event(doc, "contract event")
 
 
+def _validate_stopped_is_offline(doc: dict[str, Any]) -> list[str]:
+    """``instance.state`` is ``stopped`` exactly when ``identity.mode`` is offline (7.2, 12)."""
+    instance = doc.get("instance")
+    identity = doc.get("identity")
+    state = instance.get("state") if isinstance(instance, dict) else None
+    mode = identity.get("mode") if isinstance(identity, dict) else None
+    if state == "stopped" and mode not in (None, "offline"):
+        return ["status.instance.state 'stopped' requires identity.mode 'offline'"]
+    if mode == "offline" and state not in (None, "stopped"):
+        return ["status.identity.mode 'offline' requires instance.state 'stopped'"]
+    return []
+
+
 def validate_status(doc: object) -> list[str]:
     """Check a Status Snapshot; the empty list means valid (spec section 7.2).
 
@@ -1085,6 +1200,7 @@ def validate_status(doc: object) -> list[str]:
     if "identity" in doc:
         identity_errors = validate_identity(doc["identity"])
         errors.extend(identity_errors)
+    errors.extend(_validate_stopped_is_offline(doc))
     if "instance" in doc:
         instance = doc["instance"]
         if not isinstance(instance, dict):
@@ -1430,6 +1546,11 @@ def _validate_grow_archive_params(params: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _is_usage_reply(doc: dict[str, Any]) -> bool:
+    error = doc.get("error")
+    return doc.get("ok") is False and isinstance(error, dict) and error.get("code") == "usage"
+
+
 def validate_harness_reply(doc: object) -> list[str]:
     """Check a harness reply document; the empty list means valid (spec section 15.1)."""
     if not isinstance(doc, dict):
@@ -1440,7 +1561,10 @@ def validate_harness_reply(doc: object) -> list[str]:
     elif not _matches(CONTRACT_PATTERN, doc["harness"]):
         errors.append("harness must be a '<major>.<minor>' string")
     verb = doc.get("verb")
-    if "verb" in doc and (not isinstance(verb, str) or verb not in HARNESS_VERBS):
+    if "verb" in doc and (not isinstance(verb, str) or not verb):
+        errors.append("harness reply verb must be a non-empty string")
+    elif "verb" in doc and verb not in HARNESS_VERBS and not _is_usage_reply(doc):
+        # Only a usage reply may echo an unknown verb (spec section 15.1).
         errors.append(f"harness reply verb {verb!r} is not a known 1.0 verb")
     if "ok" not in doc:
         errors.append("harness reply is missing required property: 'ok'")

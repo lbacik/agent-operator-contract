@@ -7,17 +7,19 @@ small in-memory producer that mirrors the contract's mutation semantics
 (repository guard, idempotency, state) so the mutation scenarios run green.
 """
 
+import dataclasses
 import hashlib
 import io
 import json
 import tarfile
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import pytest
 
-from agent_operator_contract import producer_suite, shared
+from agent_operator_contract import documents, producer_suite, shared
 
 CTX = producer_suite.SuiteContext(
     container="stub-abc123",
@@ -61,7 +63,11 @@ def _fail(code: str, details: Any = None) -> str:
     doc: dict[str, Any] = {
         "contract": "1.0",
         "ok": False,
-        "error": {"code": code, "message": "stub", "retryable": False},
+        "error": {
+            "code": code,
+            "message": "stub",
+            "retryable": documents.error_table()[code]["retryable"],
+        },
     }
     if details is not None:
         doc["error"]["details"] = details
@@ -117,7 +123,7 @@ def _fail_with_request(code: str, request_id: str, details: Any = None) -> str:
         "error": {
             "code": code,
             "message": "stub",
-            "retryable": False,
+            "retryable": documents.error_table()[code]["retryable"],
             "request_id": request_id,
         },
     }
@@ -485,7 +491,12 @@ class _FakeProducer:
         exec_user: str,
         argv: list[str],
         timeout: float,
+        *,
+        offline: bool = False,
     ) -> producer_suite.DockerResult:
+        if not offline and not self.alive:
+            # A dead engine answers like the stub: agent_unreachable, exit 6.
+            return producer_suite.DockerResult(6, _fail("agent_unreachable"), "")
         delay = self.latency.get(self._op_key(argv), 0.0)
         if delay:
             time.sleep(delay)
@@ -704,6 +715,7 @@ class _FakeProducer:
                 # Commit durably, then die before replying like the stub does.
                 self.crash_armed = False
                 self._mutate(argv[2], argv[4], argv[6])
+                self.alive = False
                 return producer_suite.DockerResult(137, "", "")
             return self._mutate(argv[2], argv[4], argv[6])
         if len(argv) == 4 and argv[:3] == ["--contract", "1", "command"]:
@@ -784,7 +796,7 @@ class _FakeProducer:
                     _fail_with_request("unsupported", request_id, {"mode": "offline"}),
                     "",
                 )
-            return self.handle("", "", "", [*argv[:2], *argv[3:]], 0.0)
+            return self.handle("", "", "", [*argv[:2], *argv[3:]], 0.0, offline=True)
         raise AssertionError(f"unexpected offline argv: {argv!r}")
 
 
@@ -825,6 +837,14 @@ def fakes(monkeypatch: pytest.MonkeyPatch) -> _FakeProducer:
             return producer_suite.HarnessResult(
                 "unsupported", None, f"crash-point:{params.get('point')}"
             )
+        if verb == "start-container":
+            producer.alive = True
+            producer.startup = True
+            return producer_suite.HarnessResult("ok", {"running": True}, "")
+        if verb == "release":
+            released = producer.startup
+            producer.startup = False
+            return producer_suite.HarnessResult("ok", {"released": released}, "")
         return _fake_harness(cmd, verb, params, timeout)
 
     monkeypatch.setattr(producer_suite, "_docker_exec", producer.handle)
@@ -998,6 +1018,16 @@ def test_crash_scenario_is_not_run_when_harness_cannot_crash(
     assert outcome.status == "not_run"
 
 
+def test_crash_scenario_restarts_before_the_retry_and_leaves_a_live_instance(
+    fakes: _FakeProducer,
+) -> None:
+    outcome = producer_suite.scenario_crash_between_commit_and_reply(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert fakes.alive
+    assert not fakes.startup
+
+
 def test_crash_scenario_fails_when_the_first_attempt_replies(
     fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1081,6 +1111,34 @@ def test_apply_expect_fail_listing_a_not_run_fails_the_run() -> None:
 
     assert exit_code == 1
     assert any("hold-lock" in line and "did not fail" in line for line in lines)
+
+
+def test_apply_expect_fail_tolerates_not_run_by_default() -> None:
+    outcomes = [producer_suite.ScenarioOutcome("handoff", "not_run", "not advertised")]
+
+    lines, exit_code = producer_suite.apply_expect_fail(outcomes, [])
+
+    assert exit_code == 0
+    assert any(line.startswith("NOT RUN handoff") for line in lines)
+
+
+def test_apply_expect_fail_require_all_fails_on_not_run() -> None:
+    outcomes = [
+        producer_suite.ScenarioOutcome("identity", "passed"),
+        producer_suite.ScenarioOutcome("handoff", "not_run", "not advertised"),
+    ]
+
+    _, exit_code = producer_suite.apply_expect_fail(outcomes, [], require_all=True)
+
+    assert exit_code == 1
+
+
+def test_main_require_all_fails_when_a_scenario_does_not_run(
+    fakes: _FakeProducer, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The minimal fakes leave harness-driven scenarios not run.
+    assert producer_suite.main(["--harness", "fake-harness", "--require-all"]) == 1
+    assert "NOT RUN" in capsys.readouterr().out
 
 
 def test_apply_expect_fail_with_an_unknown_id_fails_the_run() -> None:
@@ -1657,6 +1715,23 @@ def test_budget_export_is_not_run_without_harness_support(
     assert outcome.status == "not_run"
 
 
+def test_first_byte_read_loses_nothing_from_a_real_export_pipe(tmp_path: Path) -> None:
+    payload = bytes(range(256)) * 512
+    fake_docker = tmp_path / "docker"
+    fake_docker.write_text(
+        "#!/usr/bin/env python3\n"
+        "import sys\n"
+        f"sys.stdout.buffer.write(bytes(range(256)) * {len(payload) // 256})\n"
+    )
+    fake_docker.chmod(0o755)
+
+    proc = producer_suite._popen_export(str(fake_docker), "c", "agent", ["--contract", "1"])
+    first, _ = producer_suite._read_first_byte(proc, 5.0)
+    rest, _ = proc.communicate(timeout=10.0)
+
+    assert first + rest == payload
+
+
 def test_budget_export_fails_on_a_slow_start(
     fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2061,15 +2136,42 @@ def test_handoff_rejected_without_an_active_attempt(
     assert json.loads(answered.stdout)["error"]["code"] == "rejected"
 
 
-def test_handoff_is_unsupported_when_capability_missing(
-    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize(
+    ("scenario", "capability"),
+    [
+        (producer_suite.scenario_handoff, "operator-handoff"),
+        (producer_suite.scenario_handoff_crash, "operator-handoff"),
+        (producer_suite.scenario_recovery_retry, "recovery-retry"),
+        (producer_suite.scenario_recovery_release, "recovery-release"),
+        (producer_suite.scenario_errors_reset, "errors-reset"),
+        (producer_suite.scenario_stop_after_restart, "stop-after"),
+        (producer_suite.scenario_next_issue_restart, "next-issue"),
+    ],
+)
+def test_capability_scenario_is_not_run_when_capability_missing(
+    fakes: _FakeProducer,
+    monkeypatch: pytest.MonkeyPatch,
+    scenario: Any,
+    capability: str,
 ) -> None:
     _support_claims(monkeypatch, fakes)
+    ctx = dataclasses.replace(
+        FULL_CTX, capabilities=[name for name in FULL_CTX.capabilities if name != capability]
+    )
 
-    outcome = producer_suite.scenario_handoff(CTX, ["fake-harness"])
+    outcome = scenario(ctx, ["fake-harness"])
 
-    assert outcome.status == "failed"
-    assert "unsupported" in outcome.detail
+    assert outcome.status == "not_run"
+    assert capability in outcome.detail
+
+
+def test_stop_after_invalid_is_not_run_without_stop_after(fakes: _FakeProducer) -> None:
+    ctx = dataclasses.replace(CTX, capabilities=["next-issue"])
+
+    outcome = producer_suite.scenario_stop_after_invalid(ctx)
+
+    assert outcome.status == "not_run"
+    assert "stop-after" in outcome.detail
 
 
 def test_handoff_crash_passes_with_retained_attempt(

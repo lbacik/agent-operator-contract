@@ -674,6 +674,50 @@ def test_stub_offline_read_refused_while_engine_holds_the_lock(tmp_path: Path) -
     assert refused.stderr == fixture["stderr"]
 
 
+def test_stub_offline_identity_reads_its_configuration_from_the_volume(tmp_path: Path) -> None:
+    # docker run for an Offline Read carries no environment (spec 3.2).
+    env = _durable_env(tmp_path)
+    env.pop("CONTRACT_CAPABILITIES", None)
+    env.pop("CONTRACT_REPOSITORY", None)
+    (tmp_path / "volume" / "agent-operator-contract.config.json").write_text(
+        json.dumps({"repository": "acme/widgets", "capabilities": ["pool", "stop-after"]}),
+        encoding="utf-8",
+    )
+
+    answered = _run_agentctl(["--contract", "1", "--offline", "identity"], env)
+
+    identity = json.loads(answered.stdout)["result"]
+    assert identity["repository"] == "acme/widgets"
+    assert identity["capabilities"] == ["pool", "stop-after"]
+
+
+def test_stub_offline_lock_probe_works_on_a_read_only_volume(tmp_path: Path) -> None:
+    # An Offline Read mounts the volume read-only (spec 3.2): the probe must
+    # still see a live holder, and must still serve when the lock is free.
+    fcntl = pytest.importorskip("fcntl")
+    env = _durable_env(tmp_path)
+    volume = tmp_path / "volume"
+    lock_path = volume / "agent-operator-contract.lock"
+    lock_path.touch()
+    with open(lock_path, "a", encoding="utf-8") as handle:
+        lock_path.chmod(0o444)
+        volume.chmod(0o555)
+        try:
+            served = _run_agentctl(["--contract", "1", "--offline", "identity"], env)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                refused = _run_agentctl(["--contract", "1", "--offline", "identity"], env)
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            volume.chmod(0o755)
+            lock_path.chmod(0o644)
+
+    assert served.returncode == 0, served.stdout
+    assert refused.returncode == 1
+    assert json.loads(refused.stdout)["error"]["details"] == {"reason": "instance_running"}
+
+
 def test_stub_crash_between_commit_and_reply_replays_on_retry(tmp_path: Path) -> None:
     env = _durable_env(tmp_path)
     _patch_state(env, "doc['crash_armed'] = {'point': 'between-commit-and-reply'}")
@@ -1349,12 +1393,16 @@ def _stub_stack(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
         "#!/usr/bin/env python3\n"
         "import os\n"
         "import sys\n"
+        "if len(sys.argv) > 1 and sys.argv[1] == 'inspect':\n"
+        "    print('sha256:fake-image')\n"
         "if len(sys.argv) < 2 or sys.argv[1] != 'exec':\n"
         "    sys.exit(0)\n"
         "state = os.environ['FAKE_ENGINE_STATE']\n"
         "archives = os.environ['FAKE_ENGINE_ARCHIVES']\n"
+        "config = os.environ['FAKE_ENGINE_CONFIG']\n"
         "script = sys.stdin.read()\n"
         "script = script.replace('/data/archives', archives)\n"
+        "script = script.replace('/data/agent-operator-contract.config.json', config)\n"
         "script = script.replace('/data/agent-operator-contract.json', state)\n"
         "exec(compile(script, '<engine>', 'exec'), {})\n",
         encoding="utf-8",
@@ -1370,7 +1418,35 @@ def _stub_stack(tmp_path: Path) -> tuple[dict[str, str], dict[str, str]]:
     harness_env["STUB_HARNESS_STATE"] = str(harness_state)
     harness_env["FAKE_ENGINE_STATE"] = str(volume / "agent-operator-contract.json")
     harness_env["FAKE_ENGINE_ARCHIVES"] = str(volume / "archives")
+    harness_env["FAKE_ENGINE_CONFIG"] = str(volume / "agent-operator-contract.config.json")
     return agentctl_env, harness_env
+
+
+def test_harness_setup_honors_startup_hold_and_stores_the_configuration(tmp_path: Path) -> None:
+    agentctl_env, harness_env = _stub_stack(tmp_path)
+    Path(harness_env["STUB_HARNESS_STATE"]).write_text("{}", encoding="utf-8")
+
+    _harness_verb(
+        harness_env,
+        "setup",
+        {
+            "repository": "acme/widgets",
+            "capabilities": ["stop-after"],
+            "config": {"native.startup_hold": True},
+        },
+    )
+
+    instance = _status(agentctl_env)["instance"]
+    assert isinstance(instance, dict)
+    assert instance["state"] == "starting"
+    offline_env = dict(agentctl_env)
+    offline_env.pop("CONTRACT_CAPABILITIES", None)
+    offline_env.pop("CONTRACT_REPOSITORY", None)
+    identity = json.loads(
+        _run_agentctl(["--contract", "1", "--offline", "identity"], offline_env).stdout
+    )["result"]
+    assert identity["repository"] == "acme/widgets"
+    assert identity["capabilities"] == ["stop-after"]
 
 
 def _harness_verb(harness_env: dict[str, str], verb: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -2296,3 +2372,22 @@ def test_stub_errors_reset_unsupported_without_capability(tmp_path: Path) -> Non
 
     assert completed.returncode == 3
     assert json.loads(completed.stdout)["error"]["code"] == "unsupported"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["frobnicate", json.dumps({"verb": "frobnicate", "params": {}})],
+        ["release", json.dumps({"verb": "hold", "params": {}})],
+        ["release", "not json"],
+    ],
+)
+def test_harness_usage_error_echoes_the_argv_verb(argv: list[str]) -> None:
+    """Spec section 15.1: ``verb`` is absent only when argv named no verb."""
+    completed = _run_harness(argv)
+
+    assert completed.returncode == 2
+    doc = json.loads(completed.stdout)
+    assert doc["verb"] == argv[0]
+    assert doc["error"]["code"] == "usage"
+    assert documents.validate_harness_reply(doc) == []
