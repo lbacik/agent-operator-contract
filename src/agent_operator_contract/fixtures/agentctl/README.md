@@ -41,10 +41,10 @@ A consumer passes the consumer suite when it classifies every fixture as `index.
 | Area | Fixtures |
 | --- | --- |
 | Identity | `identity` |
-| Status Snapshot, one per `instance.state` | `status-starting`, `status-idle`, `status-active`, `status-draining`, `status-paused`, `status-recovering`, `offline-status-halted` (`stopped`), plus `status-simple-coding-agent` for the second backend's shape |
+| Status Snapshot, one per `instance.state` | `status-starting`, `status-idle`, `status-active`, `status-draining`, `status-paused`, `status-recovering`, `status-recovering-retained` (Retained Attempt), `offline-status-halted` (`stopped`), plus `status-simple-coding-agent` for the second backend's shape |
 | `command` read | `command-found`, `command-not-found` |
 | Core mutations | `stop-accepted`, `stop-replayed`, `resume-accepted` |
-| Capability mutations | `stop-after-accepted`, `next-issue-accepted`, `handoff-accepted`, `handoff-completed`, `handoff-rejected`, `recovery-retry-completed`, `recovery-retry-not-found`, `recovery-release-completed`, `recovery-release-not-found`, `errors-reset-completed`, `errors-reset-rejected` |
+| Capability mutations | `stop-after-accepted`, `next-issue-accepted`, `handoff-accepted`, `handoff-completed`, `handoff-rejected`, `recovery-retry-completed`, `recovery-retry-not-found`, `recovery-retry-rejected`, `recovery-release-completed`, `recovery-release-not-found`, `recovery-release-rejected`, `errors-reset-completed`, `errors-reset-rejected` |
 | Attempt Archives | `attempts-list`, `attempts-list-paged`, `attempts-show-sealed`, `attempts-show-unsealed`, `attempts-not-found`, `attempts-export-not-found` |
 | Offline Read | `offline-status-halted`, `offline-identity-running` (`rejected` / `instance_running`) |
 | Rejections | `rejected`, `repository-mismatch`, `payload-mismatch`, `invalid-argument`, `invalid-argument-after-0`, `usage`, `internal-not-stored` |

@@ -24,10 +24,13 @@ them. It is built as a Docker image in CI and never published.
   points, `finish-attempt` with a native outcome, `crash` at every crash
   point, `terminate` (SIGTERM), `stop-container`/`start-container`, `halt`
   with a reason, `grow-archive`, `hold-lock` (holds the engine lock file
-  for the requested duration) and `defer-publication`
-  (leaves a publication effect pending at restart). State mutations run
+  for the requested duration), `defer-publication`
+  (leaves a publication effect pending at restart) and `fail-finalization`
+  (the next finishing Attempt becomes a Retained Attempt that only
+  `recovery retry` or `recovery release` clears). State mutations run
   inside the container over `docker exec`, so the stub engine honors holds,
-  crashes, Halts and deferred publication across restarts.
+  crashes, Halts, deferred publication and Retained Attempts across
+  restarts.
 - [`Dockerfile`](Dockerfile): the test-only image with a non-root `agent`
   user and the shared library on `PYTHONPATH`.
 

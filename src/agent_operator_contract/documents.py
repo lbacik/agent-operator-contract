@@ -231,7 +231,7 @@ CONTRACT_EVENTS: tuple[str, ...] = (
 )
 """Every Contract Event name of spec section 10 (``native.`` names excluded)."""
 
-HARNESS_VERSION = "1.0"
+HARNESS_VERSION = "1.1"
 """The harness protocol version the suite speaks (spec section 15.1)."""
 
 HARNESS_VERBS: tuple[str, ...] = (
@@ -249,6 +249,7 @@ HARNESS_VERBS: tuple[str, ...] = (
     "halt",
     "grow-archive",
     "defer-publication",
+    "fail-finalization",
 )
 """Every verb of the conformance harness protocol (spec section 15.1)."""
 
@@ -1397,7 +1398,7 @@ def validate_harness_request(doc: object) -> list[str]:
         return errors
     verb = doc["verb"]
     if not isinstance(verb, str) or verb not in HARNESS_VERBS:
-        return [*errors, f"harness request verb {verb!r} is not a known 1.0 verb"]
+        return [*errors, f"harness request verb {verb!r} is not a known 1.1 verb"]
     if "params" not in doc:
         return [*errors, "harness request is missing required property: 'params'"]
     params = doc["params"]
@@ -1415,6 +1416,7 @@ def _validate_harness_params(verb: str, params: dict[str, Any]) -> list[str]:
         "stop-container",
         "start-container",
         "defer-publication",
+        "fail-finalization",
     ):
         if params:
             return [f"harness {verb!r} takes no parameters"]
@@ -1565,7 +1567,7 @@ def validate_harness_reply(doc: object) -> list[str]:
         errors.append("harness reply verb must be a non-empty string")
     elif "verb" in doc and verb not in HARNESS_VERBS and not _is_usage_reply(doc):
         # Only a usage reply may echo an unknown verb (spec section 15.1).
-        errors.append(f"harness reply verb {verb!r} is not a known 1.0 verb")
+        errors.append(f"harness reply verb {verb!r} is not a known 1.1 verb")
     if "ok" not in doc:
         errors.append("harness reply is missing required property: 'ok'")
         return errors
@@ -1705,9 +1707,9 @@ def _validate_harness_result(verb: str, result: dict[str, Any]) -> list[str]:
         elif type(result["appended_bytes"]) is not int or result["appended_bytes"] < 1:
             errors.append("harness 'grow-archive' result appended_bytes must be an integer >= 1")
         return errors
-    if verb == "defer-publication":
+    if verb in ("defer-publication", "fail-finalization"):
         if result.get("armed") is not True:
-            return ["harness 'defer-publication' result armed must be true"]
+            return [f"harness {verb!r} result armed must be true"]
         return []
     raise AssertionError(f"unreachable harness verb: {verb!r}")
 

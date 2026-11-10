@@ -8,7 +8,7 @@
     "harness": {
       "type": "string",
       "pattern": "^[0-9]+\\.[0-9]+$",
-      "description": "The harness protocol version, e.g. 1.0."
+      "description": "The harness protocol version, e.g. 1.1."
     },
     "verb": {
       "type": "string",
@@ -75,7 +75,8 @@
             "start-container",
             "halt",
             "grow-archive",
-            "defer-publication"
+            "defer-publication",
+            "fail-finalization"
           ]}}}
     },
     {
@@ -308,6 +309,15 @@
       "if": {
         "required": ["verb", "ok"],
         "properties": {"verb": {"const": "defer-publication"}, "ok": {"const": true}}
+      },
+      "then": {
+        "properties": {"result": {"type": "object", "required": ["armed"], "properties": {"armed": {"const": true}}}}
+      }
+    },
+    {
+      "if": {
+        "required": ["verb", "ok"],
+        "properties": {"verb": {"const": "fail-finalization"}, "ok": {"const": true}}
       },
       "then": {
         "properties": {"result": {"type": "object", "required": ["armed"], "properties": {"armed": {"const": true}}}}

@@ -20,7 +20,7 @@ import time
 import uuid
 from typing import Any
 
-HARNESS_VERSION = "1.0"
+HARNESS_VERSION = "1.1"
 
 KNOWN_VERBS = (
     "setup",
@@ -37,6 +37,7 @@ KNOWN_VERBS = (
     "halt",
     "grow-archive",
     "defer-publication",
+    "fail-finalization",
 )
 
 KNOWN_CAPABILITIES = (
@@ -469,8 +470,10 @@ def _do_release(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> 
         return _error(verb, "usage", "harness 'release' takes no parameters")
     container = str(instance["container"])
     body = (
+        "act0=doc.get('active_attempt')\n"
+        "retained=isinstance(act0,dict) and act0.get('retained') is True\n"
         "had=doc.get('hold') is not None or doc.get('startup_hold') is True"
-        " or doc.get('recovery_pending') is True\n"
+        " or (doc.get('recovery_pending') is True and not retained)\n"
         "was_after=isinstance(doc.get('hold'),dict) and doc['hold'].get('point')=='after-outcome'\n"
         "doc['hold']=None\n"
         "starting=doc.get('startup_hold') is True\n"
@@ -479,6 +482,15 @@ def _do_release(verb: str, params: dict[str, Any], instance: dict[str, Any]) -> 
         "finished=False\n"
         "if starting:\n"
         "    pass\n"
+        "elif retained:\n"
+        "    pass\n"
+        "elif was_after and isinstance(active,dict)"
+        " and isinstance(active.get('outcome_native'),str)"
+        " and doc.get('fail_finalization_armed') is True:\n"
+        "    doc['fail_finalization_armed']=False\n"
+        "    active['retained']=True\n"
+        "    active['native_phase']='retained'\n"
+        "    doc['recovery_pending']=True\n"
         "elif was_after and isinstance(active,dict) and isinstance(active.get('outcome_native'),str):\n"
         "    now=_now()\n"
         "    aid=active.get('attempt_id')\n"
@@ -615,6 +627,14 @@ def _do_finish_attempt(
         "        _save(doc)\n"
         "        print(json.dumps({'attempt_id':aid,'native_outcome':p['native_outcome'],"
         "'crashed':True}))\n"
+        "    elif doc.get('fail_finalization_armed') is True:\n"
+        "        doc['fail_finalization_armed']=False\n"
+        "        active['retained']=True\n"
+        "        active['native_phase']='retained'\n"
+        "        doc['recovery_pending']=True\n"
+        "        _save(doc)\n"
+        "        print(json.dumps({'attempt_id':aid,'native_outcome':p['native_outcome'],"
+        "'retained':True}))\n"
         "    else:\n"
         "        summary={'attempt_id':aid,"
         "'issue':{'number':active.get('issue_number',1),'title':active.get('issue_title')},"
@@ -911,6 +931,28 @@ def _do_defer_publication(
     return _ok(verb, {"armed": True})
 
 
+def _do_fail_finalization(
+    verb: str, params: dict[str, Any], instance: dict[str, Any]
+) -> tuple[str, int]:
+    """Arm a one-shot: the next finishing Attempt becomes a Retained Attempt.
+
+    The finalization fails at its boundary after the verdict is recorded. The
+    Attempt stays the ``current_attempt``, the instance is ``recovering`` and
+    no Claim opens until ``recovery retry`` or ``recovery release``; a harness
+    ``release`` does not clear it.
+    """
+    if params:
+        return _error(verb, "usage", "harness 'fail-finalization' takes no parameters")
+    container = str(instance["container"])
+    reply, problem = _exec_mutation(
+        container,
+        "doc['fail_finalization_armed']=True\n_save(doc)\nprint(json.dumps({'armed':True}))\n",
+    )
+    if reply is None:
+        return _error(verb, "failed", problem)
+    return _ok(verb, {"armed": True})
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 2:
         text, exit_code = _error(None, "usage", "expected: <harness> <verb> '<request-json>'")
@@ -982,6 +1024,9 @@ def main(argv: list[str]) -> int:
         elif verb == "defer-publication":
             assert instance is not None
             text, exit_code = _do_defer_publication(verb, params, instance)
+        elif verb == "fail-finalization":
+            assert instance is not None
+            text, exit_code = _do_fail_finalization(verb, params, instance)
         else:  # pragma: no cover - KNOWN_VERBS is exhaustive above.
             text, exit_code = _error(
                 verb, "unsupported", f"stub harness does not implement {verb!r}",

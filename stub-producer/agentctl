@@ -150,6 +150,7 @@ def _fresh_state() -> dict[str, Any]:
         "recovery_pending": False,
         "crash_armed": None,
         "defer_armed": False,
+        "fail_finalization_armed": False,
         "error_guard": False,
         "attempt_counter": 0,
         "process_started_at": _utc_now(),
@@ -222,6 +223,8 @@ def _load_state() -> tuple[dict[str, Any], str | None]:
         state["crash_armed"] = armed
     if type(doc.get("defer_armed")) is bool:
         state["defer_armed"] = doc["defer_armed"]
+    if type(doc.get("fail_finalization_armed")) is bool:
+        state["fail_finalization_armed"] = doc["fail_finalization_armed"]
     if type(doc.get("error_guard")) is bool:
         state["error_guard"] = doc["error_guard"]
     if type(doc.get("attempt_counter")) is int and doc["attempt_counter"] >= 0:
@@ -1197,10 +1200,16 @@ def _finalize_active(
 
 
 def _find_attempt(state: dict[str, Any], attempt_id: str) -> str | None:
-    """Return where an Attempt lives: ``"active"``, ``"finished"`` or None."""
+    """Return where an Attempt lives.
+
+    ``"retained"`` is a Retained Attempt (its finalization failed and an
+    operator must decide), ``"active"`` is an Attempt whose model work is
+    still running or whose recovery the engine finishes by itself,
+    ``"finished"`` is a finalized Attempt, and None is an unknown ID.
+    """
     active = state.get("active_attempt")
     if isinstance(active, dict) and active.get("attempt_id") == attempt_id:
-        return "active"
+        return "retained" if active.get("retained") is True else "active"
     attempts = state.get("attempts")
     if isinstance(attempts, dict) and isinstance(attempts.get(attempt_id), dict):
         return "finished"
@@ -1217,7 +1226,7 @@ def _do_handoff(state: dict[str, Any], path: str | None, request_id: str) -> int
     stays retained in the active Attempt.
     """
     active = state.get("active_attempt")
-    if not isinstance(active, dict):
+    if not isinstance(active, dict) or active.get("retained") is True:
         text, exit_code = shared.render_error(
             "rejected",
             "no active attempt to hand off",
@@ -1241,6 +1250,32 @@ def _do_handoff(state: dict[str, Any], path: str | None, request_id: str) -> int
         _save_state(state, path)
         sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
         return 0
+    if state.get("fail_finalization_armed") is True:
+        state["fail_finalization_armed"] = False
+        if not isinstance(active.get("outcome_native"), str):
+            active["outcome_native"] = "handoff"
+            active["outcome_reason"] = None
+            _append_event(
+                state,
+                {
+                    "at": _utc_now(),
+                    "level": "info",
+                    "event": "outcome_recorded",
+                    "attempt_id": active["attempt_id"],
+                    "outcome": "handoff",
+                    "reason": None,
+                    "text": "outcome handoff",
+                },
+            )
+        active["retained"] = True
+        active["native_phase"] = "retained"
+        state["recovery_pending"] = True
+        record = _commit(
+            state, request_id, "handoff", {}, "not_fulfilled", "finalization failed; attempt retained"
+        )
+        _save_state(state, path)
+        sys.stdout.write(shared.render_success({"command": record, "replayed": False}))
+        return 0
     record = _commit(
         state,
         request_id,
@@ -1258,31 +1293,60 @@ def _do_handoff(state: dict[str, Any], path: str | None, request_id: str) -> int
     return 0
 
 
+def _reject_recovery(request_id: str, attempt_id: str, why: str) -> int:
+    """Answer ``rejected`` for a recovery command; nothing is stored."""
+    text, exit_code = shared.render_error(
+        "rejected",
+        f"attempt {attempt_id!r} {why}",
+        request_id=request_id,
+    )
+    sys.stdout.write(text)
+    return exit_code
+
+
+def _recovery_not_found(request_id: str, attempt_id: str) -> int:
+    text, exit_code = shared.render_error(
+        "not_found",
+        f"no attempt {attempt_id!r} is recorded",
+        request_id=request_id,
+    )
+    sys.stdout.write(text)
+    return exit_code
+
+
+def _clear_retained(state: dict[str, Any]) -> None:
+    """The Retained Attempt is finalized: recovery no longer holds the engine."""
+    state["recovery_pending"] = False
+
+
 def _do_recovery_retry(
     state: dict[str, Any], path: str | None, request_id: str, arguments: dict[str, Any]
 ) -> int:
-    """Retry safe finalization from retained evidence (spec section 8.3).
+    """Retry safe finalization of a Retained Attempt (spec section 8.3).
 
-    The recorded verdict is never recomputed: the Attempt is left untouched
-    and only the command is recorded as ``completed``. An unknown Attempt is
-    ``not_found``.
+    Only a Retained Attempt is retried: it finalizes with the verdict it
+    already recorded, which is never recomputed. An active Attempt is
+    ``rejected`` and nothing is stored. A finalized Attempt is a no-op
+    ``completed`` that changes nothing. An unknown Attempt is ``not_found``.
     """
     attempt_id = str(arguments["attempt_id"])
-    if _find_attempt(state, attempt_id) is None:
-        text, exit_code = shared.render_error(
-            "not_found",
-            f"no attempt {attempt_id!r} is recorded",
-            request_id=request_id,
-        )
-        sys.stdout.write(text)
-        return exit_code
+    where = _find_attempt(state, attempt_id)
+    if where is None:
+        return _recovery_not_found(request_id, attempt_id)
+    if where == "active":
+        return _reject_recovery(request_id, attempt_id, "is active; nothing is retained to retry")
+    detail = f"{attempt_id} is already finalized; nothing to retry"
+    if where == "retained":
+        _finalize_active(state, lifecycle_state="finished", outcome_native=None)
+        _clear_retained(state)
+        detail = f"safe finalization retried for {attempt_id} from retained evidence"
     record = _commit(
         state,
         request_id,
         "recovery_retry",
         {"attempt_id": attempt_id},
         "completed",
-        f"safe finalization retried for {attempt_id} from retained evidence",
+        detail,
     )
     _save_state(state, path)
     armed = state.get("crash_armed")
@@ -1297,22 +1361,20 @@ def _do_recovery_release(
 ) -> int:
     """Record ``--saved-at``, release the issue and finalize (spec section 8.3).
 
-    An unknown Attempt is ``not_found``. The recorded verdict is never
-    recomputed: an active Attempt finalizes with its recorded outcome (or
-    ``handoff`` when none was recorded) and a finished Attempt keeps its
-    outcome while its lifecycle moves to ``released``. No automatic requeue.
+    Only a Retained Attempt is released: it finalizes with its recorded
+    verdict and the lifecycle ``released``. An active or an already
+    finalized Attempt is ``rejected`` and nothing is stored, and an unknown
+    Attempt is ``not_found``. No automatic requeue.
     """
     attempt_id = str(arguments["attempt_id"])
     saved_at = str(arguments["saved_at"])
     where = _find_attempt(state, attempt_id)
     if where is None:
-        text, exit_code = shared.render_error(
-            "not_found",
-            f"no attempt {attempt_id!r} is recorded",
-            request_id=request_id,
-        )
-        sys.stdout.write(text)
-        return exit_code
+        return _recovery_not_found(request_id, attempt_id)
+    if where == "active":
+        return _reject_recovery(request_id, attempt_id, "is active; its work is not retained")
+    if where == "finished":
+        return _reject_recovery(request_id, attempt_id, "is already finalized")
     record = _commit(
         state,
         request_id,
@@ -1321,30 +1383,8 @@ def _do_recovery_release(
         "completed",
         f"work for {attempt_id} secured at {saved_at}; issue released",
     )
-    if where == "active":
-        _finalize_active(state, lifecycle_state="released", outcome_native=None)
-    else:
-        attempts = state.get("attempts")
-        assert isinstance(attempts, dict)
-        summary = attempts.get(attempt_id)
-        assert isinstance(summary, dict)
-        now = _utc_now()
-        summary["lifecycle_state"] = "released"
-        if state.get("last_finished") == summary or (
-            isinstance(state.get("last_finished"), dict)
-            and state["last_finished"].get("attempt_id") == attempt_id
-        ):
-            state["last_finished"] = summary
-        _append_event(
-            state,
-            {
-                "at": now,
-                "level": "info",
-                "event": "attempt_released",
-                "attempt_id": attempt_id,
-                "text": f"released {attempt_id}"[:300],
-            },
-        )
+    _finalize_active(state, lifecycle_state="released", outcome_native=None)
+    _clear_retained(state)
     _save_state(state, path)
     armed = state.get("crash_armed")
     if isinstance(armed, dict) and armed.get("point") == "between-commit-and-reply":
@@ -1493,7 +1533,7 @@ def _active_summary(state: dict[str, Any]) -> dict[str, Any] | None:
     active = state.get("active_attempt")
     if not isinstance(active, dict):
         return None
-    return _attempt_summary_for(
+    summary = _attempt_summary_for(
         str(active.get("attempt_id", "")),
         int(active.get("issue_number", 1)),
         active.get("issue_title") if isinstance(active.get("issue_title"), str) else None,
@@ -1505,6 +1545,9 @@ def _active_summary(state: dict[str, Any]) -> dict[str, Any] | None:
         False,
         None,
     )
+    if active.get("retained") is True:
+        summary["attention_required"] = True
+    return summary
 
 
 def _do_attempts_list(state: dict[str, Any], arguments: dict[str, Any]) -> int:

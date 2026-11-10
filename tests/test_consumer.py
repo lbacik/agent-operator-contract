@@ -227,6 +227,7 @@ def test_identity_human_output(consumer_env: dict[str, Any]) -> None:
 STATUS_FIXTURES = [
     "status-starting",
     "status-recovering",
+    "status-recovering-retained",
     "status-idle",
     "status-active",
     "status-draining",
@@ -1723,7 +1724,9 @@ def test_new_operation_fixture_classifications_cover_success_rejection_and_not_f
     assert index["handoff-rejected"]["classification"] == "rejection"
     assert index["recovery-retry-completed"]["classification"] == "success"
     assert index["recovery-retry-not-found"]["classification"] == "not_found"
+    assert index["recovery-retry-rejected"]["classification"] == "rejection"
     assert index["recovery-release-completed"]["classification"] == "success"
     assert index["recovery-release-not-found"]["classification"] == "not_found"
+    assert index["recovery-release-rejected"]["classification"] == "rejection"
     assert index["errors-reset-completed"]["classification"] == "success"
     assert index["errors-reset-rejected"]["classification"] == "rejection"

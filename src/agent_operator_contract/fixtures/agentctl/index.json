@@ -95,6 +95,10 @@
       "classification": "not_found",
       "note": "Exit 5, not_found: unknown attempt ID for recovery release."
     },
+    "recovery-release-rejected": {
+      "classification": "rejection",
+      "note": "Exit 1, rejected: the Attempt is active, nothing stored."
+    },
     "recovery-retry-completed": {
       "classification": "success",
       "note": "Exit 0, ok:true with replayed:false: safe finalization retried from retained evidence."
@@ -102,6 +106,10 @@
     "recovery-retry-not-found": {
       "classification": "not_found",
       "note": "Exit 5, not_found: unknown attempt ID for recovery retry."
+    },
+    "recovery-retry-rejected": {
+      "classification": "rejection",
+      "note": "Exit 1, rejected: the Attempt is active, nothing stored."
     },
     "rejected": {
       "classification": "rejection",
@@ -134,6 +142,10 @@
     "status-recovering": {
       "classification": "success",
       "note": "Exit 0, ok:true with a recovering status snapshot while finalization finishes."
+    },
+    "status-recovering-retained": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with a recovering instance holding a Retained Attempt as current_attempt."
     },
     "status-simple-coding-agent": {
       "classification": "success",

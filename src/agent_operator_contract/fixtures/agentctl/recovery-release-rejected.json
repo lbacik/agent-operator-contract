@@ -1,0 +1,18 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "recovery",
+    "release",
+    "stub-1",
+    "--saved-at",
+    "shelf-204",
+    "--request-id",
+    "req-03b2c3d4e5f6",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 1,
+  "stderr": "",
+  "stdout": "{\"contract\":\"1.0\",\"error\":{\"code\":\"rejected\",\"message\":\"attempt 'stub-1' is active; its work is not retained\",\"request_id\":\"req-03b2c3d4e5f6\",\"retryable\":false},\"ok\":false}\n"
+}

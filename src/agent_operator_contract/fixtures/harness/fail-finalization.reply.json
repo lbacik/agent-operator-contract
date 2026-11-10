@@ -1,0 +1,8 @@
+{
+  "harness": "1.1",
+  "verb": "fail-finalization",
+  "ok": true,
+  "result": {
+    "armed": true
+  }
+}

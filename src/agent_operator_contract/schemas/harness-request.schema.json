@@ -22,7 +22,8 @@
         "start-container",
         "halt",
         "grow-archive",
-        "defer-publication"
+        "defer-publication",
+        "fail-finalization"
       ],
       "description": "The harness verb, repeated from argv for dispatch and record-keeping."
     },
@@ -247,6 +248,10 @@
     },
     {
       "if": {"properties": {"verb": {"const": "defer-publication"}}, "required": ["verb"]},
+      "then": {"properties": {"params": {"type": "object", "additionalProperties": false}}}
+    },
+    {
+      "if": {"properties": {"verb": {"const": "fail-finalization"}}, "required": ["verb"]},
       "then": {"properties": {"params": {"type": "object", "additionalProperties": false}}}
     }
   ]

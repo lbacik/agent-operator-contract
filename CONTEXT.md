@@ -78,6 +78,10 @@ _Avoid_: log line
 One engine-native try at resolving one issue, identified by its native Attempt ID. Consumers treat the ID as opaque and qualify it with instance, backend and repository.
 _Avoid_: run, job
 
+**Retained Attempt**:
+An Attempt whose model work has ended but whose finalization was interrupted or not fulfilled, kept with its work until an operator decides with recovery retry or recovery release. It is neither active nor finalized.
+_Avoid_: held attempt, stuck attempt, orphan
+
 **Attempt Archive**:
 The set of redacted artifacts a Managed Instance exposes for one Attempt, described by a manifest.
 _Avoid_: logs, run directory

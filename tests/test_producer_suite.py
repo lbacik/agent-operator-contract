@@ -164,6 +164,10 @@ class _FakeProducer:
         self.pending_handoff: dict[str, Any] | None = None
         self.recovery_handoff_ack = "not_fulfilled"
         self.error_guard = False
+        self.fail_finalization = False
+        self.accept_active_recovery = False
+        self.release_finalized_accepted = False
+        self.retry_finalized_changes = False
         self.latency: dict[str, float] = {}
         self.engine_lock = threading.Lock()
         self.prepared: dict[str, Any] | None = None
@@ -251,7 +255,7 @@ class _FakeProducer:
             "lifecycle_state": "open" if finished_at is None else lifecycle,
             "outcome": outcome,
             "delivery": None,
-            "attention_required": False,
+            "attention_required": bool(active.get("retained")),
             "sealed": finished_at is not None,
             "sealed_at": finished_at,
         }
@@ -273,10 +277,10 @@ class _FakeProducer:
         return summary
 
     def _find_attempt(self, attempt_id: str) -> str | None:
-        """Return where an attempt lives: ``"active"``, ``"finished"`` or None."""
+        """Return where an attempt lives: retained, active, finished or None."""
         active = self.active_attempt
         if isinstance(active, dict) and active.get("attempt_id") == attempt_id:
-            return "active"
+            return "retained" if active.get("retained") else "active"
         if any(summary["attempt_id"] == attempt_id for summary in self.finished_attempts):
             return "finished"
         return None
@@ -465,24 +469,27 @@ class _FakeProducer:
             else:
                 record = self._record(request_id, operation, "completed", payload)
                 self._finish_active("finished", "handoff")
-        elif operation == "recovery_retry":
-            attempt_id = str(payload["attempt_id"])
-            if self._find_attempt(attempt_id) is None:
-                return producer_suite.DockerResult(
-                    5, _fail_with_request("not_found", request_id), ""
-                )
-            record = self._record(request_id, operation, "completed", payload)
-        elif operation == "recovery_release":
+        elif operation in ("recovery_retry", "recovery_release"):
             attempt_id = str(payload["attempt_id"])
             where = self._find_attempt(attempt_id)
             if where is None:
                 return producer_suite.DockerResult(
                     5, _fail_with_request("not_found", request_id), ""
                 )
+            if where == "active" and not self.accept_active_recovery:
+                return producer_suite.DockerResult(
+                    1, _fail_with_request("rejected", request_id), ""
+                )
+            release = operation == "recovery_release"
+            if where == "finished" and release and not self.release_finalized_accepted:
+                return producer_suite.DockerResult(
+                    1, _fail_with_request("rejected", request_id), ""
+                )
             record = self._record(request_id, operation, "completed", payload)
-            if where == "active":
-                self._finish_active("released", None)
-            else:
+            if where in ("retained", "active"):
+                self._finish_active("released" if release else "finished", None)
+                self.recovery_pending = False
+            elif release or self.retry_finalized_changes:
                 for summary in self.finished_attempts:
                     if summary["attempt_id"] == attempt_id:
                         summary["lifecycle_state"] = "released"
@@ -1313,11 +1320,22 @@ def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) ->
             producer.alive = True
             producer.startup = True
             return producer_suite.HarnessResult("ok", {"running": True}, "")
+        if verb == "fail-finalization":
+            producer.fail_finalization = True
+            return producer_suite.HarnessResult("ok", {"armed": True}, "")
         if verb == "release":
             hold, producer.hold = producer.hold, None
             if producer.startup:
                 producer.startup = False
                 return producer_suite.HarnessResult("ok", {"released": True}, "")
+            retained = producer.active_attempt
+            if (
+                producer.recovery_pending
+                and isinstance(retained, dict)
+                and retained.get("retained")
+            ):
+                # An operator decides a Retained Attempt: a release never clears it.
+                return producer_suite.HarnessResult("ok", {"released": False}, "")
             if producer.recovery_pending:
                 producer.recovery_pending = False
                 producer.resolve_interrupted_handoffs()
@@ -1373,6 +1391,19 @@ def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) ->
             active["outcome_reason"] = params.get("reason")
             if params["native_outcome"] == "infrastructure_error":
                 producer.error_guard = True
+            if producer.fail_finalization:
+                # The verdict is recorded, then finalization fails at its boundary.
+                producer.fail_finalization = False
+                active["retained"] = True
+                producer.recovery_pending = True
+                return producer_suite.HarnessResult(
+                    "ok",
+                    {
+                        "attempt_id": active["attempt_id"],
+                        "native_outcome": params["native_outcome"],
+                    },
+                    "",
+                )
             if isinstance(producer.hold, dict) and producer.hold.get("point") == "after-outcome":
                 attempt_id = str(active["attempt_id"])
                 producer.snapshots[attempt_id] = producer._fresh_manifest(attempt_id)
@@ -2359,7 +2390,7 @@ def test_settle_fails_when_the_instance_stays_unreachable_after_restart(
     assert "agent_unreachable" in outcome.detail
 
 
-def test_recovery_retry_passes_and_keeps_the_verdict(
+def test_recovery_retry_passes_on_a_retained_attempt_and_keeps_the_verdict(
     full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _support_claims(monkeypatch, full_fakes)
@@ -2395,7 +2426,7 @@ def test_recovery_retry_is_not_found_for_an_unknown_attempt(
     assert json.loads(answered.stdout)["error"]["code"] == "not_found"
 
 
-def test_recovery_release_passes_for_active_and_finished_attempts(
+def test_recovery_release_passes_on_a_retained_attempt_and_rejects_the_others(
     full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _support_claims(monkeypatch, full_fakes)
@@ -2466,3 +2497,257 @@ def test_errors_reset_is_rejected_when_the_guard_is_clear(
 
     assert answered.exit_code == 1
     assert json.loads(answered.stdout)["error"]["code"] == "rejected"
+
+
+_RECOVERY_SCENARIOS = [
+    pytest.param(producer_suite.scenario_recovery_retry, id="recovery-retry"),
+    pytest.param(producer_suite.scenario_recovery_release, id="recovery-release"),
+]
+
+
+@pytest.mark.parametrize("scenario", _RECOVERY_SCENARIOS)
+def test_recovery_scenarios_leave_a_clean_instance(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch, scenario: Any
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+
+    outcome = scenario(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert not full_fakes.recovery_pending
+    assert full_fakes.eligible == set()
+
+
+@pytest.mark.parametrize("scenario", _RECOVERY_SCENARIOS)
+def test_recovery_scenarios_fail_when_an_active_attempt_is_recovered(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch, scenario: Any
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    full_fakes.accept_active_recovery = True
+
+    outcome = scenario(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "rejected" in outcome.detail
+
+
+@pytest.mark.parametrize("scenario", _RECOVERY_SCENARIOS)
+def test_recovery_scenarios_fail_when_a_retained_attempt_is_last_finished(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch, scenario: Any
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    real_handle = full_fakes.handle
+
+    def retained_as_last_finished(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        answered = real_handle(docker, container, exec_user, argv, timeout)
+        active = full_fakes.active_attempt
+        if argv == list(producer_suite.STATUS_ARGV) and active and active.get("retained"):
+            doc = json.loads(answered.stdout)
+            doc["result"]["last_finished"] = full_fakes._summary_doc(active, None)
+            return producer_suite.DockerResult(0, json.dumps(doc) + "\n", "")
+        return answered
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", retained_as_last_finished)
+
+    outcome = scenario(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "last_finished" in outcome.detail
+
+
+def test_recovery_release_fails_when_a_finalized_attempt_is_released(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    full_fakes.release_finalized_accepted = True
+
+    outcome = producer_suite.scenario_recovery_release(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "rejected" in outcome.detail
+
+
+def test_recovery_retry_fails_when_a_finalized_attempt_is_changed(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    full_fakes.retry_finalized_changes = True
+
+    outcome = producer_suite.scenario_recovery_retry(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "change nothing" in outcome.detail
+
+
+@pytest.mark.parametrize("scenario", _RECOVERY_SCENARIOS)
+def test_recovery_scenarios_are_not_run_without_fail_finalization(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch, scenario: Any
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    inner = producer_suite._call_harness
+
+    def cannot_fail_finalization(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        if verb == "fail-finalization":
+            return producer_suite.HarnessResult("unsupported", None, "verb:fail-finalization")
+        return inner(cmd, verb, params, timeout)
+
+    monkeypatch.setattr(producer_suite, "_call_harness", cannot_fail_finalization)
+
+    outcome = scenario(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "not_run"
+    assert "fail-finalization" in outcome.detail
+
+
+def _leave_a_retained_attempt(producer: _FakeProducer) -> str:
+    """Leave what a failed recovery scenario leaves: a Retained Attempt, no operator."""
+    producer.eligible.add(298)
+    producer._status_reply()
+    producer.eligible.discard(298)
+    active = producer.active_attempt
+    assert active is not None
+    active["outcome_native"] = "complete"
+    active["retained"] = True
+    producer.recovery_pending = True
+    return str(active["attempt_id"])
+
+
+@pytest.mark.parametrize("capability", ["recovery-release", "recovery-retry"])
+@pytest.mark.parametrize("crashed", [False, True])
+def test_settle_clears_a_retained_attempt_so_the_next_scenario_passes(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch, capability: str, crashed: bool
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    ctx = dataclasses.replace(
+        FULL_CTX,
+        capabilities=[
+            name
+            for name in FULL_CTX.capabilities
+            if not name.startswith("recovery-") or name == capability
+        ],
+    )
+    producer = _FakeProducer(ctx)
+    monkeypatch.setattr(producer_suite, "_docker_exec", producer.handle)
+    _support_claims(monkeypatch, producer)
+    retained_id = _leave_a_retained_attempt(producer)
+    producer.alive = not crashed
+
+    outcome = producer_suite.scenario_handoff(ctx, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert not producer.recovery_pending
+    kinds = [entry["record"]["kind"] for entry in producer.commands.values()]
+    assert kinds[0] == capability.replace("-", "_")
+    first = next(iter(producer.commands.values()))["record"]
+    assert first["arguments"]["attempt_id"] == retained_id
+    if capability == "recovery-release":
+        assert first["arguments"]["saved_at"] == "suite-settle"
+
+
+def test_settle_fails_naming_the_retained_attempt_without_a_recovery_capability(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx = dataclasses.replace(
+        FULL_CTX,
+        capabilities=[n for n in FULL_CTX.capabilities if not n.startswith("recovery-")],
+    )
+    producer = _FakeProducer(ctx)
+    monkeypatch.setattr(producer_suite, "_docker_exec", producer.handle)
+    _support_claims(monkeypatch, producer)
+    retained_id = _leave_a_retained_attempt(producer)
+
+    outcome = producer_suite.scenario_handoff(ctx, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert f"Retained Attempt {retained_id}" in outcome.detail
+    assert "recovery-release" in outcome.detail
+
+
+def test_settle_waits_for_accepted_recovery_before_checking_the_retained_attempt(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    retained_id = _leave_a_retained_attempt(full_fakes)
+    real_handle = full_fakes.handle
+    recovery_id: str | None = None
+    reads = 0
+
+    def delayed_recovery(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        nonlocal recovery_id, reads
+        if argv[2:4] == ["recovery", "release"]:
+            recovery_id = argv[argv.index("--request-id") + 1]
+            record = full_fakes._record(
+                recovery_id,
+                "recovery_release",
+                "accepted",
+                {"attempt_id": retained_id, "saved_at": "suite-settle"},
+            )
+            return producer_suite.DockerResult(0, _ok({"command": record, "replayed": False}), "")
+        if recovery_id is not None and argv[2:] == ["command", recovery_id]:
+            reads += 1
+            if reads == 2:
+                full_fakes._finish_active("released", None)
+                full_fakes.recovery_pending = False
+                full_fakes.commands[recovery_id]["record"]["acknowledgement"] = "completed"
+        return real_handle(docker, container, exec_user, argv, timeout)
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", delayed_recovery)
+
+    outcome = producer_suite.scenario_handoff(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert reads == 2
+
+
+def test_settle_fails_when_the_recovery_command_does_not_clear_the_attempt(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    retained_id = _leave_a_retained_attempt(full_fakes)
+    real_handle = full_fakes.handle
+
+    def release_that_keeps_it(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        if argv[2:4] == ["recovery", "release"]:
+            request_id = argv[argv.index("--request-id") + 1]
+            record = full_fakes._record(
+                request_id,
+                "recovery_release",
+                "completed",
+                {"attempt_id": argv[4], "saved_at": argv[6]},
+            )
+            return producer_suite.DockerResult(0, _ok({"command": record, "replayed": False}), "")
+        return real_handle(docker, container, exec_user, argv, timeout)
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", release_that_keeps_it)
+
+    outcome = producer_suite.scenario_handoff(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert f"Retained Attempt {retained_id}" in outcome.detail
+    assert "still the current_attempt" in outcome.detail
+
+
+def test_settle_leaves_a_recovering_instance_without_a_retained_attempt_alone(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pending recovery the engine finishes by itself is not an operator decision."""
+    _support_claims(monkeypatch, full_fakes)
+    full_fakes.eligible.add(297)
+    full_fakes._status_reply()
+    full_fakes.eligible.discard(297)
+    full_fakes.recovery_pending = True
+
+    outcome = producer_suite.scenario_handoff(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert not any(
+        entry["record"]["kind"].startswith("recovery_") for entry in full_fakes.commands.values()
+    )
