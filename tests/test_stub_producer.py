@@ -2218,28 +2218,7 @@ def test_stub_handoff_unsupported_without_capability(tmp_path: Path) -> None:
     assert json.loads(completed.stdout)["error"]["code"] == "unsupported"
 
 
-def test_stub_recovery_retry_completes_without_touching_the_attempt(tmp_path: Path) -> None:
-    env = _full_env(tmp_path)
-    _set_issue(env, 304, True)
-    claimed = _status(env)
-    assert isinstance(claimed["current_attempt"], dict)
-    attempt_id: str = claimed["current_attempt"]["attempt_id"]
-
-    completed = _recovery_retry(attempt_id, "req-000000000106", env)
-
-    assert completed.returncode == 0
-    record = json.loads(completed.stdout)["result"]["command"]
-    assert record["kind"] == "recovery_retry"
-    assert record["acknowledgement"] == "completed"
-    assert record["arguments"] == {"attempt_id": attempt_id}
-
-    snapshot = _status(env)
-    assert isinstance(snapshot["current_attempt"], dict)
-    assert snapshot["current_attempt"]["attempt_id"] == attempt_id
-    assert snapshot["last_finished"] is None
-
-
-def test_stub_recovery_retry_keeps_the_recorded_verdict(tmp_path: Path) -> None:
+def test_stub_recovery_retry_of_a_finalized_attempt_is_a_no_op(tmp_path: Path) -> None:
     env = _full_env(tmp_path)
     _set_issue(env, 305, True)
     assert isinstance(_status(env)["current_attempt"], dict)
@@ -2274,49 +2253,6 @@ def test_stub_recovery_retry_unsupported_without_capability(tmp_path: Path) -> N
     assert json.loads(completed.stdout)["error"]["code"] == "unsupported"
 
 
-def test_stub_recovery_release_active_finalizes_released(tmp_path: Path) -> None:
-    env = _full_env(tmp_path)
-    _set_issue(env, 306, True)
-    claimed = _status(env)
-    assert isinstance(claimed["current_attempt"], dict)
-    attempt_id: str = claimed["current_attempt"]["attempt_id"]
-    _set_issue(env, 306, False)
-
-    completed = _recovery_release(attempt_id, "shelf-306", "req-000000000111", env)
-
-    assert completed.returncode == 0
-    record = json.loads(completed.stdout)["result"]["command"]
-    assert record["kind"] == "recovery_release"
-    assert record["acknowledgement"] == "completed"
-    assert record["arguments"] == {"attempt_id": attempt_id, "saved_at": "shelf-306"}
-
-    snapshot = _status(env)
-    assert snapshot["current_attempt"] is None
-    finished = snapshot["last_finished"]
-    assert isinstance(finished, dict)
-    assert finished["attempt_id"] == attempt_id
-    assert finished["lifecycle_state"] == "released"
-    assert finished["sealed"] is True
-
-
-def test_stub_recovery_release_finished_keeps_the_verdict(tmp_path: Path) -> None:
-    env = _full_env(tmp_path)
-    _set_issue(env, 307, True)
-    assert isinstance(_status(env)["current_attempt"], dict)
-    assert _handoff("req-000000000112", env).returncode == 0
-    finished_id: str = _status(env)["last_finished"]["attempt_id"]  # type: ignore[index]
-
-    completed = _recovery_release(finished_id, "shelf-307", "req-000000000113", env)
-
-    assert completed.returncode == 0
-    snapshot = _status(env)
-    finished = snapshot["last_finished"]
-    assert isinstance(finished, dict)
-    assert finished["attempt_id"] == finished_id
-    assert finished["lifecycle_state"] == "released"
-    assert finished["outcome"]["native"] == "handoff"
-
-
 def test_stub_recovery_release_unknown_attempt_is_not_found(tmp_path: Path) -> None:
     env = _full_env(tmp_path)
 
@@ -2333,6 +2269,198 @@ def test_stub_recovery_release_unsupported_without_capability(tmp_path: Path) ->
 
     assert completed.returncode == 3
     assert json.loads(completed.stdout)["error"]["code"] == "unsupported"
+
+
+def _retain_an_attempt(
+    tmp_path: Path, issue: int, native_outcome: str = "complete"
+) -> tuple[dict[str, str], dict[str, str], str]:
+    """Open a claim and fail its finalization: it becomes a Retained Attempt."""
+    agentctl_env, harness_env = _stub_stack(tmp_path)
+    agentctl_env["CONTRACT_CAPABILITIES"] = FULL_OPERATOR_CAPABILITIES
+    attempt_id = _stub_claim(agentctl_env, harness_env, issue)
+    _harness_verb(harness_env, "set-issue", {"issue": issue, "eligible": False})
+    assert _harness_verb(harness_env, "fail-finalization", {}) == {"armed": True}
+    _harness_verb(harness_env, "finish-attempt", {"native_outcome": native_outcome})
+    return agentctl_env, harness_env, attempt_id
+
+
+def test_stub_fail_finalization_leaves_a_retained_attempt(tmp_path: Path) -> None:
+    agentctl_env, harness_env, attempt_id = _retain_an_attempt(tmp_path, 308)
+
+    snapshot = _status(agentctl_env)
+    assert documents.validate_status(snapshot) == []
+    assert snapshot["instance"]["state"] == "recovering"  # type: ignore[index]
+    assert snapshot["current_attempt"]["attempt_id"] == attempt_id  # type: ignore[index]
+    assert snapshot["last_finished"] is None
+    shown = _show_attempt(agentctl_env, attempt_id)["attempt"]
+    assert shown["attention_required"] is True
+    assert shown["sealed"] is False
+    # The one-shot is spent: the next Attempt finalizes normally.
+    _harness_verb(harness_env, "set-issue", {"issue": 309, "eligible": True})
+    assert _status(agentctl_env)["current_attempt"]["attempt_id"] == attempt_id  # type: ignore[index]
+
+
+def test_stub_harness_release_does_not_clear_a_retained_attempt(tmp_path: Path) -> None:
+    agentctl_env, harness_env, attempt_id = _retain_an_attempt(tmp_path, 310)
+
+    released = _harness_verb(harness_env, "release", {})
+
+    assert released == {"released": False}
+    snapshot = _status(agentctl_env)
+    assert snapshot["instance"]["state"] == "recovering"  # type: ignore[index]
+    assert snapshot["current_attempt"]["attempt_id"] == attempt_id  # type: ignore[index]
+
+
+def test_stub_handoff_cannot_finalize_a_retained_attempt(tmp_path: Path) -> None:
+    agentctl_env, _, attempt_id = _retain_an_attempt(tmp_path, 316)
+
+    refused = _handoff("req-000000000125", agentctl_env)
+
+    assert refused.returncode == 1
+    assert json.loads(refused.stdout)["error"]["code"] == "rejected"
+    assert _command("req-000000000125", agentctl_env).returncode == 5
+    assert _status(agentctl_env)["current_attempt"]["attempt_id"] == attempt_id  # type: ignore[index]
+
+
+def test_stub_fail_finalization_applies_to_handoff_and_is_one_shot(tmp_path: Path) -> None:
+    agentctl_env, harness_env = _stub_stack(tmp_path)
+    agentctl_env["CONTRACT_CAPABILITIES"] = FULL_OPERATOR_CAPABILITIES
+    attempt_id = _stub_claim(agentctl_env, harness_env, 317)
+    _harness_verb(harness_env, "set-issue", {"issue": 317, "eligible": False})
+    _harness_verb(harness_env, "fail-finalization", {})
+
+    interrupted = _handoff("req-000000000126", agentctl_env)
+
+    assert interrupted.returncode == 0
+    assert json.loads(interrupted.stdout)["result"]["command"]["acknowledgement"] == "not_fulfilled"
+    snapshot = _status(agentctl_env)
+    assert snapshot["instance"]["state"] == "recovering"  # type: ignore[index]
+    assert snapshot["current_attempt"]["attempt_id"] == attempt_id  # type: ignore[index]
+    assert snapshot["last_finished"] is None
+    assert _recovery_retry(attempt_id, "req-000000000127", agentctl_env).returncode == 0
+    assert _status(agentctl_env)["last_finished"]["outcome"]["native"] == "handoff"  # type: ignore[index]
+    next_id = _stub_claim(agentctl_env, harness_env, 318)
+    _harness_verb(harness_env, "set-issue", {"issue": 318, "eligible": False})
+    _harness_verb(harness_env, "finish-attempt", {"native_outcome": "complete"})
+    assert _status(agentctl_env)["last_finished"]["attempt_id"] == next_id  # type: ignore[index]
+
+
+def test_stub_fail_finalization_applies_after_an_outcome_hold(tmp_path: Path) -> None:
+    agentctl_env, harness_env = _stub_stack(tmp_path)
+    attempt_id = _stub_claim(agentctl_env, harness_env, 319)
+    _harness_verb(harness_env, "set-issue", {"issue": 319, "eligible": False})
+    _harness_verb(harness_env, "hold", {"point": "after-outcome"})
+    _harness_verb(harness_env, "fail-finalization", {})
+    _harness_verb(harness_env, "finish-attempt", {"native_outcome": "complete"})
+
+    _harness_verb(harness_env, "release", {})
+
+    snapshot = _status(agentctl_env)
+    assert snapshot["instance"]["state"] == "recovering"  # type: ignore[index]
+    assert snapshot["current_attempt"]["attempt_id"] == attempt_id  # type: ignore[index]
+    assert snapshot["last_finished"] is None
+    summary = _show_attempt(agentctl_env, attempt_id)["attempt"]
+    assert summary["attention_required"] is True
+    assert summary["sealed"] is False
+
+
+def test_stub_retained_attempt_survives_a_restart_and_blocks_claims(tmp_path: Path) -> None:
+    agentctl_env, harness_env, attempt_id = _retain_an_attempt(tmp_path, 311)
+    _harness_verb(harness_env, "set-issue", {"issue": 312, "eligible": True})
+
+    _patch_state(agentctl_env, "doc['startup_hold'] = False")
+    snapshot = _status(agentctl_env)
+
+    assert snapshot["instance"]["state"] == "recovering"  # type: ignore[index]
+    assert snapshot["current_attempt"]["attempt_id"] == attempt_id  # type: ignore[index]
+
+
+def test_stub_recovery_release_finalizes_a_retained_attempt_as_released(tmp_path: Path) -> None:
+    agentctl_env, _, attempt_id = _retain_an_attempt(tmp_path, 313)
+
+    completed = _recovery_release(attempt_id, "shelf-313", "req-000000000120", agentctl_env)
+
+    assert completed.returncode == 0, completed.stdout
+    record = json.loads(completed.stdout)["result"]["command"]
+    assert record["kind"] == "recovery_release"
+    assert record["acknowledgement"] == "completed"
+    assert record["arguments"] == {"attempt_id": attempt_id, "saved_at": "shelf-313"}
+    snapshot = _status(agentctl_env)
+    assert snapshot["current_attempt"] is None
+    assert snapshot["instance"]["state"] == "idle"  # type: ignore[index]
+    finished = snapshot["last_finished"]
+    assert isinstance(finished, dict)
+    assert finished["attempt_id"] == attempt_id
+    assert finished["lifecycle_state"] == "released"
+    assert finished["sealed"] is True
+    assert finished["outcome"]["native"] == "complete"
+    again = _recovery_release(attempt_id, "shelf-313", "req-000000000121", agentctl_env)
+    assert again.returncode == 1
+    assert json.loads(again.stdout)["error"]["code"] == "rejected"
+    assert _command("req-000000000121", agentctl_env).returncode == 5
+
+
+def test_stub_recovery_retry_finalizes_a_retained_attempt_and_is_then_a_no_op(
+    tmp_path: Path,
+) -> None:
+    agentctl_env, _, attempt_id = _retain_an_attempt(tmp_path, 314)
+
+    completed = _recovery_retry(attempt_id, "req-000000000122", agentctl_env)
+
+    assert completed.returncode == 0, completed.stdout
+    record = json.loads(completed.stdout)["result"]["command"]
+    assert record["kind"] == "recovery_retry"
+    assert record["acknowledgement"] == "completed"
+    snapshot = _status(agentctl_env)
+    assert snapshot["current_attempt"] is None
+    finished = snapshot["last_finished"]
+    assert isinstance(finished, dict)
+    assert finished["attempt_id"] == attempt_id
+    assert finished["lifecycle_state"] == "finished"
+    assert finished["sealed"] is True
+    assert finished["outcome"]["native"] == "complete"
+    again = _recovery_retry(attempt_id, "req-000000000123", agentctl_env)
+    assert again.returncode == 0
+    assert json.loads(again.stdout)["result"]["command"]["acknowledgement"] == "completed"
+    assert _status(agentctl_env)["last_finished"] == finished
+
+
+@pytest.mark.parametrize("operation", ["retry", "release"])
+def test_stub_recovery_of_an_active_attempt_is_rejected_and_stores_nothing(
+    tmp_path: Path, operation: str
+) -> None:
+    env = _full_env(tmp_path)
+    _set_issue(env, 315, True)
+    claimed = _status(env)
+    assert isinstance(claimed["current_attempt"], dict)
+    attempt_id: str = claimed["current_attempt"]["attempt_id"]
+    _set_issue(env, 315, False)
+
+    if operation == "retry":
+        refused = _recovery_retry(attempt_id, "req-000000000124", env)
+    else:
+        refused = _recovery_release(attempt_id, "shelf-315", "req-000000000124", env)
+
+    assert refused.returncode == 1
+    assert json.loads(refused.stdout)["error"]["code"] == "rejected"
+    assert _command("req-000000000124", env).returncode == 5
+    assert _status(env)["current_attempt"]["attempt_id"] == attempt_id  # type: ignore[index]
+
+
+def test_stub_recovery_release_of_a_finalized_attempt_is_rejected(tmp_path: Path) -> None:
+    env = _full_env(tmp_path)
+    _set_issue(env, 307, True)
+    assert isinstance(_status(env)["current_attempt"], dict)
+    assert _handoff("req-000000000112", env).returncode == 0
+    finished = _status(env)["last_finished"]
+    assert isinstance(finished, dict)
+
+    refused = _recovery_release(finished["attempt_id"], "shelf-307", "req-000000000113", env)
+
+    assert refused.returncode == 1
+    assert json.loads(refused.stdout)["error"]["code"] == "rejected"
+    assert _command("req-000000000113", env).returncode == 5
+    assert _status(env)["last_finished"] == finished
 
 
 def test_stub_errors_reset_rejects_when_guard_is_clear(tmp_path: Path) -> None:

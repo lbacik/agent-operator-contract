@@ -30,6 +30,7 @@ def _idle_snapshot() -> dict[str, Any]:
     [
         "status-starting",
         "status-recovering",
+        "status-recovering-retained",
         "status-idle",
         "status-active",
         "status-draining",
@@ -49,6 +50,7 @@ def test_strict_parses_every_positive_snapshot(name: str) -> None:
     [
         "status-starting",
         "status-recovering",
+        "status-recovering-retained",
         "status-idle",
         "status-active",
         "status-draining",

@@ -13,7 +13,7 @@ from typing import Any
 from agent_operator_contract import documents
 
 
-def test_harness_verbs_are_the_fourteen_spec_verbs() -> None:
+def test_harness_verbs_are_the_fifteen_spec_verbs() -> None:
     assert documents.HARNESS_VERBS == (
         "setup",
         "teardown",
@@ -29,6 +29,7 @@ def test_harness_verbs_are_the_fourteen_spec_verbs() -> None:
         "halt",
         "grow-archive",
         "defer-publication",
+        "fail-finalization",
     )
 
 
@@ -56,8 +57,8 @@ def test_harness_error_codes_match_the_spec_table() -> None:
     assert documents.HARNESS_EXIT_CODES == {"usage": 2, "unsupported": 3, "failed": 1}
 
 
-def test_harness_version_is_1_0() -> None:
-    assert documents.HARNESS_VERSION == "1.0"
+def test_harness_version_is_1_1() -> None:
+    assert documents.HARNESS_VERSION == "1.1"
 
 
 def _request(verb: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -65,14 +66,14 @@ def _request(verb: str, params: dict[str, Any]) -> dict[str, Any]:
 
 
 def _reply(verb: str, result: dict[str, Any]) -> dict[str, Any]:
-    return {"harness": "1.0", "verb": verb, "ok": True, "result": result}
+    return {"harness": "1.1", "verb": verb, "ok": True, "result": result}
 
 
 def _error_reply(verb: str, code: str, details: dict[str, Any] | None = None) -> dict[str, Any]:
     error: dict[str, Any] = {"code": code, "message": "nope"}
     if details is not None:
         error["details"] = details
-    return {"harness": "1.0", "verb": verb, "ok": False, "error": error}
+    return {"harness": "1.1", "verb": verb, "ok": False, "error": error}
 
 
 def test_every_verb_has_a_request_example() -> None:
@@ -190,17 +191,17 @@ def test_finish_attempt_requires_a_named_outcome() -> None:
 def test_validate_reply_rejects_shape_mistakes() -> None:
     assert documents.validate_harness_reply(None) != []
     assert documents.validate_harness_reply({}) != []
-    assert documents.validate_harness_reply({"harness": "1.0"}) != []
+    assert documents.validate_harness_reply({"harness": "1.1"}) != []
     assert documents.validate_harness_reply(_reply("setup", {})) != []
     assert documents.validate_harness_reply(_error_reply("hold", "unsupported")) != []
-    unknown = {"harness": "1.0", "verb": "hold", "ok": False, "error": {"code": "teapot"}}
+    unknown = {"harness": "1.1", "verb": "hold", "ok": False, "error": {"code": "teapot"}}
     assert documents.validate_harness_reply(unknown) != []
     bad_version = {"harness": "1", "verb": "hold", "ok": True, "result": {}}
     assert documents.validate_harness_reply(bad_version) != []
 
 
 def test_validate_reply_accepts_replies_without_a_verb_echo() -> None:
-    doc: dict[str, Any] = {"harness": "1.0", "ok": True, "result": {}}
+    doc: dict[str, Any] = {"harness": "1.1", "ok": True, "result": {}}
     assert documents.validate_harness_reply(doc) == []
 
 
@@ -238,3 +239,17 @@ def test_hold_reply_allows_a_null_attempt_id() -> None:
     assert documents.validate_harness_reply(_reply("hold", engaged)) == []
     missing = {"point": "before-claim"}
     assert documents.validate_harness_reply(_reply("hold", missing)) != []
+
+
+def test_fail_finalization_is_a_parameterless_one_shot() -> None:
+    assert documents.validate_harness_request(_request("fail-finalization", {})) == []
+    assert documents.validate_harness_request(_request("fail-finalization", {"now": True})) != []
+    assert documents.validate_harness_reply(_reply("fail-finalization", {"armed": True})) == []
+    assert documents.validate_harness_reply(_reply("fail-finalization", {"armed": False})) != []
+    assert documents.validate_harness_reply(_reply("fail-finalization", {})) != []
+
+
+def test_a_one_zero_harness_reply_is_still_accepted() -> None:
+    """A minor never invalidates an older reply: the suite reads 1.0 harnesses too."""
+    reply = {"harness": "1.0", "verb": "release", "ok": True, "result": {"released": True}}
+    assert documents.validate_harness_reply(reply) == []

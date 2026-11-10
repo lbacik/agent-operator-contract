@@ -22,13 +22,13 @@ One version line: the tag `vX.Y.Z` is the contract version and `X` is the contra
 The package is standard library only (`dependencies = []`), so pinning it costs nothing at runtime. Python 3.11 or newer.
 
 ```text
-uv add "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.1"
+uv add "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.2"
 ```
 
 or, with pip:
 
 ```text
-pip install "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.1"
+pip install "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.2"
 ```
 
 Schemas, fixtures and the error table ship as package data, so everything below works from the installed package.
@@ -58,7 +58,7 @@ else:
 `agentfleet` is the host-side client: `ls`, `identity`, `status`, every mutation, `command` and `attempts list|show|export`, online or as an Offline Read of a stopped instance.
 
 ```text
-uv tool install "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.1"
+uv tool install "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.2"
 agentfleet --version
 agentfleet ls
 agentfleet status web-1
@@ -71,7 +71,7 @@ agentfleet status web-1
 An engine supplies a Conformance Harness (spec §15.1) and runs the suite from the pinned tag against its own image:
 
 ```yaml
-- run: uv add --dev "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.1"
+- run: uv add --dev "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.2"
 - run: |
     uv run python -m agent_operator_contract.producer_suite \
       --harness ./conformance/harness \

@@ -709,7 +709,7 @@ def test_manifest_path_forbids_a_dotdot_segment_not_a_dotdot_substring() -> None
 
 def test_usage_reply_may_echo_an_unknown_verb() -> None:
     reply = {
-        "harness": "1.0",
+        "harness": "1.1",
         "verb": "fly",
         "ok": False,
         "error": {"code": "usage", "message": "unknown verb 'fly'"},
@@ -762,7 +762,7 @@ def test_export_manifest_contract_pattern_matches_library() -> None:
 
 def test_only_a_usage_reply_may_echo_an_unknown_verb() -> None:
     failed = {
-        "harness": "1.0",
+        "harness": "1.1",
         "verb": "fly",
         "ok": False,
         "error": {"code": "failed", "message": "no instance"},

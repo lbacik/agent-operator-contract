@@ -1,6 +1,6 @@
 # Operator contract, major version 1
 
-**Status:** final for `v1.0.0`. The tag `v1.0.0` carries this text together with the JSON Schemas, fixtures, conformance suite, shared library and `agentfleet` (adoption step 1 in [the adoption plan](./adoption-plan.md)). From `v1.0.0` on, the [JSON Schemas](../src/agent_operator_contract/schemas/) are normative for document shape and this prose is normative for semantics; where they would disagree on shape, the schema wins and the disagreement is a defect to fix in a patch release.
+**Status:** final for `v1.0.0`; clarified in `v1.0.2`. The tag `v1.0.0` carries this text together with the JSON Schemas, fixtures, conformance suite, shared library and `agentfleet` (adoption step 1 in [the adoption plan](./adoption-plan.md)). From `v1.0.0` on, the [JSON Schemas](../src/agent_operator_contract/schemas/) are normative for document shape and this prose is normative for semantics; where they would disagree on shape, the schema wins and the disagreement is a defect to fix in a patch release.
 
 **Provenance.** Agreed with the owner in [What versioned operator contract and adoption plan should all four repositories implement?](https://github.com/lbacik/coding-agent/issues/192), building on [What common operator capabilities define an Agent Forge-compatible agent?](https://github.com/lbacik/coding-agent/issues/190#issuecomment-6680989084) (the capability surface) and [Where should the shared agent interface live, and what should it own?](https://github.com/lbacik/coding-agent/issues/191#issuecomment-6681592096) (the repository allocation). Source facts were read at simple-coding-agent `38aaee1`, coding-agent `9a13c34`, agent-forge `04d6eff` and agent-dashboard `b1e5ff4`.
 
@@ -233,12 +233,14 @@ truncated             bool
 | State | Meaning |
 | --- | --- |
 | `starting` | Startup checks running; `startup_check` names the current one. |
-| `recovering` | Finishing recorded effects of earlier Attempts. |
+| `recovering` | Finishing recorded effects of earlier Attempts, or holding a Retained Attempt for an operator decision. |
 | `idle` | Intake open, no active Attempt. |
 | `active` | Intake open, an Attempt is active. |
 | `draining` | Intake closed, an Attempt is still active. |
 | `paused` | Intake closed, no active Attempt. |
 | `stopped` | Offline only: the process is not running. |
+
+A Retained Attempt is the `current_attempt`, and its AttemptSummary (`attempts list`, `attempts show`) has `attention_required: true` and `sealed: false`.
 
 `Halt` is `{ "reason": string, "detail": string, "at": timestamp }` with a non-empty `reason`, recorded durably by the engine before it exits and reported on the next start and offline.
 
@@ -361,10 +363,11 @@ Supersession: a newer `stop`, `stop --after` or `resume` supersedes a pending on
 - **`resume`** only reopens closed Intake and supersedes a pending stop or stop plan. It never starts a process and never resumes interrupted work. Starting a stopped container is a deployment action, not a command.
 - **`stop --after N`** counts fully finalized Attempts that have a Terminal Outcome, the active one first. A Claim released before confirmation does not count. The counter is durable. The command is `completed` when Intake closes.
 - **`next issue N`** is a one-shot priority among already eligible issues. Eligibility is checked at commit (`rejected` if the issue is plainly ineligible) and again at the Claim boundary. It never bypasses selection labels, assignees, blockers or delivery guards and never reopens Intake. Ineligible at Claim: `not_fulfilled`, and normal selection proceeds.
-- **`handoff now`** is `completed` only when publication, issue release and cleanup have finished durably; otherwise `not_fulfilled` and the work is retained.
+- **`handoff now`** is `completed` only when publication, issue release and cleanup have finished durably; otherwise `not_fulfilled`, and the partial work is kept, as a Retained Attempt or in the finalized Attempt.
+- **Recovery family.** `recovery retry` and `recovery release` act only on a Retained Attempt. On an active Attempt both answer `rejected` and store nothing. On a finalized Attempt, `recovery release` answers `rejected` and `recovery retry` is a no-op `completed` that changes nothing. An unknown Attempt ID is `not_found` for both. No Claim opens while a Retained Attempt exists.
 - **`recovery retry`** retries safe finalization from retained evidence only. It never reruns the model or recomputes a recorded verdict.
 - **`recovery release`** records `--saved-at`, releases the issue and finalizes. No automatic requeue.
-- **`errors reset`** resets the durable infrastructure-error guard of a live process.
+- **`errors reset`** resets the durable infrastructure-error guard of a live process. It answers `rejected` while the guard is clear.
 
 ### 8.4 Ambiguous outcomes
 
@@ -482,6 +485,7 @@ Each row is a conformance scenario (§15).
 | Export of an unsealed archive while a file grows | The torn read is detected by `sha256` mismatch. |
 | Halt (process exit by engine decision) | `halted` event recorded; Offline Read and the next start report `last_halt`. |
 | Offline Read while the container is running | Consumer refuses; producer answers `rejected` / `instance_running` if reached. |
+| Finalization fails at its boundary | The Attempt becomes a Retained Attempt in `current_attempt`; `instance.state` is `recovering`; no Claim opens until `recovery retry` or `recovery release`; neither changes the recorded verdict. |
 | Publication effect pending at restart | Recovery finishes it before new Claims; `instance.state` is `recovering` meanwhile; no command changes a recorded verdict. |
 
 ## 15. Conformance
@@ -503,23 +507,23 @@ Each engine supplies a **Conformance Harness**: an executable that runs on the h
 <harness> <verb> '<request-json>'
 ```
 
-- `<verb>` is one of the fourteen verbs below.
+- `<verb>` is one of the fifteen verbs below.
 - `<request-json>` is an object `{"verb": "<verb>", "params": {...}}`: the verb repeated from argv plus the verb's parameters. The argv verb and the document verb MUST agree; a mismatch is a usage error.
 - Every invocation writes exactly one JSON document followed by a newline to stdout, also for usage errors. stderr is free-form diagnostics and MUST NOT be parsed.
 - Exit codes mirror the contract's classes: `0` for `ok:true`, `1` for `failed`, `2` for `usage`, `3` for `unsupported`.
 
 ```json
-{"harness": "1.0", "verb": "hold", "ok": true,
+{"harness": "1.1", "verb": "hold", "ok": true,
  "result": {"point": "before-claim", "attempt_id": null}}
 ```
 
 ```json
-{"harness": "1.0", "verb": "hold", "ok": false,
+{"harness": "1.1", "verb": "hold", "ok": false,
  "error": {"code": "unsupported", "message": "this engine cannot pause after the outcome is recorded",
            "details": {"what": "hold-point", "name": "after-outcome"}}}
 ```
 
-- `harness` is the harness protocol's `major.minor`, currently `1.0`. A minor adds verbs or optional parameters; it never removes or retypes a field, never changes a meaning, and never makes an optional parameter required.
+- `harness` is the harness protocol's `major.minor`, currently `1.1`. A minor adds verbs or optional parameters; it never removes or retypes a field, never changes a meaning, and never makes an optional parameter required.
 - `verb` echoes the invoked verb. It is absent only when the invocation named no verb; a `usage` reply to an unknown verb echoes it as given.
 - The request and reply shapes below are described in prose; [`harness-request.schema.json`](../src/agent_operator_contract/schemas/harness-request.schema.json) and [`harness-reply.schema.json`](../src/agent_operator_contract/schemas/harness-reply.schema.json) are their normative machine-readable form. The examples under [`fixtures/harness/`](../src/agent_operator_contract/fixtures/harness/) and the negatives under [`fixtures/negative/`](../src/agent_operator_contract/fixtures/negative/) (`harness-request-*`, `harness-reply-*`) are checked against both the schemas and the shared library in CI, like the other documents.
 - Requests are strict and replies are lenient: a harness MUST reject unknown parameters with `usage`, so suite typos fail loudly, while the suite MUST ignore unknown `result` and `details` keys, so a minor can add fields.
@@ -554,6 +558,7 @@ The harness manages one current instance: `setup` fails with `failed` while one 
 | `halt` | `{reason, detail?}` | `{reason}` |
 | `grow-archive` | `{attempt_id?, append_bytes}` (`attempt_id` may be `null`) | `{path, appended_bytes}` |
 | `defer-publication` | `{}` | `{armed: true}` |
+| `fail-finalization` | `{}` | `{armed: true}` |
 
 - **`setup`** creates a fresh state volume and starts the instance from the engine's image with its fakes: no active Attempt, Intake open. It reports the six discovery facts: the container (name or ID), the image ID (as used for Offline Read), every volume as `{name, path}` with the in-container mount path, the exec user (never `root`), the Target Repository, and the advertised Operator Capabilities. `capabilities` asks the harness to enable that subset when the engine can toggle capabilities; an engine-fixed set is reported as-is. A request the harness cannot honour answers `unsupported` with `details.what: "capability"`. `config` carries opaque engine knobs; only `native.*` keys are allowed.
 - **`set-issue`** marks the fake issue `issue` (an integer `>= 1`) eligible or ineligible for selection. `title` is display text.
@@ -584,6 +589,7 @@ The harness manages one current instance: `setup` fails with `failed` while one 
 - **`halt`** arranges an engine Halt with the given `reason` (`detail` is optional human text). The engine records the halted event and `last_halt` and exits by decision (§14).
 - **`grow-archive`** appends `append_bytes` to one file of the unsealed archive: the active Attempt's, or the named `attempt_id`'s when given. The reply names the grown `path` and the `appended_bytes`. The suite exports the archive and expects the torn read of §14: content that no longer matches its manifest `sha256`.
 - **`defer-publication`** arms a one-shot: the next finishing Attempt leaves its publication effect pending across the restart. Recovery finishes it before new Claims open; `instance.state` is `recovering` meanwhile, and no command changes a recorded verdict (§14). An engine whose publication is always synchronous answers `unsupported` with `details.what: "verb"`.
+- **`fail-finalization`** arms a one-shot: the next finishing Attempt fails at its finalization boundary (publication, issue release or cleanup) after its verdict is recorded and becomes a Retained Attempt (§14). It remains the `current_attempt` with `instance.state: "recovering"`; no Claim opens until an operator decides with `recovery retry` or `recovery release`. Neither command changes its recorded verdict. An engine that cannot fail its finalization answers `unsupported` with `details.what: "verb"`.
 
 ## 16. Backend mapping notes (informative)
 
