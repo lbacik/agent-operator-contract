@@ -770,6 +770,11 @@ def _do_stop_container(
     if params:
         return _error(verb, "usage", "harness 'stop-container' takes no parameters")
     container = str(instance["container"])
+    # The stub has no engine process to receive Docker's SIGTERM. Record the
+    # same interruption as terminate before stopping its container.
+    interrupted, code = _do_terminate(verb, {}, instance)
+    if code != 0:
+        return interrupted, code
     try:
         stopped = _run_docker(["stop", container])
     except (OSError, subprocess.TimeoutExpired) as exc:

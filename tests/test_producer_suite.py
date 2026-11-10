@@ -2058,9 +2058,10 @@ def _serve_export_offline(producer: _FakeProducer, argv: list[str]) -> _FakeExpo
 def _support_offline(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) -> None:
     """Harness plus ``docker run`` fakes for the two offline scenarios.
 
-    The claims lifecycle comes from ``_support_claims``; ``stop-container`` and
-    ``start-container`` answer ok, ``hold-lock`` really holds the fake engine
-    lock, and Offline Reads dispatch to the fake without touching a volume.
+    The claims lifecycle comes from ``_support_claims``; stopping interrupts
+    the active Attempt, restart needs startup then recovery releases,
+    ``hold-lock`` really holds the fake engine lock, and Offline Reads
+    dispatch to the fake without touching a volume.
     """
     _support_claims(monkeypatch, producer)
     inner = producer_suite._call_harness
@@ -2072,9 +2073,15 @@ def _support_offline(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) -
             with producer.engine_lock:
                 time.sleep(params["duration_ms"] / 1000.0)
             return producer_suite.HarnessResult("ok", {"held_ms": params["duration_ms"]}, "")
-        if verb in ("stop-container", "start-container"):
-            return producer_suite.HarnessResult("ok", {verb: True}, "")
-        return inner(cmd, verb, params, timeout)
+        if verb == "stop-container" and producer.active_attempt is not None:
+            producer.recovery_pending = True
+        result = inner(cmd, verb, params, timeout)
+        if verb == "release" and not producer.recovery_pending and producer.active_attempt is None:
+            for entry in producer.commands.values():
+                record = entry["record"]
+                if record["kind"] == "stop" and record["acknowledgement"] == "accepted":
+                    record["acknowledgement"] = "completed"
+        return result
 
     monkeypatch.setattr(producer_suite, "_call_harness", harness)
 
@@ -2105,6 +2112,32 @@ def test_offline_reads_passes_with_a_stopped_container(
     assert fakes.eligible == set()
 
 
+def test_offline_reads_waits_for_startup_and_recovery_before_resume(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_offline(monkeypatch, fakes)
+    real_handle = fakes.handle
+
+    def reject_resume_during_recovery(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        if argv[2:3] == ["resume"] and (fakes.startup or fakes.recovery_pending):
+            request_id = argv[argv.index("--request-id") + 1]
+            return producer_suite.DockerResult(1, _fail_with_request("rejected", request_id), "")
+        return real_handle(docker, container, exec_user, argv, timeout)
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", reject_resume_during_recovery)
+
+    outcome = producer_suite.scenario_offline_reads(CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert not fakes.startup
+    assert not fakes.recovery_pending
+    assert fakes.active_attempt is None
+    assert fakes.finished_attempts[0]["outcome"]["native"] == "infrastructure_error"
+    assert fakes.intake == "open"
+
+
 def test_offline_reads_is_not_run_without_an_image(
     fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -2119,6 +2152,55 @@ def test_offline_reads_is_not_run_without_an_image(
     outcome = producer_suite.scenario_offline_reads(ctx, ["fake-harness"])
 
     assert outcome.status == "not_run"
+
+
+@pytest.mark.parametrize(
+    ("defect", "detail"),
+    [
+        ("unfinished", "finalized with a recorded outcome"),
+        ("no-outcome", "finalized with a recorded outcome"),
+        ("stop-pending", "stop must complete"),
+        ("intake-open", "intake must stay closed"),
+        ("resume-not-fulfilled", "resume must complete"),
+        ("resume-keeps-intake-closed", "resume must reopen intake"),
+    ],
+)
+def test_offline_reads_checks_recovery_and_resume(
+    fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch, defect: str, detail: str
+) -> None:
+    _support_offline(monkeypatch, fakes)
+    real_handle = fakes.handle
+
+    def broken_recovery(
+        docker: str, container: str, exec_user: str, argv: list[str], timeout: float
+    ) -> producer_suite.DockerResult:
+        answered = real_handle(docker, container, exec_user, argv, timeout)
+        if not fakes.finished_attempts or answered.exit_code != 0:
+            return answered
+        doc = json.loads(answered.stdout)
+        result = doc["result"]
+        if argv[2:4] == ["attempts", "show"]:
+            if defect == "unfinished":
+                result["attempt"]["finished_at"] = None
+            elif defect == "no-outcome":
+                result["attempt"]["outcome"] = None
+        elif argv[2:3] == ["command"] and defect == "stop-pending":
+            result["command"]["acknowledgement"] = "accepted"
+        elif argv[2:3] == ["resume"] and defect == "resume-not-fulfilled":
+            result["command"]["acknowledgement"] = "not_fulfilled"
+        elif argv == list(producer_suite.STATUS_ARGV):
+            if defect == "intake-open":
+                result["intake"]["state"] = "open"
+            elif defect == "resume-keeps-intake-closed":
+                result["intake"]["state"] = "closed"
+        return producer_suite.DockerResult(0, shared.render_document(doc), "")
+
+    monkeypatch.setattr(producer_suite, "_docker_exec", broken_recovery)
+
+    outcome = producer_suite.scenario_offline_reads(CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert detail in outcome.detail
 
 
 def test_offline_while_running_passes_with_a_held_lock(

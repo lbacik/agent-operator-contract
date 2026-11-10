@@ -3309,7 +3309,8 @@ def scenario_offline_reads(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
     The container is stopped, then every read of section 6 (``identity``,
     ``status``, ``command``, ``attempts list|show|export``) is served offline
     from the volume with ``instance.state`` stopped; mutations offline answer
-    ``unsupported`` and store nothing.
+    ``unsupported`` and store nothing. Restart recovers the interrupted
+    Attempt and completes the stop before ``resume`` reopens Intake.
     """
     scenario_id = "offline-reads"
     if not ctx.image:
@@ -3426,10 +3427,7 @@ def scenario_offline_reads(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
         if restart_outcome is not None:
             return restart_outcome
         return unsupported
-    _, outcome = _harness(ctx, harness_cmd, scenario_id, "start-container", {})
-    if outcome is not None:
-        return outcome
-    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
+    outcome = _restart_after_crash(ctx, harness_cmd, scenario_id)
     if outcome is not None:
         return outcome
     for offline_id in offline_ids:
@@ -3439,26 +3437,45 @@ def scenario_offline_reads(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
         nothing = _check_error(stored_check.stdout, stored_check.exit_code, "not_found")
         if nothing:
             return ScenarioOutcome(scenario_id, "failed", f"offline mutation stored {offline_id}")
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status after recovery")
+    if snapshot["current_attempt"] is not None:
+        return ScenarioOutcome(scenario_id, "failed", "the interrupted attempt must finish")
+    if snapshot["intake"]["state"] != "closed":
+        return ScenarioOutcome(scenario_id, "failed", "intake must stay closed after recovery")
+    summary, outcome = _attempt_summary(ctx, scenario_id, attempt_id)
+    if outcome is not None or summary is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "the recovered attempt is missing")
+    if summary.get("finished_at") is None or summary.get("outcome") is None:
+        return ScenarioOutcome(
+            scenario_id, "failed", "the recovered attempt must be finalized with a recorded outcome"
+        )
     stored, outcome = _read_command(ctx, scenario_id, stop_id)
     if outcome is not None or stored is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "stop record is missing")
-    resume_id = _new_request_id()
-    _, outcome = _submit(ctx, scenario_id, "resume", resume_id)
-    if outcome is not None:
-        return outcome
-    _, outcome = _harness(
-        ctx, harness_cmd, scenario_id, "finish-attempt", {"native_outcome": "complete"}
-    )
-    if outcome is not None:
-        return outcome
+    if stored.get("acknowledgement") != "completed":
+        return ScenarioOutcome(scenario_id, "failed", "stop must complete after recovery")
     _, outcome = _harness(
         ctx, harness_cmd, scenario_id, "set-issue", {"issue": 115, "eligible": False}
     )
     if outcome is not None:
         return outcome
-    settled = _settle(ctx, harness_cmd, scenario_id)
-    if settled is not None:
-        return settled
+    resume_id = _new_request_id()
+    record, outcome = _submit(ctx, scenario_id, "resume", resume_id)
+    if outcome is not None or record is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "resume committed nothing")
+    if record.get("acknowledgement") == "accepted":
+        record, outcome = _await_final(ctx, scenario_id, resume_id)
+        if outcome is not None or record is None:
+            return outcome or ScenarioOutcome(scenario_id, "failed", "resume record is missing")
+    if record.get("acknowledgement") != "completed":
+        return ScenarioOutcome(scenario_id, "failed", "resume must complete after recovery")
+    snapshot, outcome = _snapshot(ctx, scenario_id)
+    if outcome is not None or snapshot is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "no status after resume")
+    if snapshot["intake"]["state"] != "open":
+        return ScenarioOutcome(scenario_id, "failed", "resume must reopen intake after recovery")
     return ScenarioOutcome(scenario_id, "passed")
 
 

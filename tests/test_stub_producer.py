@@ -2364,6 +2364,33 @@ def test_stub_fail_finalization_applies_after_an_outcome_hold(tmp_path: Path) ->
     assert summary["sealed"] is False
 
 
+@pytest.mark.parametrize("verb", ["terminate", "stop-container"])
+def test_stub_stopping_an_active_attempt_requires_recovery(tmp_path: Path, verb: str) -> None:
+    agentctl_env, harness_env = _stub_stack(tmp_path)
+    attempt_id = _stub_claim(agentctl_env, harness_env, 320)
+    stopped = _stop("example-owner/example-repo", "req-000000000130", agentctl_env)
+    assert json.loads(stopped.stdout)["result"]["command"]["acknowledgement"] == "accepted"
+
+    _harness_verb(harness_env, verb, {})
+    _harness_verb(harness_env, "start-container", {})
+    assert _status(agentctl_env)["instance"]["state"] == "starting"  # type: ignore[index]
+    _harness_verb(harness_env, "release", {})
+    recovering = _status(agentctl_env)
+    assert recovering["instance"]["state"] == "recovering"  # type: ignore[index]
+    assert recovering["current_attempt"]["attempt_id"] == attempt_id  # type: ignore[index]
+
+    _harness_verb(harness_env, "release", {})
+    recovered = _status(agentctl_env)
+    assert recovered["current_attempt"] is None
+    assert recovered["intake"]["state"] == "closed"  # type: ignore[index]
+    summary = _show_attempt(agentctl_env, attempt_id)["attempt"]
+    assert summary["lifecycle_state"] == "finished"
+    assert summary["outcome"]["native"] == "infrastructure_error"
+    assert summary["finished_at"] is not None
+    command = json.loads(_command("req-000000000130", agentctl_env).stdout)["result"]["command"]
+    assert command["acknowledgement"] == "completed"
+
+
 def test_stub_retained_attempt_survives_a_restart_and_blocks_claims(tmp_path: Path) -> None:
     agentctl_env, harness_env, attempt_id = _retain_an_attempt(tmp_path, 311)
     _harness_verb(harness_env, "set-issue", {"issue": 312, "eligible": True})

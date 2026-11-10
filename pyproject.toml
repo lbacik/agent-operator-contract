@@ -1,6 +1,6 @@
 [project]
 name = "agent-operator-contract"
-version = "1.0.2"
+version = "1.0.3"
 description = "Operator contract between coding-agent engines and their consumers: spec, fixtures, conformance suite, shared library and the agentfleet client."
 readme = "README.md"
 authors = [{ name = "Łukasz Bacik" }]
