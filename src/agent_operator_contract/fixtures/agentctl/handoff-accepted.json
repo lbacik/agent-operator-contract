@@ -1,0 +1,15 @@
+{
+  "argv": [
+    "--contract",
+    "1",
+    "handoff",
+    "now",
+    "--request-id",
+    "req-b7c8d9e0f1a2",
+    "--expect-repo",
+    "example-owner/example-repo"
+  ],
+  "exit_code": 0,
+  "stderr": "",
+  "stdout": "{\"contract\":\"1.0\",\"ok\":true,\"result\":{\"command\":{\"acknowledgement\":\"accepted\",\"arguments\":{},\"created_at\":\"2026-11-06T09:12:03Z\",\"detail\":\"handoff accepted; finalizing the active attempt\",\"kind\":\"handoff\",\"repository\":\"example-owner/example-repo\",\"request_id\":\"req-b7c8d9e0f1a2\",\"sequence\":1,\"updated_at\":\"2026-11-06T09:12:03Z\"},\"replayed\":false}}\n"
+}

@@ -73,6 +73,14 @@ LOCK_SETTLE_S = 1.0
 RESTART_RELEASES = 3
 """Harness ``release`` calls a restart may need: the startup hold, then recovery."""
 
+POLL_INTERVAL_S = 0.5
+"""How often a scenario re-reads ``command`` or ``status`` while it waits.
+
+The wait itself is bounded by the suite's ``--timeout``."""
+
+STATUS_ARGV = ("--contract", "1", "status")
+"""The online ``status`` read the settle and poll helpers send."""
+
 
 @dataclass(frozen=True)
 class HarnessResult:
@@ -2164,9 +2172,21 @@ def _snapshot(
     ctx: SuiteContext, scenario_id: str
 ) -> tuple[dict[str, Any] | None, ScenarioOutcome | None]:
     """Read and validate one online ``status`` snapshot."""
-    answered = _exec(scenario_id, ["--contract", "1", "status"], ctx)
+    answered = _exec(scenario_id, list(STATUS_ARGV), ctx)
     if isinstance(answered, ScenarioOutcome):
         return None, answered
+    return _parse_snapshot(ctx, scenario_id, answered)
+
+
+def _is_unreachable(answered: DockerResult) -> bool:
+    """Whether a reply is a valid ``agent_unreachable`` error (the engine is down)."""
+    return not _check_error(answered.stdout, answered.exit_code, "agent_unreachable")
+
+
+def _parse_snapshot(
+    ctx: SuiteContext, scenario_id: str, answered: DockerResult
+) -> tuple[dict[str, Any] | None, ScenarioOutcome | None]:
+    """Validate one online ``status`` reply and return its snapshot."""
     problems = _check_status(answered.stdout, answered.exit_code, ctx)
     if problems:
         return None, ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
@@ -2244,13 +2264,26 @@ def _settle(
     """Settle to intake open with no active Attempt and no holds or recovery.
 
     Each harness-driven scenario starts here so scenarios stay independent of
-    the order they run in. An unsupported harness verb becomes not-run.
+    the order they run in. An unsupported harness verb becomes not-run. When
+    ``status`` answers ``agent_unreachable`` (an earlier scenario left a
+    one-shot crash armed, and settling fired it), the instance is restarted
+    once; an instance still unreachable after that fails the scenario.
     """
     _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
     if outcome is not None:
         return outcome
-    for _ in range(6):
-        snapshot, outcome = _snapshot(ctx, scenario_id)
+    restarted = False
+    for _ in range(7):  # six settle passes, plus one when a restart is needed
+        answered = _exec(scenario_id, list(STATUS_ARGV), ctx)
+        if isinstance(answered, ScenarioOutcome):
+            return answered
+        if not restarted and _is_unreachable(answered):
+            restarted = True
+            outcome = _restart_after_crash(ctx, harness_cmd, scenario_id)
+            if outcome is not None:
+                return outcome
+            continue
+        snapshot, outcome = _parse_snapshot(ctx, scenario_id, answered)
         if outcome is not None or snapshot is None:
             return outcome
         state = snapshot["instance"]["state"]
@@ -3532,8 +3565,103 @@ def _expect_rejection(
     return None
 
 
+def _handoff_argv(ctx: SuiteContext, request_id: str) -> list[str]:
+    """The ``handoff now`` argv for one request ID against the instance under test."""
+    return [
+        "--contract",
+        "1",
+        "handoff",
+        "now",
+        "--request-id",
+        request_id,
+        "--expect-repo",
+        ctx.repository,
+    ]
+
+
+def _check_handoff_record(
+    scenario_id: str, record: dict[str, Any], label: str, allowed: tuple[str, ...]
+) -> ScenarioOutcome | None:
+    """A ``handoff`` record with empty arguments and an allowed acknowledgement."""
+    if record.get("kind") != "handoff":
+        return ScenarioOutcome(
+            scenario_id, "failed", f"{label} kind must be handoff, got {record.get('kind')!r}"
+        )
+    if record.get("arguments") != {}:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"{label} arguments must be empty, got {record.get('arguments')!r}",
+        )
+    acknowledgement = record.get("acknowledgement")
+    if acknowledgement not in allowed:
+        return ScenarioOutcome(
+            scenario_id,
+            "failed",
+            f"{label} must be {' or '.join(allowed)}, got {acknowledgement!r}",
+        )
+    return None
+
+
+def _await_final(
+    ctx: SuiteContext, scenario_id: str, request_id: str
+) -> tuple[dict[str, Any] | None, ScenarioOutcome | None]:
+    """Poll ``command`` until the record leaves ``accepted`` (spec 8.1), bounded.
+
+    A mutation's reply means committed, not done: the final acknowledgement is
+    read from the stored record. Times out after the suite's ``--timeout``,
+    naming the last acknowledgement seen.
+    """
+    deadline = time.monotonic() + ctx.timeout
+    while True:
+        record, outcome = _read_command(ctx, scenario_id, request_id)
+        if outcome is not None or record is None:
+            return None, outcome or ScenarioOutcome(scenario_id, "failed", "the record is missing")
+        acknowledgement = record.get("acknowledgement")
+        if acknowledgement != "accepted":
+            return record, None
+        if time.monotonic() >= deadline:
+            return None, ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"{request_id} reached no final acknowledgement within {ctx.timeout:g}s;"
+                f" last seen {acknowledgement!r}",
+            )
+        time.sleep(POLL_INTERVAL_S)
+
+
+def _await_unreachable(ctx: SuiteContext, scenario_id: str) -> ScenarioOutcome | None:
+    """Poll ``status`` until it answers ``agent_unreachable``, bounded by ``--timeout``.
+
+    Proves an armed crash fired. Every reply before that must still be a valid
+    snapshot.
+    """
+    deadline = time.monotonic() + ctx.timeout
+    while True:
+        answered = _exec(scenario_id, list(STATUS_ARGV), ctx)
+        if isinstance(answered, ScenarioOutcome):
+            return answered
+        if _is_unreachable(answered):
+            return None
+        _, outcome = _parse_snapshot(ctx, scenario_id, answered)
+        if outcome is not None:
+            return outcome
+        if time.monotonic() >= deadline:
+            return ScenarioOutcome(
+                scenario_id,
+                "failed",
+                f"the armed crash did not fire: status still answers after {ctx.timeout:g}s",
+            )
+        time.sleep(POLL_INTERVAL_S)
+
+
 def scenario_handoff(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
-    """``handoff now`` completes the active Attempt and seals it as handoff."""
+    """``handoff now`` completes the active Attempt and seals it as handoff.
+
+    The reply commits the handoff (``accepted`` or already ``completed``); the
+    suite then polls ``command`` until the final acknowledgement, which must be
+    ``completed``.
+    """
     scenario_id = "handoff"
     gated = _require_capability(ctx, scenario_id, "operator-handoff")
     if gated is not None:
@@ -3581,55 +3709,28 @@ def scenario_handoff(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioO
     if outcome is not None:
         return outcome
     request_id = _new_request_id()
-    record, outcome = _submit_operation(
-        ctx,
-        scenario_id,
-        [
-            "--contract",
-            "1",
-            "handoff",
-            "now",
-            "--request-id",
-            request_id,
-            "--expect-repo",
-            ctx.repository,
-        ],
-    )
-    if outcome is not None or record is None:
+    reply, outcome = _submit_operation(ctx, scenario_id, _handoff_argv(ctx, request_id))
+    if outcome is not None or reply is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "handoff committed nothing")
-    if record.get("kind") != "handoff" or record.get("acknowledgement") != "completed":
-        return ScenarioOutcome(
-            scenario_id,
-            "failed",
-            f"handoff must complete at once, got {record.get('acknowledgement')!r}",
-        )
-    if record.get("arguments") != {}:
-        return ScenarioOutcome(
-            scenario_id,
-            "failed",
-            f"handoff arguments must be empty, got {record.get('arguments')!r}",
-        )
-    replayed = _exec(
-        scenario_id,
-        [
-            "--contract",
-            "1",
-            "handoff",
-            "now",
-            "--request-id",
-            request_id,
-            "--expect-repo",
-            ctx.repository,
-        ],
-        ctx,
+    wrong = _check_handoff_record(
+        scenario_id, reply, "the handoff reply", ("accepted", "completed")
     )
+    if wrong is not None:
+        return wrong
+    record, outcome = _await_final(ctx, scenario_id, request_id)
+    if outcome is not None or record is None:
+        return outcome or ScenarioOutcome(scenario_id, "failed", "handoff record is missing")
+    wrong = _check_handoff_record(scenario_id, record, "the final handoff", ("completed",))
+    if wrong is not None:
+        return wrong
+    replayed = _exec(scenario_id, _handoff_argv(ctx, request_id), ctx)
     if isinstance(replayed, ScenarioOutcome):
         return replayed
     problems = _check_mutation(replayed.stdout, replayed.exit_code, replayed=True)
     if problems:
         return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
     if json.loads(replayed.stdout)["result"]["command"] != record:
-        return ScenarioOutcome(scenario_id, "failed", "the replay changed the stored record")
+        return ScenarioOutcome(scenario_id, "failed", "the replay is not the stored record")
     snapshot, outcome = _snapshot(ctx, scenario_id)
     if outcome is not None or snapshot is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "no status after handoff")
@@ -3660,7 +3761,14 @@ def scenario_handoff(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioO
 
 
 def scenario_handoff_crash(ctx: SuiteContext, harness_cmd: Sequence[str]) -> ScenarioOutcome:
-    """``handoff now`` in progress, crash: ``not_fulfilled``, partial work retained."""
+    """``handoff now`` in progress, crash: ``not_fulfilled``, partial work retained.
+
+    The reply is the commit (``accepted`` or ``not_fulfilled``) or, when the
+    engine dies before replying, an ambiguous ``agent_unreachable``. The suite
+    waits for ``status`` to answer ``agent_unreachable``, restarts the
+    instance, and checks that the record is never ``completed`` and ends
+    ``not_fulfilled`` once recovery finalizes the interrupted Attempt.
+    """
     scenario_id = "handoff-crash"
     gated = _require_capability(ctx, scenario_id, "operator-handoff")
     if gated is not None:
@@ -3687,28 +3795,26 @@ def scenario_handoff_crash(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
     if outcome is not None:
         return outcome
     request_id = _new_request_id()
-    record, outcome = _submit_operation(
-        ctx,
-        scenario_id,
-        [
-            "--contract",
-            "1",
-            "handoff",
-            "now",
-            "--request-id",
-            request_id,
-            "--expect-repo",
-            ctx.repository,
-        ],
-    )
-    if outcome is not None or record is None:
-        return outcome or ScenarioOutcome(scenario_id, "failed", "handoff committed nothing")
-    if record.get("kind") != "handoff" or record.get("acknowledgement") != "not_fulfilled":
-        return ScenarioOutcome(
+    answered = _exec(scenario_id, _handoff_argv(ctx, request_id), ctx)
+    if isinstance(answered, ScenarioOutcome):
+        return answered
+    # An agent_unreachable reply is ambiguous (spec 8.4): the request ID is
+    # resolved below with ``command``. Anything else must be the commit.
+    if not _is_unreachable(answered):
+        problems = _check_mutation(answered.stdout, answered.exit_code, replayed=False)
+        if problems:
+            return ScenarioOutcome(scenario_id, "failed", "; ".join(problems))
+        wrong = _check_handoff_record(
             scenario_id,
-            "failed",
-            f"an interrupted handoff must be not_fulfilled, got {record.get('acknowledgement')!r}",
+            json.loads(answered.stdout)["result"]["command"],
+            "an interrupted handoff reply",
+            ("accepted", "not_fulfilled"),
         )
+        if wrong is not None:
+            return wrong
+    outcome = _await_unreachable(ctx, scenario_id)
+    if outcome is not None:
+        return outcome
     _, outcome = _harness(ctx, harness_cmd, scenario_id, "stop-container", {})
     if outcome is not None:
         return outcome
@@ -3727,12 +3833,14 @@ def scenario_handoff_crash(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
     stored, outcome = _read_command(ctx, scenario_id, request_id)
     if outcome is not None or stored is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "handoff record is missing")
-    if stored.get("acknowledgement") != "not_fulfilled":
-        return ScenarioOutcome(
-            scenario_id,
-            "failed",
-            f"handoff must stay not_fulfilled, got {stored.get('acknowledgement')!r}",
-        )
+    wrong = _check_handoff_record(
+        scenario_id,
+        stored,
+        "an interrupted handoff before recovery",
+        ("accepted", "not_fulfilled"),
+    )
+    if wrong is not None:
+        return wrong
     _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
     if outcome is not None:
         return outcome
@@ -3767,12 +3875,11 @@ def scenario_handoff_crash(ctx: SuiteContext, harness_cmd: Sequence[str]) -> Sce
     stored, outcome = _read_command(ctx, scenario_id, request_id)
     if outcome is not None or stored is None:
         return outcome or ScenarioOutcome(scenario_id, "failed", "handoff record is missing")
-    if stored.get("acknowledgement") != "not_fulfilled":
-        return ScenarioOutcome(
-            scenario_id,
-            "failed",
-            f"recovery must not complete the handoff, got {stored.get('acknowledgement')!r}",
-        )
+    wrong = _check_handoff_record(
+        scenario_id, stored, "an interrupted handoff after recovery", ("not_fulfilled",)
+    )
+    if wrong is not None:
+        return wrong
     return ScenarioOutcome(scenario_id, "passed")
 
 

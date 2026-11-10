@@ -159,6 +159,10 @@ class _FakeProducer:
         self.startup = False
         self.recovery_pending = False
         self.crash_finalize = False
+        self.crash_before_reply = False
+        self.handoff_finish_after: int | None = None
+        self.pending_handoff: dict[str, Any] | None = None
+        self.recovery_handoff_ack = "not_fulfilled"
         self.error_guard = False
         self.latency: dict[str, float] = {}
         self.engine_lock = threading.Lock()
@@ -446,9 +450,18 @@ class _FakeProducer:
                 )
             if self.crash_finalize:
                 self.crash_finalize = False
-                record = self._record(request_id, operation, "not_fulfilled", payload)
                 self.alive = False
                 self.recovery_pending = True
+                if self.crash_before_reply:
+                    # Commit the handoff, then die before replying: the
+                    # consumer sees agent_unreachable and recovery resolves it.
+                    self._record(request_id, operation, "accepted", payload)
+                    return producer_suite.DockerResult(6, _fail("agent_unreachable"), "")
+                record = self._record(request_id, operation, "not_fulfilled", payload)
+            elif self.handoff_finish_after is not None:
+                # Cooperative handoff: committed now, completed by a later read.
+                record = self._record(request_id, operation, "accepted", payload)
+                self.pending_handoff = {"request_id": request_id, "reads": 0}
             else:
                 record = self._record(request_id, operation, "completed", payload)
                 self._finish_active("finished", "handoff")
@@ -483,6 +496,29 @@ class _FakeProducer:
         else:
             raise AssertionError(f"unexpected fake mutation: {operation!r}")
         return producer_suite.DockerResult(0, _ok({"command": record, "replayed": False}), "")
+
+    def _advance_handoff(self, request_id: str) -> None:
+        """Complete a cooperative handoff once enough ``command`` reads passed."""
+        pending = self.pending_handoff
+        if pending is None or pending["request_id"] != request_id:
+            return
+        pending["reads"] += 1
+        assert self.handoff_finish_after is not None
+        if pending["reads"] < self.handoff_finish_after:
+            return
+        self.pending_handoff = None
+        record = self.commands[request_id]["record"]
+        record["acknowledgement"] = "completed"
+        record["detail"] = "handoff completed"
+        self._finish_active("finished", "handoff")
+
+    def resolve_interrupted_handoffs(self) -> None:
+        """Recovery resolves every still-accepted handoff record."""
+        for entry in self.commands.values():
+            record = entry["record"]
+            if record["kind"] == "handoff" and record["acknowledgement"] == "accepted":
+                record["acknowledgement"] = self.recovery_handoff_ack
+                record["detail"] = f"handoff {self.recovery_handoff_ack}"
 
     def handle(
         self,
@@ -719,6 +755,7 @@ class _FakeProducer:
                 return producer_suite.DockerResult(137, "", "")
             return self._mutate(argv[2], argv[4], argv[6])
         if len(argv) == 4 and argv[:3] == ["--contract", "1", "command"]:
+            self._advance_handoff(argv[3])
             stored = self.commands.get(argv[3])
             if stored is None:
                 return producer_suite.DockerResult(5, _fail("not_found"), "")
@@ -1283,6 +1320,7 @@ def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) ->
                 return producer_suite.HarnessResult("ok", {"released": True}, "")
             if producer.recovery_pending:
                 producer.recovery_pending = False
+                producer.resolve_interrupted_handoffs()
                 active = producer.active_attempt
                 if isinstance(active, dict):
                     if not isinstance(active.get("outcome_native"), str):
@@ -1318,6 +1356,19 @@ def _support_claims(monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer) ->
             active = producer.active_attempt
             if active is None:
                 return producer_suite.HarnessResult("error", None, "no active attempt")
+            if producer.crash_finalize:
+                # Like the stub, an armed finalization crash fires here too.
+                producer.crash_finalize = False
+                producer.alive = False
+                producer.recovery_pending = True
+                return producer_suite.HarnessResult(
+                    "ok",
+                    {
+                        "attempt_id": active["attempt_id"],
+                        "native_outcome": params["native_outcome"],
+                    },
+                    "",
+                )
             active["outcome_native"] = params["native_outcome"]
             active["outcome_reason"] = params.get("reason")
             if params["native_outcome"] == "infrastructure_error":
@@ -2205,6 +2256,107 @@ def test_handoff_crash_is_not_run_without_crash_support(
     outcome = producer_suite.scenario_handoff_crash(FULL_CTX, ["fake-harness"])
 
     assert outcome.status == "not_run"
+
+
+def test_handoff_passes_when_accepted_completes_later(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    monkeypatch.setattr(producer_suite, "POLL_INTERVAL_S", 0.0)
+    full_fakes.handoff_finish_after = 3
+
+    outcome = producer_suite.scenario_handoff(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    (record,) = (entry["record"] for entry in full_fakes.commands.values())
+    assert record["acknowledgement"] == "completed"
+
+
+def test_handoff_fails_when_the_record_never_leaves_accepted(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    monkeypatch.setattr(producer_suite, "POLL_INTERVAL_S", 0.01)
+    full_fakes.handoff_finish_after = 10**9
+    ctx = dataclasses.replace(FULL_CTX, timeout=0.2)
+
+    outcome = producer_suite.scenario_handoff(ctx, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "accepted" in outcome.detail
+
+
+def test_handoff_crash_passes_when_the_producer_dies_before_replying(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    monkeypatch.setattr(producer_suite, "POLL_INTERVAL_S", 0.0)
+    full_fakes.crash_before_reply = True
+
+    outcome = producer_suite.scenario_handoff_crash(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    (record,) = (entry["record"] for entry in full_fakes.commands.values())
+    assert record["acknowledgement"] == "not_fulfilled"
+    assert full_fakes.finished_attempts[-1]["attempt_id"] == "fake-1"
+
+
+def test_handoff_crash_fails_when_recovery_completes_the_handoff(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    monkeypatch.setattr(producer_suite, "POLL_INTERVAL_S", 0.0)
+    full_fakes.crash_before_reply = True
+    full_fakes.recovery_handoff_ack = "completed"
+
+    outcome = producer_suite.scenario_handoff_crash(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "completed" in outcome.detail
+
+
+def _arm_crash_under_a_claim(producer: _FakeProducer) -> None:
+    """Leave what a failed crash scenario leaves: a claim and a crash still armed."""
+    producer.eligible.add(299)
+    producer._status_reply()
+    producer.eligible.discard(299)
+    assert producer.active_attempt is not None
+    producer.crash_finalize = True
+
+
+def test_settle_restarts_an_unreachable_instance_so_the_next_scenario_passes(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    _arm_crash_under_a_claim(full_fakes)
+
+    outcome = producer_suite.scenario_handoff(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert full_fakes.alive
+
+
+def test_settle_fails_when_the_instance_stays_unreachable_after_restart(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    inner = producer_suite._call_harness
+
+    def start_stays_dead(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        result = inner(cmd, verb, params, timeout)
+        if verb == "start-container":
+            full_fakes.alive = False
+        return result
+
+    monkeypatch.setattr(producer_suite, "_call_harness", start_stays_dead)
+    _arm_crash_under_a_claim(full_fakes)
+
+    outcome = producer_suite.scenario_handoff(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "agent_unreachable" in outcome.detail
 
 
 def test_recovery_retry_passes_and_keeps_the_verdict(
