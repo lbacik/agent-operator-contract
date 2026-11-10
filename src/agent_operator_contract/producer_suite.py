@@ -78,7 +78,8 @@ POLL_INTERVAL_S = 0.5
 
 The wait itself is bounded by the suite's ``--timeout``."""
 
-STATUS_ARGV = ["--contract", "1", "status"]
+STATUS_ARGV = ("--contract", "1", "status")
+"""The online ``status`` read the settle and poll helpers send."""
 
 
 @dataclass(frozen=True)
@@ -2171,7 +2172,7 @@ def _snapshot(
     ctx: SuiteContext, scenario_id: str
 ) -> tuple[dict[str, Any] | None, ScenarioOutcome | None]:
     """Read and validate one online ``status`` snapshot."""
-    answered = _exec(scenario_id, STATUS_ARGV, ctx)
+    answered = _exec(scenario_id, list(STATUS_ARGV), ctx)
     if isinstance(answered, ScenarioOutcome):
         return None, answered
     return _parse_snapshot(ctx, scenario_id, answered)
@@ -2272,8 +2273,8 @@ def _settle(
     if outcome is not None:
         return outcome
     restarted = False
-    for _ in range(6):
-        answered = _exec(scenario_id, STATUS_ARGV, ctx)
+    for _ in range(7):  # six settle passes, plus one when a restart is needed
+        answered = _exec(scenario_id, list(STATUS_ARGV), ctx)
         if isinstance(answered, ScenarioOutcome):
             return answered
         if not restarted and _is_unreachable(answered):
@@ -3565,6 +3566,7 @@ def _expect_rejection(
 
 
 def _handoff_argv(ctx: SuiteContext, request_id: str) -> list[str]:
+    """The ``handoff now`` argv for one request ID against the instance under test."""
     return [
         "--contract",
         "1",
@@ -3578,25 +3580,25 @@ def _handoff_argv(ctx: SuiteContext, request_id: str) -> list[str]:
 
 
 def _check_handoff_record(
-    scenario_id: str, record: dict[str, Any], what: str, allowed: tuple[str, ...]
+    scenario_id: str, record: dict[str, Any], label: str, allowed: tuple[str, ...]
 ) -> ScenarioOutcome | None:
     """A ``handoff`` record with empty arguments and an allowed acknowledgement."""
     if record.get("kind") != "handoff":
         return ScenarioOutcome(
-            scenario_id, "failed", f"{what} kind must be handoff, got {record.get('kind')!r}"
+            scenario_id, "failed", f"{label} kind must be handoff, got {record.get('kind')!r}"
         )
     if record.get("arguments") != {}:
         return ScenarioOutcome(
             scenario_id,
             "failed",
-            f"handoff arguments must be empty, got {record.get('arguments')!r}",
+            f"{label} arguments must be empty, got {record.get('arguments')!r}",
         )
     acknowledgement = record.get("acknowledgement")
     if acknowledgement not in allowed:
         return ScenarioOutcome(
             scenario_id,
             "failed",
-            f"{what} must be {' or '.join(allowed)}, got {acknowledgement!r}",
+            f"{label} must be {' or '.join(allowed)}, got {acknowledgement!r}",
         )
     return None
 
@@ -3636,7 +3638,7 @@ def _await_unreachable(ctx: SuiteContext, scenario_id: str) -> ScenarioOutcome |
     """
     deadline = time.monotonic() + ctx.timeout
     while True:
-        answered = _exec(scenario_id, STATUS_ARGV, ctx)
+        answered = _exec(scenario_id, list(STATUS_ARGV), ctx)
         if isinstance(answered, ScenarioOutcome):
             return answered
         if _is_unreachable(answered):
