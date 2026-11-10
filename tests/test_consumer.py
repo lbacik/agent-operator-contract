@@ -1718,6 +1718,7 @@ def test_new_operations_without_expect_repo_are_usage_and_send_nothing(
 
 def test_new_operation_fixture_classifications_cover_success_rejection_and_not_found() -> None:
     index = documents.load_fixture_index()["fixtures"]
+    assert index["handoff-accepted"]["classification"] == "success"
     assert index["handoff-completed"]["classification"] == "success"
     assert index["handoff-rejected"]["classification"] == "rejection"
     assert index["recovery-retry-completed"]["classification"] == "success"

@@ -39,6 +39,10 @@
       "classification": "rejection",
       "note": "Exit 1, rejected: the infrastructure-error guard is already clear, nothing stored."
     },
+    "handoff-accepted": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with replayed:false: the handoff is committed and still finalizing; the final acknowledgement is read with command."
+    },
     "handoff-completed": {
       "classification": "success",
       "note": "Exit 0, ok:true with replayed:false: the handoff completed and sealed the attempt."
