@@ -4058,8 +4058,8 @@ def _retain_attempt(
     Attempt with ``complete``. The Attempt must become a Retained Attempt:
     the ``current_attempt`` of a ``recovering`` instance, with
     ``attention_required: true`` and ``sealed: false``, and no Claim opens
-    for an eligible issue while it exists (``probe_issue``, made ineligible
-    again afterwards).
+    for an eligible issue while it exists, even after a ``release``
+    (``probe_issue``, made ineligible again afterwards).
     """
     _, outcome = _harness(ctx, harness_cmd, scenario_id, "fail-finalization", {})
     if outcome is not None:
@@ -4106,6 +4106,10 @@ def _retain_attempt(
     _, outcome = _harness(
         ctx, harness_cmd, scenario_id, "set-issue", {"issue": probe_issue, "eligible": True}
     )
+    if outcome is not None:
+        return outcome
+    # The engine gets its chance to claim only on ``release`` (spec 15.1).
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
     if outcome is not None:
         return outcome
     snapshot, outcome = _snapshot(ctx, scenario_id)
@@ -4337,6 +4341,10 @@ def scenario_recovery_release(ctx: SuiteContext, harness_cmd: Sequence[str]) -> 
     _, outcome = _harness(
         ctx, harness_cmd, scenario_id, "set-issue", {"issue": 205, "eligible": True}
     )
+    if outcome is not None:
+        return outcome
+    # Like _claim_active_attempt: the later Claim opens on ``release`` (spec 15.1).
+    _, outcome = _harness(ctx, harness_cmd, scenario_id, "release", {})
     if outcome is not None:
         return outcome
     snapshot, outcome = _snapshot(ctx, scenario_id)
