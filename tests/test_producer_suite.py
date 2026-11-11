@@ -142,11 +142,12 @@ class _FakeProducer:
     ``resume`` and ``command`` with the contract's mutation semantics: the
     ``--expect-repo`` guard, idempotent replay, ``payload_mismatch`` and the
     ``rejected`` state guard. Opens a claim on ``status`` for an eligible
-    issue and serves ``attempts list``/``show`` from it. ``status`` serves
-    the last prepared snapshot while ``engine_lock`` is held, like a real
-    engine; ``blocking_reads`` makes it wait on the lock instead, and
-    ``always_fresh`` makes it re-read under the hold. Anything else answers
-    as the fixed seams below.
+    issue, or only on the harness ``release`` with ``claims_on_release_only``
+    like a real engine, and serves ``attempts list``/``show`` from it.
+    ``status`` serves the last prepared snapshot while ``engine_lock`` is
+    held, like a real engine; ``blocking_reads`` makes it wait on the lock
+    instead, and ``always_fresh`` makes it re-read under the hold. Anything
+    else answers as the fixed seams below.
     """
 
     def __init__(self, ctx: producer_suite.SuiteContext) -> None:
@@ -174,6 +175,7 @@ class _FakeProducer:
         self.blocking_reads = False
         self.always_fresh = False
         self.eligible: set[int] = set()
+        self.claims_on_release_only = False
         self.active_attempt: dict[str, Any] | None = None
         self.finished_attempts: list[dict[str, Any]] = []
         self.attempt_counter = 0
@@ -309,27 +311,39 @@ class _FakeProducer:
             return [dict(entry) for entry in snapshot]
         return self._fresh_manifest(attempt_id)
 
+    def open_claim(self, observed_at: str, *, over_retained: bool = False) -> None:
+        """Open a Claim for the lowest eligible issue when the engine is free.
+
+        ``over_retained`` models a broken engine that claims even while a
+        Retained Attempt exists, replacing it.
+        """
+        active = self.active_attempt
+        free = active is None and not self.recovery_pending
+        retained = isinstance(active, dict) and active.get("retained") is True
+        if not (
+            self.alive
+            and not self.startup
+            and self.intake == "open"
+            and self.eligible
+            and (free or (over_retained and retained))
+        ):
+            return
+        self.attempt_counter += 1
+        issue = min(self.eligible)
+        self.active_attempt = {
+            "attempt_id": f"fake-{self.attempt_counter}",
+            "issue_number": issue,
+            "issue_title": None,
+            "started_at": observed_at,
+        }
+        attempt_id = str(self.active_attempt["attempt_id"])
+        self.snapshots[attempt_id] = self._fresh_manifest(attempt_id)
+
     def _fresh_doc(self) -> dict[str, Any]:
         self.tick += 1
         observed_at = self._observed_at()
-        if (
-            self.alive
-            and not self.startup
-            and not self.recovery_pending
-            and self.intake == "open"
-            and self.active_attempt is None
-            and self.eligible
-        ):
-            self.attempt_counter += 1
-            issue = min(self.eligible)
-            self.active_attempt = {
-                "attempt_id": f"fake-{self.attempt_counter}",
-                "issue_number": issue,
-                "issue_title": None,
-                "started_at": observed_at,
-            }
-            attempt_id = str(self.active_attempt["attempt_id"])
-            self.snapshots[attempt_id] = self._fresh_manifest(attempt_id)
+        if not self.claims_on_release_only:
+            self.open_claim(observed_at)
         identity = {**IDENTITY, "capabilities": sorted(self._ctx.capabilities)}
         records = sorted(
             (entry["record"] for entry in self.commands.values()),
@@ -2637,6 +2651,55 @@ def test_recovery_scenarios_fail_when_a_retained_attempt_is_last_finished(
 
     assert outcome.status == "failed"
     assert "last_finished" in outcome.detail
+
+
+def _claim_on_release_only(
+    monkeypatch: pytest.MonkeyPatch, producer: _FakeProducer, *, over_retained: bool = False
+) -> None:
+    """Like a real engine harness: a Claim opens only on ``release``.
+
+    Never on ``set-issue`` or a ``status`` read. Wraps the harness installed
+    by ``_support_claims``. ``over_retained`` makes the engine wrongly claim
+    on ``release`` while a Retained Attempt exists.
+    """
+    producer.claims_on_release_only = True
+    inner = producer_suite._call_harness
+
+    def harness(
+        cmd: Any, verb: str, params: dict[str, Any], timeout: float
+    ) -> producer_suite.HarnessResult:
+        result = inner(cmd, verb, params, timeout)
+        if verb == "release" and result.status == "ok":
+            producer.open_claim(producer._observed_at(), over_retained=over_retained)
+        return result
+
+    monkeypatch.setattr(producer_suite, "_call_harness", harness)
+
+
+@pytest.mark.parametrize("scenario", _RECOVERY_SCENARIOS)
+def test_recovery_scenarios_pass_when_claims_open_only_on_release(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch, scenario: Any
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    _claim_on_release_only(monkeypatch, full_fakes)
+
+    outcome = scenario(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "passed", outcome.detail
+    assert full_fakes.eligible == set()
+
+
+@pytest.mark.parametrize("scenario", _RECOVERY_SCENARIOS)
+def test_recovery_scenarios_fail_when_a_release_claims_over_a_retained_attempt(
+    full_fakes: _FakeProducer, monkeypatch: pytest.MonkeyPatch, scenario: Any
+) -> None:
+    _support_claims(monkeypatch, full_fakes)
+    _claim_on_release_only(monkeypatch, full_fakes, over_retained=True)
+
+    outcome = scenario(FULL_CTX, ["fake-harness"])
+
+    assert outcome.status == "failed"
+    assert "no Claim may open while a Retained Attempt exists" in outcome.detail
 
 
 def test_recovery_release_fails_when_a_finalized_attempt_is_released(

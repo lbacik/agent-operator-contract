@@ -572,6 +572,8 @@ The harness manages one current instance: `setup` fails with `failed` while one 
   | `after-outcome` | Pauses after the outcome is recorded but before finalization completes; the archive stays unsealed. |
 
 - **`release`** clears the hold; a paused Attempt resumes. `{released: false}` means nothing was held.
+
+  Claim timing is an obligation on the suite, not on the harness. The suite expects a new Claim only after `set-issue` marks an issue eligible and a `release` follows; it never assumes that a Claim opens between two other verbs or on a bare `status` read. When it checks that no Claim opens while a Retained Attempt exists, it likewise calls `release` first, so the engine has its chance to claim. The suite never relies on `set-issue` opening a Claim before the next verb, so a scenario may arm a `hold` or a `halt` right after it. A harness may still let its engine claim earlier on its own schedule, for example on a `status` read, as the stub producer in this repository does.
 - **`finish-attempt`** drives the active Attempt to completion through the engine's normal finalization with the given native outcome, recording `reason` alongside it when given. An outcome the engine has no notion of answers `unsupported` with `details.what: "native-outcome"`. No active Attempt is `failed`.
 - **`hold-lock`** blocks while holding the engine's lock for `duration_ms` (1 to 60000). The suite calls `status` concurrently; the producer MUST still answer within its 3 s budget (§3.3). The reply carries the actual `held_ms`.
 - **`crash`** kills the engine process with SIGKILL.
