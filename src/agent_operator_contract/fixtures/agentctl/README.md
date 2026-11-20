@@ -41,7 +41,7 @@ A consumer passes the consumer suite when it classifies every fixture as `index.
 | Area | Fixtures |
 | --- | --- |
 | Identity | `identity` |
-| Status Snapshot, one per `instance.state` | `status-starting`, `status-idle`, `status-active`, `status-draining`, `status-paused`, `status-recovering`, `status-recovering-retained` (Retained Attempt), `offline-status-halted` (`stopped`), plus `status-simple-coding-agent` for the second backend's shape |
+| Status Snapshot, one per `instance.state` | `status-starting`, `status-idle`, `status-active`, `status-draining`, `status-paused`, `status-recovering`, `status-recovering-retained` (Retained Attempt), `offline-status-halted` (`stopped`), plus `status-simple-coding-agent` for the second backend's shape and `status-active-1-1` for a contract 1.1 snapshot (`budget.by_origin`, `context_threshold`, Sub-agent counts) |
 | `command` read | `command-found`, `command-not-found` |
 | Core mutations | `stop-accepted`, `stop-replayed`, `resume-accepted` |
 | Capability mutations | `stop-after-accepted`, `next-issue-accepted`, `handoff-accepted`, `handoff-completed`, `handoff-rejected`, `recovery-retry-completed`, `recovery-retry-not-found`, `recovery-retry-rejected`, `recovery-release-completed`, `recovery-release-not-found`, `recovery-release-rejected`, `errors-reset-completed`, `errors-reset-rejected` |

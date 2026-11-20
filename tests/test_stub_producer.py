@@ -19,7 +19,7 @@ from typing import Any
 
 import pytest
 
-from agent_operator_contract import documents
+from agent_operator_contract import CONTRACT_MAJOR, documents, shared, status
 
 REPO_ROOT = Path(__file__).parent.parent
 AGENTCTL = REPO_ROOT / "stub-producer" / "agentctl"
@@ -670,7 +670,12 @@ def test_stub_offline_read_refused_while_engine_holds_the_lock(tmp_path: Path) -
 
     assert refused.returncode == 1
     assert refused.returncode == fixture["exit_code"]
-    assert refused.stdout == fixture["stdout"]
+    # The fixture records a contract 1.0 producer; the stub speaks this library's minor.
+    reply = json.loads(refused.stdout)
+    recorded = json.loads(fixture["stdout"])
+    assert reply.pop("contract") == shared.CONTRACT_VERSION
+    recorded.pop("contract")
+    assert reply == recorded
     assert refused.stderr == fixture["stderr"]
 
 
@@ -1001,6 +1006,48 @@ def test_stub_claim_opens_for_an_eligible_issue(tmp_path: Path) -> None:
 
     assert snapshot["current_attempt"] is not None
     assert snapshot["instance"]["state"] == "active"  # type: ignore[index]
+
+
+def test_stub_speaks_the_library_contract_version(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 111, True)
+    identity = json.loads(_run_agentctl(["--contract", "1", "identity"], env).stdout)
+    snapshot = _status(env)
+    current = snapshot["current_attempt"]
+    assert isinstance(current, dict)
+
+    completed = _run_agentctl_raw(
+        ["--contract", "1", "attempts", "export", current["attempt_id"]], env
+    )
+    assert completed.returncode == 0, completed.stderr
+    with tarfile.open(fileobj=io.BytesIO(completed.stdout), mode="r:") as archive:
+        member = archive.extractfile("manifest.json")
+        assert member is not None
+        manifest = json.loads(member.read())
+
+    expected = {"major": CONTRACT_MAJOR, "minor": shared.CONTRACT_MINOR}
+    assert identity["contract"] == shared.CONTRACT_VERSION
+    assert identity["result"]["contract"] == expected
+    assert snapshot["identity"]["contract"] == expected  # type: ignore[index]
+    assert manifest["contract"] == shared.CONTRACT_VERSION
+
+
+def test_stub_reports_spend_per_usage_origin_without_telemetry(tmp_path: Path) -> None:
+    env = _durable_env(tmp_path)
+    _set_issue(env, 112, True)
+
+    snapshot = _status(env)
+    parsed = status.parse_status_strict(snapshot)
+
+    assert parsed.current_attempt is not None
+    by_origin = parsed.current_attempt.budget.by_origin
+    assert by_origin is not None
+    assert set(by_origin) == {"main"}
+    assert by_origin["main"].effective_tokens.basis == "unavailable"
+    assert by_origin["main"].cost_usd.unit == "usd"
+    figures = parsed.current_attempt.figures
+    for name in ("context_threshold", "subagents_running", "subagents_ended"):
+        assert figures[name].basis == "unavailable"
 
 
 def test_stub_hold_before_claim_blocks_the_claim(tmp_path: Path) -> None:

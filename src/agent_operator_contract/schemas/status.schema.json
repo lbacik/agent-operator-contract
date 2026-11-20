@@ -188,10 +188,13 @@
             "context_used": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "tokens"}}},
             "context_peak": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "tokens"}}},
             "context_window": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "tokens"}}},
+            "context_threshold": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "tokens"}}},
             "turns": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "count"}}},
             "tool_calls": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "count"}}},
             "continuations": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "count"}}},
             "review_seats_running": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "count"}}},
+            "subagents_running": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "count"}}},
+            "subagents_ended": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "count"}}},
             "elapsed_seconds": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "seconds"}}}
           },
           "additionalProperties": {"$ref": "#/$defs/figure"}
@@ -426,7 +429,32 @@
               }
             ]
           }
+        },
+        "by_origin": {
+          "description": "Spend per Usage Origin (contract 1.1). Origin names are an open set: main, subagent and handoff are defined, and a consumer renders any other name as unknown.",
+          "type": "object",
+          "propertyNames": {"minLength": 1},
+          "additionalProperties": {"$ref": "#/$defs/origin_cell"}
         }
+      }
+    },
+    "origin_cell": {
+      "type": "object",
+      "required": [
+        "input_tokens",
+        "cache_read_tokens",
+        "cache_write_tokens",
+        "output_tokens",
+        "effective_tokens",
+        "cost_usd"
+      ],
+      "properties": {
+        "input_tokens": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "tokens"}}},
+        "cache_read_tokens": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "tokens"}}},
+        "cache_write_tokens": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "tokens"}}},
+        "output_tokens": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "tokens"}}},
+        "effective_tokens": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "tokens"}}},
+        "cost_usd": {"$ref": "#/$defs/figure", "properties": {"unit": {"const": "usd"}}}
       }
     },
     "command_record": {

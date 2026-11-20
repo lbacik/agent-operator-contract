@@ -23,7 +23,7 @@ from typing import Any
 
 from agent_operator_contract import CONTRACT_MAJOR, documents
 
-CONTRACT_MINOR = 0
+CONTRACT_MINOR = 1
 """The contract minor this library speaks (spec section 5)."""
 
 CONTRACT_VERSION = f"{CONTRACT_MAJOR}.{CONTRACT_MINOR}"

@@ -73,13 +73,32 @@ class BudgetLimit:
 
 
 @dataclass(frozen=True)
+class OriginSpend:
+    """One ``Budget.by_origin`` cell: the spend of one Usage Origin (spec section 7.2)."""
+
+    input_tokens: Figure
+    cache_read_tokens: Figure
+    cache_write_tokens: Figure
+    output_tokens: Figure
+    effective_tokens: Figure
+    cost_usd: Figure
+
+
+@dataclass(frozen=True)
 class Budget:
-    """The attempt budget (spec section 7.2)."""
+    """The attempt budget (spec section 7.2).
+
+    ``by_origin`` is ``None`` when the producer does not report the spend
+    breakdown (contract 1.0, or a 1.1 backend without it). Its keys are kept
+    as the producer sent them: the set of Usage Origins is open, and a
+    consumer renders a name outside ``documents.ORIGIN_NAMES`` as unknown.
+    """
 
     raw_tokens: Figure
     effective_tokens: Figure
     enforced_tokens: str
     limits: tuple[BudgetLimit, ...] = ()
+    by_origin: dict[str, OriginSpend] | None = None
 
 
 @dataclass(frozen=True)
@@ -303,11 +322,38 @@ def _parse_halt(doc: object, prefix: str, strict: bool) -> Halt | None:
     return Halt(reason=reason, detail=detail, at=_parse_timestamp(at, prefix, "at"))
 
 
+def _parse_cell_figure(doc: object, unit: str, prefix: str, strict: bool) -> Figure:
+    """A Figure whose name fixes its unit; lenient mode keeps an unknown unit as unknown."""
+    figure = parse_figure(doc, strict=strict, prefix=prefix)
+    if figure.unit not in (unit, UNKNOWN):
+        raise _fail(prefix, f"unit must be {unit!r}")
+    return figure
+
+
+def _parse_by_origin(doc: object, prefix: str, strict: bool) -> dict[str, OriginSpend]:
+    data = _require_object(doc, prefix)
+    cells: dict[str, OriginSpend] = {}
+    for origin, cell in data.items():
+        if not origin:
+            raise _fail(prefix, "origin names must be non-empty strings")
+        cell_prefix = f"{prefix}.{origin}"
+        cell_data = _require_object(cell, cell_prefix)
+        _check_unknown(cell_data, frozenset(documents.ORIGIN_CELL_UNITS), cell_prefix, strict)
+        figures = {
+            name: _parse_cell_figure(
+                _required(cell_data, name, cell_prefix), unit, f"{cell_prefix}.{name}", strict
+            )
+            for name, unit in documents.ORIGIN_CELL_UNITS.items()
+        }
+        cells[origin] = OriginSpend(**figures)
+    return cells
+
+
 def _parse_budget(doc: object, prefix: str, strict: bool) -> Budget:
     data = _require_object(doc, prefix)
     _check_unknown(
         data,
-        frozenset({"raw_tokens", "effective_tokens", "enforced_tokens", "limits"}),
+        frozenset({"raw_tokens", "effective_tokens", "enforced_tokens", "limits", "by_origin"}),
         prefix,
         strict,
     )
@@ -344,11 +390,17 @@ def _parse_budget(doc: object, prefix: str, strict: bool) -> Budget:
             prefix=f"{item_prefix}.limit",
         )
         limits.append(BudgetLimit(name=name, used=used, limit=limit))
+    by_origin = (
+        _parse_by_origin(data["by_origin"], f"{prefix}.by_origin", strict)
+        if "by_origin" in data
+        else None
+    )
     return Budget(
         raw_tokens=raw,
         effective_tokens=effective,
         enforced_tokens=enforced,
         limits=tuple(limits),
+        by_origin=by_origin,
     )
 
 

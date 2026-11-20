@@ -1,6 +1,6 @@
 # Operator contract, major version 1
 
-**Status:** final for `v1.0.0`; clarified in `v1.0.2`. The tag `v1.0.0` carries this text together with the JSON Schemas, fixtures, conformance suite, shared library and `agentfleet` (adoption step 1 in [the adoption plan](./adoption-plan.md)). From `v1.0.0` on, the [JSON Schemas](../src/agent_operator_contract/schemas/) are normative for document shape and this prose is normative for semantics; where they would disagree on shape, the schema wins and the disagreement is a defect to fix in a patch release.
+**Status:** final for `v1.0.0`; clarified in `v1.0.2`; minor version 1.1 in `v1.1.0` (§5.2). The tag `v1.0.0` carries this text together with the JSON Schemas, fixtures, conformance suite, shared library and `agentfleet` (adoption step 1 in [the adoption plan](./adoption-plan.md)). From `v1.0.0` on, the [JSON Schemas](../src/agent_operator_contract/schemas/) are normative for document shape and this prose is normative for semantics; where they would disagree on shape, the schema wins and the disagreement is a defect to fix in a patch release.
 
 **Provenance.** Agreed with the owner in [What versioned operator contract and adoption plan should all four repositories implement?](https://github.com/lbacik/coding-agent/issues/192), building on [What common operator capabilities define an Agent Forge-compatible agent?](https://github.com/lbacik/coding-agent/issues/190#issuecomment-6680989084) (the capability surface) and [Where should the shared agent interface live, and what should it own?](https://github.com/lbacik/coding-agent/issues/191#issuecomment-6681592096) (the repository allocation). Source facts were read at simple-coding-agent `38aaee1`, coding-agent `9a13c34`, agent-forge `04d6eff` and agent-dashboard `b1e5ff4`.
 
@@ -157,6 +157,17 @@ The mandatory core is never listed; it is implied by the major. `identity.capabi
 
 A consumer SHOULD hide or refuse an operation whose capability is not advertised, before submitting it. A producer MUST still answer `unsupported` (exit 3) if one arrives.
 
+### 5.2 Minor versions
+
+| Minor | Tag | Changes |
+| --- | --- | --- |
+| 1.0 | `v1.0.0` | The major-1 baseline. |
+| 1.1 | `v1.1.0` | `Budget.by_origin` (§7.2); the standard optional figures `context_threshold`, `subagents_running` and `subagents_ended` and normative definitions of the context figures (§9.2); the coding-agent mapping of the context figures (§16). |
+
+**Provenance of 1.1.** Agreed with the owner in [What changes in the operator contract carry the new token figures, and in which version?](https://github.com/lbacik/coding-agent/issues/560#issuecomment-7040351162). Every change adds an optional field or figure, so a 1.0 consumer reads a 1.1 producer unchanged and a 1.1 consumer reads a 1.0 producer with the new fields absent; the only removal is the backend-specific `native.context_estimate_tokens`. The §9.2 definitions match what simple-coding-agent already reports (its `context_window` is the model's window), and `context_threshold` stays optional for it.
+
+coding-agent's figure meanings move with its 1.1 producer, through its backend mapping (§16), not through a §9.2 definition. Under 1.0 its `context_window` was the configured Context-Window Handoff threshold and its `context_used` the input plus output of the main conversation's last settled response. Under 1.1 `context_window` is the Model Context Window, the threshold the engine compares with is the new `context_threshold`, `context_used` is the size of the main conversation's next request, and `native.context_estimate_tokens` is removed. A consumer can tell the two apart by `identity.contract.minor`, but is not required to.
+
 ## 6. Operations
 
 Every operation is `agentctl --contract 1 [--offline] <operation>`. Operations not available offline answer `unsupported` with `--offline`.
@@ -202,7 +213,7 @@ Timestamps are RFC 3339 UTC strings with a `Z` suffix. All objects MAY gain fiel
 {
   "backend": "coding-agent",
   "agent_version": "0.9.0",
-  "contract": {"major": 1, "minor": 0},
+  "contract": {"major": 1, "minor": 1},
   "repository": "acme/widgets",
   "mode": "online",
   "process_started_at": "2026-11-06T08:00:00Z",
@@ -264,9 +275,26 @@ raw_tokens            Figure (tokens)   cache-inclusive total
 effective_tokens      Figure (tokens)   engine's effective accounting
 enforced_tokens       "raw"|"effective"|"none"
 limits                [ { name, used: Figure, limit: Figure } ]
+by_origin             { <origin>: Cell }   optional, since 1.1
 ```
 
 `limits[].name` is one of `raw_tokens`, `effective_tokens`, `cost_usd`, `wall_clock_seconds`, `tool_calls`, `turns`, or `native.<name>`. Only ceilings the engine enforces are listed. A named limit fixes the unit of its `used` and `limit` figures: `tokens` for `raw_tokens` and `effective_tokens`, `usd` for `cost_usd`, `seconds` for `wall_clock_seconds`, `count` for `tool_calls` and `turns`; `native.<name>` limits choose their own.
+
+`by_origin` breaks the Attempt's spend down by **Usage Origin**. It is optional; absence means "not reported by this backend", never zero. Origin names are an open set: this version defines `main` (the main conversation), `subagent` (Sub-agent conversations) and `handoff` (Context-Window Handoff turns). A name is a non-empty string, and a consumer MUST render a name it does not know as unknown. A `Cell` holds six required Figures:
+
+```text
+input_tokens          Figure (tokens)
+cache_read_tokens     Figure (tokens)   input read from the prompt cache
+cache_write_tokens    Figure (tokens)   input written to the prompt cache
+output_tokens         Figure (tokens)
+effective_tokens      Figure (tokens)   the engine's effective accounting, as budget.effective_tokens
+cost_usd              Figure (usd)
+```
+
+- The origins sum to the Attempt's totals: summed over all origins, `effective_tokens` equals `budget.effective_tokens`, `cost_usd` equals the `cost_usd` figure (§9.2) when that is reported, and each token bucket equals the Attempt's total of that bucket, from which the engine derives `budget.raw_tokens`. The sums hold where every figure involved has a value; an `unavailable` figure is never counted as zero.
+- A worst-case charge (for example for a response that reported no usage) makes that origin's figures `estimated`, with a `reason` saying they are an upper bound.
+- Spend the engine did not record is never reported as zero: such a cell has its figures `unavailable`, with a `reason` such as "not recorded".
+- The breakdown is per Attempt only; the contract has no per-step, per-Sub-agent or per-response spend.
 
 ### 7.3 Figure
 
@@ -389,13 +417,25 @@ Supersession: a newer `stop`, `stop --after` or `resume` supersedes a pending on
 | --- | --- | --- |
 | `cost_usd` | usd | Basis `estimated` when computed from configured prices. |
 | `cache_hit_rate` | ratio | Main conversation only. |
-| `context_used`, `context_peak`, `context_window` | tokens | |
+| `context_used`, `context_peak`, `context_window` | tokens | Defined below. |
+| `context_threshold` | tokens | Since 1.1. Basis `configured`. Defined below. |
 | `turns` | count | Model turns; tool calls are not turns. |
 | `tool_calls` | count | |
 | `continuations` | count | Engine-native context continuations. |
 | `review_seats_running` | count | Engine-native review participants; not generic sub-agents. |
+| `subagents_running` | count | Since 1.1. Sub-agents of the Attempt running now. |
+| `subagents_ended` | count | Since 1.1. Sub-agents of the Attempt that have ended. |
 | `elapsed_seconds` | seconds | |
 | `native.<name>` | any | Backend-specific; consumers may ignore. |
+
+The context figures are defined as follows (normative since 1.1):
+
+- **`context_window`:** the largest request the model accepts; a request and its response share it.
+- **`context_threshold`:** the main conversation's context size at which the engine stops growing it (by a handoff or a compaction); the value compared with `context_used`.
+- **`context_used`:** the main conversation's context size. Where `context_threshold` is reported, `context_used` MUST be exactly the value the engine compares with it.
+- **`context_peak`:** the largest `context_used` over the Attempt.
+
+The Figure Basis enum is unchanged; 1.1 adds no basis value.
 
 ## 10. Contract Events
 
@@ -613,10 +653,16 @@ These notes record how each engine's native concepts map onto the contract. Each
 - Terminal Outcomes: `delivered`, `failed`, `failed-limit`, `abandoned`, each with its native reason. The Run Ledger stays the sole lifecycle authority; contract DTOs are projections of it.
 - Budget: `enforced_tokens: "effective"` (cache reads excluded); limits from the configured ceilings (`effective_tokens`, `cost_usd`, `wall_clock_seconds`, `tool_calls`). There is no turn limit.
 - `cost_usd` has basis `estimated` (configured prices).
-- `context_used`: `measured`, the `input_tokens + output_tokens` of the main conversation's last settled response. Sub-agent conversations and Context-Window Handoff turns are excluded. Each Step Execution and each Context-Window Handoff starts a new conversation, so the value restarts with it: `unavailable` until that conversation's first response settles, and again when the last response carried no usage.
-- `context_peak`: `measured`, the largest `context_used` over the Attempt, kept across conversations.
-- `context_window`: `configured`, the Pinned Model's Context-Window Handoff threshold, not the model's context window. The engine compares it against `native.context_estimate_tokens`, not against `context_used`. It is `unavailable` when no threshold is pinned.
-- `native.context_estimate_tokens` (tokens): `estimated`, the engine's local estimate of the main conversation's next request. It is `unavailable` until the engine estimates a new conversation.
+- `context_window`: `configured`, the Pinned Model's Model Context Window, from the pin's `context-window-tokens`.
+- `context_threshold`: `configured`, the Usable Threshold: the Handoff Threshold less the safety margin and the request overhead. `native.handoff_threshold_tokens` (tokens, `configured`) reports the configured Handoff Threshold itself.
+- `context_used`: `estimated`, the Conversation Context of the main conversation's **next** request, exactly the value the engine compares with the Usable Threshold. Its `reason` is "anchored on provider-reported input" when the value is the last provider-reported input of the conversation plus a local estimate of what was appended since, and "local estimate, no measured response yet" when the conversation has no measured response yet. Sub-agent conversations and Context-Window Handoff turns are excluded. Each Step Execution and each Context-Window Handoff starts a new conversation, so the value restarts with it.
+- `context_peak`: `estimated`, the largest `context_used` over the Attempt, kept across conversations.
+- `native.context_estimate_tokens` is removed in 1.1.
+- `continuations`: the Context-Window Handoffs in the Attempt.
+- `subagents_running` and `subagents_ended`: the Attempt's Sub-agents. Per-Sub-agent detail stays in the Run Ledger and the Attempt export.
+- `budget.by_origin`: `main`, `subagent` and `handoff` cells. Per-bucket costs, response counts and per-step spend stay in the Run Ledger and the export. `cache_hit_rate` is derived from the `main` cell.
+- An Attempt that started before the engine produced 1.1 figures and is still the `current_attempt`: its `by_origin` cells read `unavailable` with the reason "not recorded", while the `budget` totals read as before. `context_peak` is computed only from requests recorded since the upgrade, never mixed with the 1.0 measure, and `context_peak` and `subagents_ended` carry the reason "covers only requests recorded since upgrade" while earlier requests lack records. Archived Attempts carry no figures in the contract (`AttemptSummary`), so they are unaffected.
+- coding-agent produces these figures from the release that closes its 1.1 producer issue; earlier releases report the 1.0 mapping described in §5.2.
 - Only `turns` is `not_applicable`.
 - Advertises `stop-after` and `next-issue` only. `handoff now`, recovery commands, `errors reset` and `pool` answer `unsupported`.
 - There is no legacy grammar: without `--contract`, `agentctl` answers `usage`.

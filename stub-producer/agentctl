@@ -30,7 +30,7 @@ import sys
 import tarfile
 from typing import Any
 
-from agent_operator_contract import shared
+from agent_operator_contract import CONTRACT_MAJOR, documents, shared
 
 _FCNTL: Any
 try:
@@ -536,7 +536,7 @@ def _identity(offline: bool, state: dict[str, Any] | None = None) -> dict[str, o
     return {
         "backend": os.environ.get("CONTRACT_BACKEND", "stub"),
         "agent_version": os.environ.get("CONTRACT_AGENT_VERSION", "0.0.0"),
-        "contract": {"major": 1, "minor": 0},
+        "contract": {"major": CONTRACT_MAJOR, "minor": shared.CONTRACT_MINOR},
         "repository": _repository(),
         "mode": "offline" if offline else "online",
         "process_started_at": started_at,
@@ -560,11 +560,25 @@ def _recent_commands(state: dict[str, Any]) -> list[dict[str, Any]]:
 def _stub_budget() -> dict[str, Any]:
     unknown = {"value": None, "unit": "tokens", "basis": "unavailable",
                "reason": "stub has no telemetry"}
+    main = {
+        name: dict(unknown, unit=unit)
+        for name, unit in documents.ORIGIN_CELL_UNITS.items()
+    }
     return {
         "raw_tokens": dict(unknown),
         "effective_tokens": dict(unknown),
         "enforced_tokens": "none",
         "limits": [],
+        "by_origin": {"main": main},
+    }
+
+
+def _stub_figures() -> dict[str, Any]:
+    """The 1.1 standard figures, unknown: the stub has no telemetry."""
+    return {
+        name: {"value": None, "unit": documents.FIGURE_NAME_UNITS[name],
+               "basis": "unavailable", "reason": "stub has no telemetry"}
+        for name in ("context_threshold", "subagents_running", "subagents_ended")
     }
 
 
@@ -583,7 +597,7 @@ def _current_attempt_doc(state: dict[str, Any], now: str) -> dict[str, Any] | No
         "last_activity_at": active.get("last_activity_at"),
         "observed_at": now,
         "budget": _stub_budget(),
-        "figures": {},
+        "figures": _stub_figures(),
     }
 
 
@@ -1826,7 +1840,7 @@ def _do_attempts_export(
                 sys.stdout.write(text)
                 return exit_code
         files = [entry for entry in files if entry["path"] in wanted]
-    manifest = {"contract": "1.0", "attempt": summary, "files": files}
+    manifest = {"contract": shared.CONTRACT_VERSION, "attempt": summary, "files": files}
     manifest_bytes = (json.dumps(manifest, sort_keys=True) + "\n").encode("utf-8")
     # Stream current bytes (which may have grown past a snapshot manifest).
     if not offline:

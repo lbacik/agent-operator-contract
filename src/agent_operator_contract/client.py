@@ -31,7 +31,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from agent_operator_contract import CONTRACT_MAJOR, documents
+from agent_operator_contract import CONTRACT_MAJOR, documents, shared
 
 CONTRACT_LABEL = "io.github.lbacik.agent-operator.contract"
 INSTANCE_LABEL = "io.github.lbacik.agent-operator.instance"
@@ -44,7 +44,8 @@ AGENTCTL_PATH = "/usr/local/bin/agentctl"
 DOCKER_ENV_VAR = "AGENTFLEET_DOCKER"
 DEFAULT_TIMEOUT = 10.0
 
-CLIENT_CONTRACT = f"{CONTRACT_MAJOR}.0"
+CLIENT_CONTRACT = shared.CONTRACT_VERSION
+"""The contract ``major.minor`` the client speaks, rendered into its error envelopes."""
 
 MUTATION_TIMEOUT = 15.0
 """Default consumer timeout for mutations (spec section 3.3)."""

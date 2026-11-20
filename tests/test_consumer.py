@@ -25,7 +25,7 @@ from typing import Any
 import pytest
 from jsonschema import Draft202012Validator
 
-from agent_operator_contract import client, documents
+from agent_operator_contract import agentfleet, client, documents
 
 REPO_ROOT = Path(__file__).parent.parent
 FAKE_DOCKER = REPO_ROOT / "tests" / "consumer" / "fake_docker"
@@ -357,6 +357,33 @@ def test_status_human_output_shows_units_bases_and_freshness(
     assert "cache_hit_rate: 0" not in out
     assert "observed 2026-11-06T09:12:05Z" in out
     assert "observed 2026-11-06T09:12:04Z" in out
+
+
+def test_status_human_output_shows_the_spend_breakdown(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _status_env(consumer_env, tmp_path, monkeypatch, "status-active-1-1")
+    completed = _run_agentfleet(["status", "web-1"], env)
+
+    assert completed.returncode == 0
+    out = completed.stdout.decode("utf-8")
+    assert "by_origin:" in out
+    assert "  main:\n    input_tokens: 52000 tokens (measured)" in out
+    assert "    cost_usd: 2.71 usd (estimated)" in out
+    assert "    effective_tokens: unknown tokens (unavailable) - not recorded" in out
+    assert "context_threshold: 140000 tokens (configured)" in out
+    assert "subagents_running: 1 count (measured)" in out
+
+
+def test_status_human_output_renders_an_unknown_origin_as_unknown() -> None:
+    doc = json.loads(documents.load_fixture("status-active-1-1")["stdout"])["result"]
+    by_origin = doc["current_attempt"]["budget"]["by_origin"]
+    by_origin["compaction"] = by_origin.pop("main")
+
+    out = agentfleet._human_status(doc)
+
+    assert "  unknown (compaction):" in out
+    assert out.index("  subagent:") < out.index("  handoff:") < out.index("  unknown (compaction):")
 
 
 def test_status_human_output_for_idle_shows_no_attempt(
