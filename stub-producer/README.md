@@ -21,7 +21,9 @@ them. It is built as a Docker image in CI and never published.
   It speaks the library's contract version (`shared.CONTRACT_VERSION`, 1.1)
   in replies, `identity` and export manifests. It has no telemetry, so its
   budget figures are `unavailable`, with one `main` cell in
-  `budget.by_origin` so the suite validates the 1.1 shape.
+  `budget.by_origin` and the 1.1 figures `context_threshold`,
+  `subagents_running` and `subagents_ended`, so the suite validates the 1.1
+  shape.
 - [`harness`](harness): the Conformance Harness executable. It implements the
   protocol verbs by steering a stub container over the Docker CLI: `setup`,
   `teardown`, `set-issue` (eligible/ineligible), `hold`/`release` at named

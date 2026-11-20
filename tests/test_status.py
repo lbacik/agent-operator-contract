@@ -161,18 +161,14 @@ def test_strict_accepts_both_backend_flavours() -> None:
     assert simple.current_attempt.budget.enforced_tokens == "raw"
 
 
-def _snapshot_1_1() -> dict[str, Any]:
-    return _snapshot("status-active-1-1")
-
-
 def _by_origin(snapshot: dict[str, Any]) -> dict[str, Any]:
     by_origin: dict[str, Any] = snapshot["current_attempt"]["budget"]["by_origin"]
     return by_origin
 
 
 @pytest.mark.parametrize("strict", [True, False])
-def test_parses_the_1_1_spend_breakdown(strict: bool) -> None:
-    parsed = status.parse_status(_snapshot_1_1(), strict=strict)
+def test_parses_spend_per_usage_origin(strict: bool) -> None:
+    parsed = status.parse_status(_snapshot("status-active-1-1"), strict=strict)
 
     assert parsed.identity.contract_minor == 1
     assert parsed.current_attempt is not None
@@ -190,7 +186,7 @@ def test_parses_the_1_1_spend_breakdown(strict: bool) -> None:
 
 
 @pytest.mark.parametrize("strict", [True, False])
-def test_a_1_0_budget_has_no_spend_breakdown(strict: bool) -> None:
+def test_a_1_0_budget_has_no_spend_per_usage_origin(strict: bool) -> None:
     parsed = status.parse_status(_snapshot("status-active"), strict=strict)
 
     assert parsed.current_attempt is not None
@@ -199,7 +195,7 @@ def test_a_1_0_budget_has_no_spend_breakdown(strict: bool) -> None:
 
 @pytest.mark.parametrize("strict", [True, False])
 def test_an_unknown_origin_name_is_accepted_and_kept(strict: bool) -> None:
-    snapshot = _snapshot_1_1()
+    snapshot = _snapshot("status-active-1-1")
     by_origin = _by_origin(snapshot)
     by_origin["compaction"] = copy.deepcopy(by_origin["main"])
 
@@ -221,14 +217,14 @@ def test_an_unknown_origin_name_is_accepted_and_kept(strict: bool) -> None:
     ],
 )
 @pytest.mark.parametrize("strict", [True, False])
-def test_rejects_a_malformed_spend_breakdown(name: str, strict: bool) -> None:
+def test_rejects_a_malformed_usage_origin_cell(name: str, strict: bool) -> None:
     with pytest.raises(status.StatusError):
         status.parse_status(documents.load_negative(name), strict=strict)
 
 
 @pytest.mark.parametrize("strict", [True, False])
 def test_rejects_an_empty_origin_name(strict: bool) -> None:
-    snapshot = _snapshot_1_1()
+    snapshot = _snapshot("status-active-1-1")
     by_origin = _by_origin(snapshot)
     by_origin[""] = by_origin.pop("handoff")
 
@@ -237,7 +233,7 @@ def test_rejects_an_empty_origin_name(strict: bool) -> None:
 
 
 def test_strict_rejects_an_unknown_field_in_a_cell_and_lenient_ignores_it() -> None:
-    snapshot = _snapshot_1_1()
+    snapshot = _snapshot("status-active-1-1")
     _by_origin(snapshot)["main"]["response_count"] = 12
 
     with pytest.raises(status.StatusError):
@@ -246,8 +242,8 @@ def test_strict_rejects_an_unknown_field_in_a_cell_and_lenient_ignores_it() -> N
 
 
 @pytest.mark.parametrize("figure", ["context_threshold", "subagents_running", "subagents_ended"])
-def test_strict_rejects_a_new_figure_in_the_wrong_unit(figure: str) -> None:
-    snapshot = _snapshot_1_1()
+def test_validator_rejects_a_new_figure_in_the_wrong_unit(figure: str) -> None:
+    snapshot = _snapshot("status-active-1-1")
     snapshot["current_attempt"]["figures"][figure]["unit"] = "usd"
 
     assert documents.validate_status(snapshot) != []

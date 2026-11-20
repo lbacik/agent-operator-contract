@@ -69,7 +69,7 @@ How a Figure was obtained: `measured`, `estimated`, `configured`, `assumed`, `un
 _Avoid_: source, confidence
 
 **Usage Origin**:
-The part of an Attempt's work that spent model tokens: `main` (the main conversation), `subagent` (Sub-agent conversations) or `handoff` (Context-Window Handoff turns). An open set: a consumer renders an origin it does not know as unknown.
+The part of an Attempt's work that spent model tokens: `main` (the main conversation), `subagent` (Sub-agent conversations) or `handoff` (Context-Window Handoff turns). An open set: a consumer renders an origin it does not know as unknown. The `handoff` origin is the engine-internal Context-Window Handoff, never an Operator Handoff.
 _Avoid_: source, bucket (a bucket is input, cache read, cache write or output)
 
 **Sub-agent**:

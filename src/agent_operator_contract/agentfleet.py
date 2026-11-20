@@ -239,11 +239,14 @@ def _format_figure_value(figure: object) -> str:
 
 def _human_by_origin(by_origin: dict[str, Any]) -> list[str]:
     """Spend per Usage Origin: defined origins first, any other name shown as unknown."""
-    known = [name for name in documents.ORIGIN_NAMES if name in by_origin]
-    others = sorted(name for name in by_origin if name not in documents.ORIGIN_NAMES)
+    known = [(name, name) for name in documents.ORIGIN_NAMES if name in by_origin]
+    others = [
+        (name, f"unknown ({name})")
+        for name in sorted(by_origin)
+        if name not in documents.ORIGIN_NAMES
+    ]
     lines: list[str] = []
-    for name in [*known, *others]:
-        label = name if name in documents.ORIGIN_NAMES else f"unknown ({name})"
+    for name, label in [*known, *others]:
         lines.append(f"  {label}:")
         cell = by_origin[name]
         if not isinstance(cell, dict):

@@ -1032,7 +1032,7 @@ def test_stub_speaks_the_library_contract_version(tmp_path: Path) -> None:
     assert manifest["contract"] == shared.CONTRACT_VERSION
 
 
-def test_stub_reports_the_spend_breakdown_without_telemetry(tmp_path: Path) -> None:
+def test_stub_reports_spend_per_usage_origin_without_telemetry(tmp_path: Path) -> None:
     env = _durable_env(tmp_path)
     _set_issue(env, 112, True)
 
@@ -1045,6 +1045,9 @@ def test_stub_reports_the_spend_breakdown_without_telemetry(tmp_path: Path) -> N
     assert set(by_origin) == {"main"}
     assert by_origin["main"].effective_tokens.basis == "unavailable"
     assert by_origin["main"].cost_usd.unit == "usd"
+    figures = parsed.current_attempt.figures
+    for name in ("context_threshold", "subagents_running", "subagents_ended"):
+        assert figures[name].basis == "unavailable"
 
 
 def test_stub_hold_before_claim_blocks_the_claim(tmp_path: Path) -> None:

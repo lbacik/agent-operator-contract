@@ -79,7 +79,7 @@
         "basis": "estimated",
         "reason": "upper bound: worst-case charge for a response without usage",
         "unit": "tokens",
-        "value": 244221
+        "value": 256221
       },
       "enforced_tokens": "effective",
       "limits": [
@@ -94,7 +94,7 @@
             "basis": "estimated",
             "reason": "upper bound: worst-case charge for a response without usage",
             "unit": "tokens",
-            "value": 244221
+            "value": 256221
           }
         },
         {
@@ -107,7 +107,7 @@
           "used": {
             "basis": "estimated",
             "unit": "usd",
-            "value": 3.41
+            "value": 3.49
           }
         },
         {
@@ -128,7 +128,7 @@
         "basis": "estimated",
         "reason": "upper bound: worst-case charge for a response without usage",
         "unit": "tokens",
-        "value": 1834221
+        "value": 1846221
       }
     },
     "figures": {
@@ -167,7 +167,7 @@
       "cost_usd": {
         "basis": "estimated",
         "unit": "usd",
-        "value": 3.41
+        "value": 3.49
       },
       "native.handoff_threshold_tokens": {
         "basis": "configured",

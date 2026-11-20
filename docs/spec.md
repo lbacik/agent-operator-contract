@@ -164,7 +164,7 @@ A consumer SHOULD hide or refuse an operation whose capability is not advertised
 | 1.0 | `v1.0.0` | The major-1 baseline. |
 | 1.1 | `v1.1.0` | `Budget.by_origin` (§7.2); the standard optional figures `context_threshold`, `subagents_running` and `subagents_ended` and normative definitions of the context figures (§9.2); the coding-agent mapping of the context figures (§16). |
 
-**Provenance of 1.1.** Agreed with the owner in [What changes in the operator contract carry the new token figures, and in which version?](https://github.com/lbacik/coding-agent/issues/560#issuecomment-7040351162). Every change adds an optional field or figure, so a 1.0 consumer reads a 1.1 producer unchanged and a 1.1 consumer reads a 1.0 producer with the new fields absent. The §9.2 definitions match what a conforming 1.0 backend already reported (simple-coding-agent's `context_window` is the model's window); they change no 1.0 figure's meaning.
+**Provenance of 1.1.** Agreed with the owner in [What changes in the operator contract carry the new token figures, and in which version?](https://github.com/lbacik/coding-agent/issues/560#issuecomment-7040351162). Every change adds an optional field or figure, so a 1.0 consumer reads a 1.1 producer unchanged and a 1.1 consumer reads a 1.0 producer with the new fields absent; the only removal is the backend-specific `native.context_estimate_tokens`. The §9.2 definitions match what simple-coding-agent already reports (its `context_window` is the model's window), and `context_threshold` stays optional for it.
 
 coding-agent's figure meanings move with its 1.1 producer, through its backend mapping (§16), not through a §9.2 definition. Under 1.0 its `context_window` was the configured Context-Window Handoff threshold and its `context_used` the input plus output of the main conversation's last settled response. Under 1.1 `context_window` is the Model Context Window, the threshold the engine compares with is the new `context_threshold`, `context_used` is the size of the main conversation's next request, and `native.context_estimate_tokens` is removed. A consumer can tell the two apart by `identity.contract.minor`, but is not required to.
 
@@ -293,7 +293,7 @@ cost_usd              Figure (usd)
 
 - The origins sum to the Attempt's totals: summed over all origins, `effective_tokens` equals `budget.effective_tokens`, `cost_usd` equals the `cost_usd` figure (§9.2) when that is reported, and each token bucket equals the Attempt's total of that bucket, from which the engine derives `budget.raw_tokens`. The sums hold where every figure involved has a value; an `unavailable` figure is never counted as zero.
 - A worst-case charge (for example for a response that reported no usage) makes that origin's figures `estimated`, with a `reason` saying they are an upper bound.
-- A cell the engine has no record for is reported with every figure `unavailable` and the `reason` "not recorded".
+- Spend the engine did not record is never reported as zero: such a cell has its figures `unavailable`, with a `reason` such as "not recorded".
 - The breakdown is per Attempt only; the contract has no per-step, per-Sub-agent or per-response spend.
 
 ### 7.3 Figure
@@ -435,7 +435,7 @@ The context figures are defined as follows (normative since 1.1):
 - **`context_used`:** the main conversation's context size. Where `context_threshold` is reported, `context_used` MUST be exactly the value the engine compares with it.
 - **`context_peak`:** the largest `context_used` over the Attempt.
 
-The Figure Basis enum is unchanged: a backend that tells two ways of obtaining a context size apart reports both as `estimated` and distinguishes them in `reason`.
+The Figure Basis enum is unchanged; 1.1 adds no basis value.
 
 ## 10. Contract Events
 

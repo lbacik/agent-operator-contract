@@ -573,6 +573,15 @@ def _stub_budget() -> dict[str, Any]:
     }
 
 
+def _stub_figures() -> dict[str, Any]:
+    """The 1.1 standard figures, unknown: the stub has no telemetry."""
+    return {
+        name: {"value": None, "unit": documents.FIGURE_NAME_UNITS[name],
+               "basis": "unavailable", "reason": "stub has no telemetry"}
+        for name in ("context_threshold", "subagents_running", "subagents_ended")
+    }
+
+
 def _current_attempt_doc(state: dict[str, Any], now: str) -> dict[str, Any] | None:
     active = state.get("active_attempt")
     if not isinstance(active, dict):
@@ -588,7 +597,7 @@ def _current_attempt_doc(state: dict[str, Any], now: str) -> dict[str, Any] | No
         "last_activity_at": active.get("last_activity_at"),
         "observed_at": now,
         "budget": _stub_budget(),
-        "figures": {},
+        "figures": _stub_figures(),
     }
 
 
