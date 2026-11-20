@@ -32,7 +32,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any, NoReturn
 
-from agent_operator_contract import CONTRACT_MAJOR, client, shared
+from agent_operator_contract import CONTRACT_MAJOR, client, documents, shared
 
 LS_VERSION = 1
 
@@ -237,6 +237,23 @@ def _format_figure_value(figure: object) -> str:
     return text
 
 
+def _human_by_origin(by_origin: dict[str, Any]) -> list[str]:
+    """Spend per Usage Origin: defined origins first, any other name shown as unknown."""
+    known = [name for name in documents.ORIGIN_NAMES if name in by_origin]
+    others = sorted(name for name in by_origin if name not in documents.ORIGIN_NAMES)
+    lines: list[str] = []
+    for name in [*known, *others]:
+        label = name if name in documents.ORIGIN_NAMES else f"unknown ({name})"
+        lines.append(f"  {label}:")
+        cell = by_origin[name]
+        if not isinstance(cell, dict):
+            lines.append("    unknown")
+            continue
+        for figure_name in documents.ORIGIN_CELL_UNITS:
+            lines.append(f"    {figure_name}: {_format_figure_value(cell.get(figure_name))}")
+    return lines
+
+
 def _human_status(snapshot: object) -> str:
     if not isinstance(snapshot, dict):
         return "status: <unreadable>\n"
@@ -295,6 +312,10 @@ def _human_status(snapshot: object) -> str:
                     used = _format_figure_value(entry.get("used"))
                     limit = _format_figure_value(entry.get("limit"))
                     lines.append(f"  {name}: used {used} / limit {limit}")
+            by_origin = budget.get("by_origin")
+            if isinstance(by_origin, dict) and by_origin:
+                lines.append("by_origin:")
+                lines.extend(_human_by_origin(by_origin))
         figures = current.get("figures")
         if isinstance(figures, dict) and figures:
             lines.append("figures:")

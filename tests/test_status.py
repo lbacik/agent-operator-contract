@@ -33,6 +33,7 @@ def _idle_snapshot() -> dict[str, Any]:
         "status-recovering-retained",
         "status-idle",
         "status-active",
+        "status-active-1-1",
         "status-draining",
         "status-paused",
         "status-simple-coding-agent",
@@ -53,6 +54,7 @@ def test_strict_parses_every_positive_snapshot(name: str) -> None:
         "status-recovering-retained",
         "status-idle",
         "status-active",
+        "status-active-1-1",
         "status-draining",
         "status-paused",
         "status-simple-coding-agent",
@@ -157,3 +159,95 @@ def test_strict_accepts_both_backend_flavours() -> None:
     assert coding_agent.current_attempt.attempt_id == "#42/1"
     assert simple.current_attempt is not None
     assert simple.current_attempt.budget.enforced_tokens == "raw"
+
+
+def _snapshot_1_1() -> dict[str, Any]:
+    return _snapshot("status-active-1-1")
+
+
+def _by_origin(snapshot: dict[str, Any]) -> dict[str, Any]:
+    by_origin: dict[str, Any] = snapshot["current_attempt"]["budget"]["by_origin"]
+    return by_origin
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_parses_the_1_1_spend_breakdown(strict: bool) -> None:
+    parsed = status.parse_status(_snapshot_1_1(), strict=strict)
+
+    assert parsed.identity.contract_minor == 1
+    assert parsed.current_attempt is not None
+    by_origin = parsed.current_attempt.budget.by_origin
+    assert by_origin is not None
+    assert set(by_origin) == {"main", "subagent", "handoff"}
+    assert by_origin["main"].cache_read_tokens.value == 1300000
+    assert by_origin["subagent"].effective_tokens.basis == "estimated"
+    assert by_origin["handoff"].cost_usd.basis == "unavailable"
+    assert by_origin["handoff"].cost_usd.value is None
+    figures = parsed.current_attempt.figures
+    assert figures["context_threshold"].value == 140000
+    assert figures["subagents_running"].unit == "count"
+    assert figures["subagents_ended"].value == 3
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_a_1_0_budget_has_no_spend_breakdown(strict: bool) -> None:
+    parsed = status.parse_status(_snapshot("status-active"), strict=strict)
+
+    assert parsed.current_attempt is not None
+    assert parsed.current_attempt.budget.by_origin is None
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_an_unknown_origin_name_is_accepted_and_kept(strict: bool) -> None:
+    snapshot = _snapshot_1_1()
+    by_origin = _by_origin(snapshot)
+    by_origin["compaction"] = copy.deepcopy(by_origin["main"])
+
+    parsed = status.parse_status(snapshot, strict=strict)
+
+    assert parsed.current_attempt is not None
+    assert parsed.current_attempt.budget.by_origin is not None
+    assert "compaction" in parsed.current_attempt.budget.by_origin
+    assert "compaction" not in documents.ORIGIN_NAMES
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "status-by-origin-cell-missing-figure",
+        "status-by-origin-cell-unit-not-the-names-unit",
+        "status-by-origin-cell-not-an-object",
+        "status-by-origin-not-an-object",
+    ],
+)
+@pytest.mark.parametrize("strict", [True, False])
+def test_rejects_a_malformed_spend_breakdown(name: str, strict: bool) -> None:
+    with pytest.raises(status.StatusError):
+        status.parse_status(documents.load_negative(name), strict=strict)
+
+
+@pytest.mark.parametrize("strict", [True, False])
+def test_rejects_an_empty_origin_name(strict: bool) -> None:
+    snapshot = _snapshot_1_1()
+    by_origin = _by_origin(snapshot)
+    by_origin[""] = by_origin.pop("handoff")
+
+    with pytest.raises(status.StatusError):
+        status.parse_status(snapshot, strict=strict)
+
+
+def test_strict_rejects_an_unknown_field_in_a_cell_and_lenient_ignores_it() -> None:
+    snapshot = _snapshot_1_1()
+    _by_origin(snapshot)["main"]["response_count"] = 12
+
+    with pytest.raises(status.StatusError):
+        status.parse_status_strict(snapshot)
+    assert status.parse_status_lenient(snapshot).current_attempt is not None
+
+
+@pytest.mark.parametrize("figure", ["context_threshold", "subagents_running", "subagents_ended"])
+def test_strict_rejects_a_new_figure_in_the_wrong_unit(figure: str) -> None:
+    snapshot = _snapshot_1_1()
+    snapshot["current_attempt"]["figures"][figure]["unit"] = "usd"
+
+    assert documents.validate_status(snapshot) != []

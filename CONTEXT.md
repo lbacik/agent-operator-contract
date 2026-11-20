@@ -68,6 +68,14 @@ _Avoid_: metric, stat
 How a Figure was obtained: `measured`, `estimated`, `configured`, `assumed`, `unavailable` (the concept exists but the value is unknown) or `not_applicable` (the concept does not exist in this backend).
 _Avoid_: source, confidence
 
+**Usage Origin**:
+The part of an Attempt's work that spent model tokens: `main` (the main conversation), `subagent` (Sub-agent conversations) or `handoff` (Context-Window Handoff turns). An open set: a consumer renders an origin it does not know as unknown.
+_Avoid_: source, bucket (a bucket is input, cache read, cache write or output)
+
+**Sub-agent**:
+A model conversation an engine starts beside an Attempt's main conversation to do delegated work. Its spend counts under the `subagent` Usage Origin.
+_Avoid_: review seat (an engine-native review participant), worker
+
 **Contract Event**:
 A structured lifecycle event whose name and fields the contract defines. Engines may add native events under the `native.` prefix.
 _Avoid_: log line

@@ -152,13 +152,33 @@ FIGURE_NAME_UNITS: dict[str, str] = {
     "context_used": "tokens",
     "context_peak": "tokens",
     "context_window": "tokens",
+    "context_threshold": "tokens",
     "turns": "count",
     "tool_calls": "count",
     "continuations": "count",
     "review_seats_running": "count",
+    "subagents_running": "count",
+    "subagents_ended": "count",
     "elapsed_seconds": "seconds",
 }
 """The unit of each optional figure of spec section 9.2; ``native.*`` names are open."""
+
+ORIGIN_NAMES: tuple[str, ...] = ("main", "subagent", "handoff")
+"""Usage Origins that contract 1.1 defines for ``Budget.by_origin`` (spec section 7.2).
+
+The set is open: any non-empty name is valid, and a consumer renders a name
+outside this tuple as unknown.
+"""
+
+ORIGIN_CELL_UNITS: dict[str, str] = {
+    "input_tokens": "tokens",
+    "cache_read_tokens": "tokens",
+    "cache_write_tokens": "tokens",
+    "output_tokens": "tokens",
+    "effective_tokens": "tokens",
+    "cost_usd": "usd",
+}
+"""The required figures of one ``Budget.by_origin`` cell and their units (spec section 7.2)."""
 
 COMMAND_ARGUMENTS: dict[str, tuple[str, ...]] = {
     "stop_after": ("after",),
@@ -625,6 +645,29 @@ def _validate_budget(doc: object, prefix: str = "budget") -> list[str]:
                         errors.extend(
                             _validate_figure_unit(entry[key], unit, f"{item_prefix}.{key}")
                         )
+    if "by_origin" in doc:
+        errors.extend(_validate_by_origin(doc["by_origin"], f"{prefix}.by_origin"))
+    return errors
+
+
+def _validate_by_origin(doc: object, prefix: str) -> list[str]:
+    """Spend per Usage Origin (spec section 7.2): open names, one cell of fixed figures each."""
+    if not isinstance(doc, dict):
+        return [f"{prefix} must be an object"]
+    errors: list[str] = []
+    for origin, cell in doc.items():
+        if not origin:
+            errors.append(f"{prefix} origin names must be non-empty strings")
+            continue
+        cell_prefix = f"{prefix}.{origin}"
+        if not isinstance(cell, dict):
+            errors.append(f"{cell_prefix} must be an object")
+            continue
+        for name, unit in ORIGIN_CELL_UNITS.items():
+            if name not in cell:
+                errors.append(f"{cell_prefix} is missing required property: {name!r}")
+            else:
+                errors.extend(_validate_figure_unit(cell[name], unit, f"{cell_prefix}.{name}"))
     return errors
 
 

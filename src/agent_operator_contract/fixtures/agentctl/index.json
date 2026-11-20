@@ -127,6 +127,10 @@
       "classification": "success",
       "note": "Exit 0, ok:true with an active status snapshot and a coding-agent attempt."
     },
+    "status-active-1-1": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with a contract 1.1 coding-agent snapshot: budget.by_origin with a measured, an estimated (worst-case charge) and an unavailable origin, context_threshold and the Sub-agent counts."
+    },
     "status-draining": {
       "classification": "success",
       "note": "Exit 0, ok:true with a draining status snapshot."

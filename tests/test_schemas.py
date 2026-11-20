@@ -741,6 +741,29 @@ def test_status_unit_tables_match_library() -> None:
         name: entry["properties"]["unit"]["const"] for name, entry in figures["properties"].items()
     }
     assert figure_units == documents.FIGURE_NAME_UNITS
+    cell = STATUS_SCHEMA["$defs"]["origin_cell"]
+    cell_units = {
+        name: entry["properties"]["unit"]["const"] for name, entry in cell["properties"].items()
+    }
+    assert cell_units == documents.ORIGIN_CELL_UNITS
+    assert tuple(cell["required"]) == tuple(documents.ORIGIN_CELL_UNITS)
+    assert budget["properties"]["by_origin"]["additionalProperties"] == {
+        "$ref": "#/$defs/origin_cell"
+    }
+
+
+def test_status_by_origin_accepts_an_unknown_origin_name() -> None:
+    snapshot = json.loads(documents.load_fixture("status-active-1-1")["stdout"])["result"]
+    by_origin = snapshot["current_attempt"]["budget"]["by_origin"]
+    by_origin["compaction"] = by_origin["main"]
+
+    assert STATUS_VALIDATOR.is_valid(snapshot)
+    assert documents.validate_status(snapshot) == []
+
+    by_origin[""] = by_origin.pop("compaction")
+
+    assert not STATUS_VALIDATOR.is_valid(snapshot)
+    assert documents.validate_status(snapshot) != []
 
 
 @pytest.mark.parametrize("schema_name", ["command", "mutation-result", "status"])

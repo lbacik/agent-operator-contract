@@ -4,7 +4,7 @@ The versioned operator contract between coding-agent engines (simple-coding-agen
 
 This repository owns the normative specification, its JSON Schemas, fixtures and conformance suites, a stateless shared library and the host-side `agentfleet` client. It depends on none of the engines or consumers. See [ADR 0001](docs/adr/0001-the-contract-lives-in-a-neutral-repository-and-is-negotiated-at-runtime.md).
 
-- [Specification, major version 1](docs/spec.md) (final for `v1.0.0`)
+- [Specification, major version 1](docs/spec.md) (final for `v1.0.0`, minor 1.1 since `v1.1.0`)
 - [JSON Schemas](src/agent_operator_contract/schemas/): normative for document shape; the spec is normative for semantics
 - [Consumer fixtures and their classification index](src/agent_operator_contract/fixtures/agentctl/)
 - [Conformance Harness examples](src/agent_operator_contract/fixtures/harness/) and [negative examples](src/agent_operator_contract/fixtures/negative/)
@@ -22,13 +22,13 @@ One version line: the tag `vX.Y.Z` is the contract version and `X` is the contra
 The package is standard library only (`dependencies = []`), so pinning it costs nothing at runtime. Python 3.11 or newer.
 
 ```text
-uv add "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.4"
+uv add "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.1.0"
 ```
 
 or, with pip:
 
 ```text
-pip install "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.4"
+pip install "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.1.0"
 ```
 
 Schemas, fixtures and the error table ship as package data, so everything below works from the installed package.
@@ -58,7 +58,7 @@ else:
 `agentfleet` is the host-side client: `ls`, `identity`, `status`, every mutation, `command` and `attempts list|show|export`, online or as an Offline Read of a stopped instance.
 
 ```text
-uv tool install "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.4"
+uv tool install "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.1.0"
 agentfleet --version
 agentfleet ls
 agentfleet status web-1
@@ -71,7 +71,7 @@ agentfleet status web-1
 An engine supplies a Conformance Harness (spec §15.1) and runs the suite from the pinned tag against its own image:
 
 ```yaml
-- run: uv add --dev "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.0.4"
+- run: uv add --dev "agent-operator-contract @ git+https://github.com/lbacik/agent-operator-contract@v1.1.0"
 - run: |
     uv run python -m agent_operator_contract.producer_suite \
       --harness ./conformance/harness \
