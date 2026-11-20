@@ -612,6 +612,11 @@ These notes record how each engine's native concepts map onto the contract. Each
 - `attempt_id`: `#<issue>/<n>`. Lifecycle states: `open`, `claim-confirmed`, `outcome-recorded`, `finished`, `released`. Native phases: the Attempt graph nodes (`claim` … `terminal_writes`).
 - Terminal Outcomes: `delivered`, `failed`, `failed-limit`, `abandoned`, each with its native reason. The Run Ledger stays the sole lifecycle authority; contract DTOs are projections of it.
 - Budget: `enforced_tokens: "effective"` (cache reads excluded); limits from the configured ceilings (`effective_tokens`, `cost_usd`, `wall_clock_seconds`, `tool_calls`). There is no turn limit.
-- `cost_usd` has basis `estimated` (configured prices). SDK-specific figures are `not_applicable`.
+- `cost_usd` has basis `estimated` (configured prices).
+- `context_used`: `measured`, the `input_tokens + output_tokens` of the main conversation's last settled response. Sub-agent conversations and Context-Window Handoff turns are excluded. Each Step Execution and each Context-Window Handoff starts a new conversation, so the value restarts with it: `unavailable` until that conversation's first response settles, and again when the last response carried no usage.
+- `context_peak`: `measured`, the largest `context_used` over the Attempt, kept across conversations.
+- `context_window`: `configured`, the Pinned Model's Context-Window Handoff threshold, not the model's context window. The engine compares it against `native.context_estimate_tokens`, not against `context_used`. It is `unavailable` when no threshold is pinned.
+- `native.context_estimate_tokens` (tokens): `estimated`, the engine's local estimate of the main conversation's next request. It is `unavailable` until the engine estimates a new conversation.
+- Only `turns` is `not_applicable`.
 - Advertises `stop-after` and `next-issue` only. `handoff now`, recovery commands, `errors reset` and `pool` answer `unsupported`.
 - There is no legacy grammar: without `--contract`, `agentctl` answers `usage`.
