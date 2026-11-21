@@ -375,7 +375,7 @@ conversation          string            optional, since 1.2: opaque, non-empty l
 
 The optional fields link the artifacts of a **Tool Invocation** and the model outputs around it:
 
-- `at`, `origin` and `conversation` MAY appear only on `tool_call`, `tool_result` and `model_output` entries; `call_id` and `tool` MAY appear only on `tool_call` and `tool_result` entries.
+- `at`, `origin` and `conversation` MAY appear on `tool_call`, `tool_result` and `model_output` entries. `call_id` and `tool` MAY appear only on `tool_call` and `tool_result` entries.
 - A `tool_call` and a `tool_result` with the same `call_id` are the call and the result of one Tool Invocation. At most one `tool_call` and at most one `tool_result` in an Attempt's manifest carry a given `call_id`.
 - In a Sealed archive, a `tool_result` with a `call_id` MUST have a `tool_call` with the same `call_id`. A Sealed archive MAY hold a call without a result (an interrupted call); an unsealed archive MAY also hold a call whose result is not written yet. The rule applies to the whole manifest: an export with `--path` (§11.3) lists only the named files and may name a result without its call.
 - `origin` names are the open set of §7.2: a consumer MUST render a name it does not know as unknown. `conversation` labels are opaque and compared only for equality within one Attempt; this version defines none.
@@ -485,7 +485,7 @@ Native events MUST use the `native.` prefix; consumers MAY ignore them. `status.
 
 - `events.jsonl` (kind `events`) is required in every Attempt Archive.
 - Every other artifact is backend-defined and described by its `kind` and `media_type`. Consumers render by `kind` and `media_type`, never by backend-specific file names.
-- Consumers pair a `tool_call` with its `tool_result` only by `call_id`, and order artifacts by `at`, ties broken by `path` (§7.6). They MUST NOT pair by file name or by the text of an event. An entry without `call_id` is shown unpaired, and one without `at` is not placed on the time line; a 1.0 or 1.1 producer carries neither.
+- Consumers pair a `tool_call` with its `tool_result` only by `call_id`, and order artifacts by `at`, ties broken by `path` (§7.6). They MUST NOT pair by file name or by the text of an event. When the fields are absent, as from a 1.0 or 1.1 producer, the consumer shows the artifacts unpaired.
 - The manifest MUST NOT include private engine state: databases, credentials, checkpoints, configuration containing secrets, raw unredacted transcripts.
 - An Attempt is listed as soon as its Claim opens.
 

@@ -680,7 +680,7 @@ def _manifest_entry_defs() -> list[tuple[str, dict[str, Any]]]:
 
 @pytest.mark.parametrize(("schema_name", "entry"), _manifest_entry_defs())
 def test_manifest_entry_link_rules_match_library(schema_name: str, entry: dict[str, Any]) -> None:
-    allowed: dict[str, tuple[str, ...]] = {}
+    allowed = dict.fromkeys(documents.MANIFEST_LINK_FIELDS, documents.MANIFEST_KINDS)
     for rule in entry["allOf"]:
         kinds = tuple(rule["if"]["properties"]["kind"]["not"]["enum"])
         for field, forbidden in rule["then"]["properties"].items():
@@ -705,14 +705,15 @@ def test_manifest_entry_definitions_agree_across_schemas() -> None:
 
 
 @pytest.mark.parametrize("field", ["at", "call_id", "tool", "origin", "conversation"])
-def test_manifest_entry_schema_rejects_link_fields_on_an_events_entry(field: str) -> None:
+def test_manifest_entry_schema_restricts_only_call_fields_by_kind(field: str) -> None:
     show = json.loads(documents.load_fixture("attempts-show-tool-calls")["stdout"])["result"]
     events = next(entry for entry in show["manifest"] if entry["kind"] == "events")
     link = next(entry for entry in show["manifest"] if entry["kind"] == "tool_call")
     entry = dict(events, **{field: link[field]})
+    restricted = field in ("call_id", "tool")
 
-    assert not MANIFEST_ENTRY_VALIDATOR.is_valid(entry)
-    assert documents.validate_manifest_entry(entry) != []
+    assert MANIFEST_ENTRY_VALIDATOR.is_valid(entry) is not restricted
+    assert (documents.validate_manifest_entry(entry) == []) is not restricted
 
 
 def test_attempt_summary_sealed_rule_matches_library() -> None:

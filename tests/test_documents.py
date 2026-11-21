@@ -627,13 +627,22 @@ def test_validate_manifest_entry_rejects_call_fields_on_a_model_output(field: st
     assert documents.validate_manifest_entry(entry) != []
 
 
-@pytest.mark.parametrize("field", ["at", "call_id", "tool", "origin", "conversation"])
+@pytest.mark.parametrize("field", ["call_id", "tool"])
 @pytest.mark.parametrize("kind", ["events", "transcript", "command_output", "record", "other"])
-def test_validate_manifest_entry_rejects_link_fields_on_other_kinds(field: str, kind: str) -> None:
-    value = "2026-11-21T09:00:05Z" if field == "at" else "x"
-    entry = dict(_entry_of_kind("events"), kind=kind, **{field: value})
+def test_validate_manifest_entry_rejects_call_fields_on_other_kinds(field: str, kind: str) -> None:
+    entry = dict(_entry_of_kind("events"), kind=kind, **{field: "x"})
 
     assert documents.validate_manifest_entry(entry) != []
+
+
+@pytest.mark.parametrize("field", ["at", "origin", "conversation"])
+def test_validate_manifest_entry_does_not_forbid_time_and_origin_on_other_kinds(
+    field: str,
+) -> None:
+    link = _entry_of_kind("tool_call")[field]
+    entry = dict(_entry_of_kind("events"), kind="transcript", **{field: link})
+
+    assert documents.validate_manifest_entry(entry) == []
 
 
 @pytest.mark.parametrize("field", ["call_id", "tool", "origin", "conversation"])

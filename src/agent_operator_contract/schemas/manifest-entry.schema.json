@@ -57,13 +57,6 @@
     {
       "if": {
         "required": ["kind"],
-        "properties": {"kind": {"not": {"enum": ["tool_call", "tool_result", "model_output"]}}}
-      },
-      "then": {"properties": {"at": false, "origin": false, "conversation": false}}
-    },
-    {
-      "if": {
-        "required": ["kind"],
         "properties": {"kind": {"not": {"enum": ["tool_call", "tool_result"]}}}
       },
       "then": {"properties": {"call_id": false, "tool": false}}

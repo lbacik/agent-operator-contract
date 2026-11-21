@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from importlib import resources
 from typing import Any, Literal
 
@@ -226,20 +227,22 @@ MANIFEST_KINDS: tuple[str, ...] = (
 )
 """Every ``ManifestEntry.kind`` of spec section 7.6."""
 
-MANIFEST_LINK_KINDS: tuple[str, ...] = ("tool_call", "tool_result", "model_output")
-"""The kinds that may carry ``at``, ``origin`` and ``conversation`` (spec section 7.6, 1.2)."""
-
 MANIFEST_CALL_KINDS: tuple[str, ...] = ("tool_call", "tool_result")
-"""The kinds that may carry ``call_id`` and ``tool`` (spec section 7.6, 1.2)."""
+"""The only kinds that may carry ``call_id`` and ``tool`` (spec section 7.6, 1.2)."""
 
 MANIFEST_LINK_FIELDS: dict[str, tuple[str, ...]] = {
-    "at": MANIFEST_LINK_KINDS,
+    "at": MANIFEST_KINDS,
     "call_id": MANIFEST_CALL_KINDS,
     "tool": MANIFEST_CALL_KINDS,
-    "origin": MANIFEST_LINK_KINDS,
-    "conversation": MANIFEST_LINK_KINDS,
+    "origin": MANIFEST_KINDS,
+    "conversation": MANIFEST_KINDS,
 }
-"""Each optional 1.2 ManifestEntry link field and the kinds allowed to carry it."""
+"""Each optional 1.2 ManifestEntry link field and the kinds allowed to carry it.
+
+The spec names ``tool_call``, ``tool_result`` and ``model_output`` as the
+entries ``at``, ``origin`` and ``conversation`` describe, but forbids them on
+no kind; only ``call_id`` and ``tool`` are restricted.
+"""
 
 LIBRARY_ONLY_NEGATIVES: frozenset[str] = frozenset(
     {
@@ -610,6 +613,10 @@ def _validate_figure_unit(doc: object, unit: str | None, prefix: str) -> list[st
     return errors
 
 
+def _is_non_empty_string(value: object) -> bool:
+    return isinstance(value, str) and value != ""
+
+
 def _validate_timestamp(value: object) -> bool:
     return _matches(TIMESTAMP_PATTERN, value)
 
@@ -912,24 +919,31 @@ def validate_manifest_entry(doc: object, prefix: str = "manifest entry") -> list
     for field, kinds in MANIFEST_LINK_FIELDS.items():
         if field not in doc:
             continue
-        value = doc[field]
+        valid, expected = _MANIFEST_LINK_CHECKS[field]
         if "kind" in doc and doc["kind"] not in kinds:
             errors.append(f"{prefix}.{field} is allowed only on kinds {', '.join(kinds)}")
-        elif field == "at":
-            if not _validate_timestamp(value):
-                errors.append(f"{prefix}.at must be an RFC 3339 UTC timestamp")
-        elif not isinstance(value, str) or not value:
-            errors.append(f"{prefix}.{field} must be a non-empty string")
+        elif not valid(doc[field]):
+            errors.append(f"{prefix}.{field} must be {expected}")
     return errors
 
 
-def _validate_manifest_links(entries: list[Any], prefix: str, sealed: bool) -> list[str]:
+_MANIFEST_LINK_CHECKS: dict[str, tuple[Callable[[object], bool], str]] = {
+    "at": (_validate_timestamp, "an RFC 3339 UTC timestamp"),
+    "call_id": (_is_non_empty_string, "a non-empty string"),
+    "tool": (_is_non_empty_string, "a non-empty string"),
+    "origin": (_is_non_empty_string, "a non-empty string"),
+    "conversation": (_is_non_empty_string, "a non-empty string"),
+}
+"""How each ManifestEntry link field's value is checked, and what the error expects."""
+
+
+def _validate_manifest_links(entries: list[Any], prefix: str, *, sealed: bool) -> list[str]:
     """Rules across a manifest's entries (spec section 7.6, since 1.2).
 
     At most one entry of each of ``tool_call`` and ``tool_result`` carries a
     given ``call_id``. With ``sealed``, every ``tool_result`` with a ``call_id``
-    has the ``tool_call`` with the same ``call_id``; pass it only for a complete
-    manifest, since a path-filtered export may omit the call.
+    has the ``tool_call`` with the same ``call_id``; pass it only for an
+    unfiltered manifest, since a ``--path`` export may omit the call.
     """
     errors: list[str] = []
     seen: dict[str, set[str]] = {kind: set() for kind in MANIFEST_CALL_KINDS}
@@ -1004,7 +1018,9 @@ def validate_attempts_show(doc: object) -> list[str]:
         attempt = doc.get("attempt")
         sealed = isinstance(attempt, dict) and attempt.get("sealed") is True
         errors.extend(
-            _validate_manifest_links(doc["manifest"], "attempts show result.manifest", sealed)
+            _validate_manifest_links(
+                doc["manifest"], "attempts show result.manifest", sealed=sealed
+            )
         )
         if not any(
             isinstance(entry, dict)
@@ -1042,7 +1058,7 @@ def validate_export_manifest(doc: object) -> list[str]:
         for index, entry in enumerate(doc["files"]):
             errors.extend(validate_manifest_entry(entry, f"export manifest.files[{index}]"))
         # A --path export lists only the named files, so a result may lack its call here.
-        errors.extend(_validate_manifest_links(doc["files"], "export manifest.files", False))
+        errors.extend(_validate_manifest_links(doc["files"], "export manifest.files", sealed=False))
     return errors
 
 
@@ -1486,10 +1502,6 @@ def validate_instance_name(value: object) -> list[str]:
     if _matches(INSTANCE_NAME_PATTERN, value):
         return []
     return ["instance name must match ^[a-z0-9][a-z0-9-]{0,62}$"]
-
-
-def _is_non_empty_string(value: object) -> bool:
-    return isinstance(value, str) and value != ""
 
 
 def _is_string_list(value: object) -> bool:
