@@ -226,6 +226,35 @@ MANIFEST_KINDS: tuple[str, ...] = (
 )
 """Every ``ManifestEntry.kind`` of spec section 7.6."""
 
+MANIFEST_LINK_KINDS: tuple[str, ...] = ("tool_call", "tool_result", "model_output")
+"""The kinds that may carry ``at``, ``origin`` and ``conversation`` (spec section 7.6, 1.2)."""
+
+MANIFEST_CALL_KINDS: tuple[str, ...] = ("tool_call", "tool_result")
+"""The kinds that may carry ``call_id`` and ``tool`` (spec section 7.6, 1.2)."""
+
+MANIFEST_LINK_FIELDS: dict[str, tuple[str, ...]] = {
+    "at": MANIFEST_LINK_KINDS,
+    "call_id": MANIFEST_CALL_KINDS,
+    "tool": MANIFEST_CALL_KINDS,
+    "origin": MANIFEST_LINK_KINDS,
+    "conversation": MANIFEST_LINK_KINDS,
+}
+"""Each optional 1.2 ManifestEntry link field and the kinds allowed to carry it."""
+
+LIBRARY_ONLY_NEGATIVES: frozenset[str] = frozenset(
+    {
+        "attempts-show-duplicate-call-id",
+        "attempts-show-sealed-result-without-call",
+    }
+)
+"""Negative examples only ``documents`` rejects.
+
+They break a rule across manifest entries (a ``call_id`` used twice in one kind,
+a Sealed ``tool_result`` without its ``tool_call``), which JSON Schema cannot
+express, so they are valid against the schema. Every other negative example is
+rejected by both.
+"""
+
 STARTUP_CHECK_RESULTS: tuple[str, ...] = ("started", "ok", "skipped", "failed")
 """Every ``startup_check`` event ``result`` of spec section 10."""
 
@@ -880,6 +909,46 @@ def validate_manifest_entry(doc: object, prefix: str = "manifest entry") -> list
         errors.append(f"{prefix}.size must be an integer >= 0")
     if "sha256" in doc and not _matches(SHA256_PATTERN, doc["sha256"]):
         errors.append(f"{prefix}.sha256 must be lowercase hex sha256")
+    for field, kinds in MANIFEST_LINK_FIELDS.items():
+        if field not in doc:
+            continue
+        value = doc[field]
+        if "kind" in doc and doc["kind"] not in kinds:
+            errors.append(f"{prefix}.{field} is allowed only on kinds {', '.join(kinds)}")
+        elif field == "at":
+            if not _validate_timestamp(value):
+                errors.append(f"{prefix}.at must be an RFC 3339 UTC timestamp")
+        elif not isinstance(value, str) or not value:
+            errors.append(f"{prefix}.{field} must be a non-empty string")
+    return errors
+
+
+def _validate_manifest_links(entries: list[Any], prefix: str, sealed: bool) -> list[str]:
+    """Rules across a manifest's entries (spec section 7.6, since 1.2).
+
+    At most one entry of each of ``tool_call`` and ``tool_result`` carries a
+    given ``call_id``. With ``sealed``, every ``tool_result`` with a ``call_id``
+    has the ``tool_call`` with the same ``call_id``; pass it only for a complete
+    manifest, since a path-filtered export may omit the call.
+    """
+    errors: list[str] = []
+    seen: dict[str, set[str]] = {kind: set() for kind in MANIFEST_CALL_KINDS}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or entry.get("kind") not in MANIFEST_CALL_KINDS:
+            continue
+        call_id = entry.get("call_id")
+        if not isinstance(call_id, str) or not call_id:
+            continue
+        kind = entry["kind"]
+        if call_id in seen[kind]:
+            errors.append(f"{prefix}[{index}].call_id {call_id!r} is already on another {kind}")
+        seen[kind].add(call_id)
+    if sealed:
+        for call_id in sorted(seen["tool_result"] - seen["tool_call"]):
+            errors.append(
+                f"{prefix} has a tool_result with call_id {call_id!r} but no tool_call with it"
+                " in a Sealed archive"
+            )
     return errors
 
 
@@ -932,6 +1001,11 @@ def validate_attempts_show(doc: object) -> list[str]:
     else:
         for index, entry in enumerate(doc["manifest"]):
             errors.extend(validate_manifest_entry(entry, f"attempts show result.manifest[{index}]"))
+        attempt = doc.get("attempt")
+        sealed = isinstance(attempt, dict) and attempt.get("sealed") is True
+        errors.extend(
+            _validate_manifest_links(doc["manifest"], "attempts show result.manifest", sealed)
+        )
         if not any(
             isinstance(entry, dict)
             and entry.get("kind") == "events"
@@ -967,6 +1041,8 @@ def validate_export_manifest(doc: object) -> list[str]:
     else:
         for index, entry in enumerate(doc["files"]):
             errors.extend(validate_manifest_entry(entry, f"export manifest.files[{index}]"))
+        # A --path export lists only the named files, so a result may lack its call here.
+        errors.extend(_validate_manifest_links(doc["files"], "export manifest.files", False))
     return errors
 
 

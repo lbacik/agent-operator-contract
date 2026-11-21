@@ -111,8 +111,49 @@
         },
         "media_type": {"type": "string", "minLength": 1},
         "size": {"type": "integer", "minimum": 0},
-        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
-      }
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "at": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+          "description": "Since 1.2: when the engine wrote the artifact."
+        },
+        "call_id": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Since 1.2: opaque; the same on a tool call and its result, unique per kind in the Attempt."
+        },
+        "tool": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Since 1.2: the tool's name as the engine calls it."
+        },
+        "origin": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Since 1.2: a Usage Origin name (spec section 7.2), an open set."
+        },
+        "conversation": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Since 1.2: opaque label grouping the artifacts of one model conversation."
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": {"kind": {"not": {"enum": ["tool_call", "tool_result", "model_output"]}}}
+          },
+          "then": {"properties": {"at": false, "origin": false, "conversation": false}}
+        },
+        {
+          "if": {
+            "required": ["kind"],
+            "properties": {"kind": {"not": {"enum": ["tool_call", "tool_result"]}}}
+          },
+          "then": {"properties": {"call_id": false, "tool": false}}
+        }
+      ]
     }
   }
 }

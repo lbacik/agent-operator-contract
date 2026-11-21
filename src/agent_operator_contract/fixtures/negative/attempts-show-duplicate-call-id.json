@@ -1,0 +1,115 @@
+{
+  "attempt": {
+    "attempt_id": "#43/1",
+    "issue": {
+      "number": 43,
+      "title": "Speed up the CSV export"
+    },
+    "started_at": "2026-11-21T09:00:00Z",
+    "finished_at": "2026-11-21T09:04:10Z",
+    "lifecycle_state": "finished",
+    "outcome": {
+      "native": "delivered",
+      "reason": null,
+      "label": "Delivered"
+    },
+    "delivery": {
+      "pull_request": {
+        "number": 78,
+        "url": "https://github.com/example-owner/example-repo/pull/78"
+      }
+    },
+    "attention_required": false,
+    "sealed": true,
+    "sealed_at": "2026-11-21T09:04:20Z"
+  },
+  "manifest": [
+    {
+      "path": "events.jsonl",
+      "kind": "events",
+      "media_type": "application/x-ndjson",
+      "size": 9120,
+      "sha256": "a100000000000000000000000000000000000000000000000000000000000000"
+    },
+    {
+      "path": "artifacts/0001_tool_call.json",
+      "kind": "tool_call",
+      "media_type": "application/json",
+      "size": 212,
+      "sha256": "b100000000000000000000000000000000000000000000000000000000000000",
+      "at": "2026-11-21T09:00:05Z",
+      "call_id": "toolu_01",
+      "tool": "Read",
+      "origin": "main",
+      "conversation": "main"
+    },
+    {
+      "path": "artifacts/0002_tool_result.json",
+      "kind": "tool_result",
+      "media_type": "application/json",
+      "size": 4810,
+      "sha256": "b200000000000000000000000000000000000000000000000000000000000000",
+      "at": "2026-11-21T09:00:06Z",
+      "call_id": "toolu_01",
+      "tool": "Read",
+      "origin": "main",
+      "conversation": "main"
+    },
+    {
+      "path": "artifacts/0003_model_output.json",
+      "kind": "model_output",
+      "media_type": "application/json",
+      "size": 1530,
+      "sha256": "b300000000000000000000000000000000000000000000000000000000000000",
+      "at": "2026-11-21T09:00:11Z",
+      "origin": "main",
+      "conversation": "main"
+    },
+    {
+      "path": "artifacts/0004_tool_call.json",
+      "kind": "tool_call",
+      "media_type": "application/json",
+      "size": 188,
+      "sha256": "c100000000000000000000000000000000000000000000000000000000000000",
+      "at": "2026-11-21T09:00:14Z",
+      "call_id": "toolu_02",
+      "tool": "Grep",
+      "origin": "subagent",
+      "conversation": "subagent-1"
+    },
+    {
+      "path": "artifacts/0005_tool_result.json",
+      "kind": "tool_result",
+      "media_type": "application/json",
+      "size": 902,
+      "sha256": "c200000000000000000000000000000000000000000000000000000000000000",
+      "at": "2026-11-21T09:00:15Z",
+      "call_id": "toolu_01",
+      "tool": "Grep",
+      "origin": "subagent",
+      "conversation": "subagent-1"
+    },
+    {
+      "path": "artifacts/0006_model_output.json",
+      "kind": "model_output",
+      "media_type": "application/json",
+      "size": 640,
+      "sha256": "c300000000000000000000000000000000000000000000000000000000000000",
+      "at": "2026-11-21T09:00:19Z",
+      "origin": "subagent",
+      "conversation": "subagent-1"
+    },
+    {
+      "path": "artifacts/0007_tool_call.json",
+      "kind": "tool_call",
+      "media_type": "application/json",
+      "size": 240,
+      "sha256": "d100000000000000000000000000000000000000000000000000000000000000",
+      "at": "2026-11-21T09:03:58Z",
+      "call_id": "toolu_03",
+      "tool": "Bash",
+      "origin": "main",
+      "conversation": "main"
+    }
+  ]
+}

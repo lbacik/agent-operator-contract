@@ -1,6 +1,6 @@
 # Operator contract, major version 1
 
-**Status:** final for `v1.0.0`; clarified in `v1.0.2`; minor version 1.1 in `v1.1.0` (§5.2). The tag `v1.0.0` carries this text together with the JSON Schemas, fixtures, conformance suite, shared library and `agentfleet` (adoption step 1 in [the adoption plan](./adoption-plan.md)). From `v1.0.0` on, the [JSON Schemas](../src/agent_operator_contract/schemas/) are normative for document shape and this prose is normative for semantics; where they would disagree on shape, the schema wins and the disagreement is a defect to fix in a patch release.
+**Status:** final for `v1.0.0`; clarified in `v1.0.2`; minor version 1.1 in `v1.1.0` and 1.2 in `v1.2.0` (§5.2). The tag `v1.0.0` carries this text together with the JSON Schemas, fixtures, conformance suite, shared library and `agentfleet` (adoption step 1 in [the adoption plan](./adoption-plan.md)). From `v1.0.0` on, the [JSON Schemas](../src/agent_operator_contract/schemas/) are normative for document shape and this prose is normative for semantics; where they would disagree on shape, the schema wins and the disagreement is a defect to fix in a patch release.
 
 **Provenance.** Agreed with the owner in [What versioned operator contract and adoption plan should all four repositories implement?](https://github.com/lbacik/coding-agent/issues/192), building on [What common operator capabilities define an Agent Forge-compatible agent?](https://github.com/lbacik/coding-agent/issues/190#issuecomment-6680989084) (the capability surface) and [Where should the shared agent interface live, and what should it own?](https://github.com/lbacik/coding-agent/issues/191#issuecomment-6681592096) (the repository allocation). Source facts were read at simple-coding-agent `38aaee1`, coding-agent `9a13c34`, agent-forge `04d6eff` and agent-dashboard `b1e5ff4`.
 
@@ -163,10 +163,13 @@ A consumer SHOULD hide or refuse an operation whose capability is not advertised
 | --- | --- | --- |
 | 1.0 | `v1.0.0` | The major-1 baseline. |
 | 1.1 | `v1.1.0` | `Budget.by_origin` (§7.2); the standard optional figures `context_threshold`, `subagents_running` and `subagents_ended` and normative definitions of the context figures (§9.2); the coding-agent mapping of the context figures (§16). |
+| 1.2 | `v1.2.0` | The optional `ManifestEntry` fields `at`, `call_id`, `tool`, `origin` and `conversation` that link Tool Invocations and model outputs (§7.6); the consumer rule for pairing and ordering them (§11.1); both backends' mappings (§16). |
 
 **Provenance of 1.1.** Agreed with the owner in [What changes in the operator contract carry the new token figures, and in which version?](https://github.com/lbacik/coding-agent/issues/560#issuecomment-7040351162). Every change adds an optional field or figure, so a 1.0 consumer reads a 1.1 producer unchanged and a 1.1 consumer reads a 1.0 producer with the new fields absent; the only removal is the backend-specific `native.context_estimate_tokens`. The §9.2 definitions match what simple-coding-agent already reports (its `context_window` is the model's window), and `context_threshold` stays optional for it.
 
 coding-agent's figure meanings move with its 1.1 producer, through its backend mapping (§16), not through a §9.2 definition. Under 1.0 its `context_window` was the configured Context-Window Handoff threshold and its `context_used` the input plus output of the main conversation's last settled response. Under 1.1 `context_window` is the Model Context Window, the threshold the engine compares with is the new `context_threshold`, `context_used` is the size of the main conversation's next request, and `native.context_estimate_tokens` is removed. A consumer can tell the two apart by `identity.contract.minor`, but is not required to.
+
+**Provenance of 1.2.** Agreed with the owner in [Operator contract 1.2: link tool-call artifacts in the manifest](https://github.com/lbacik/agent-operator-contract/issues/47). Before 1.2 the contract named the `tool_call`, `tool_result` and `model_output` kinds but not how they relate, so a consumer could pair a call with its result only by reverse-engineering each backend's file names or event text, which §11.1 forbids. Every change adds an optional field: a 1.1 consumer ignores the new fields (§5) and reads a 1.2 producer unchanged, and a 1.2 consumer reads a 1.0 or 1.1 producer with the fields absent and shows its artifacts unpaired. Standardising the `transcript` record shape and new Contract Events for tool calls are out of scope: the manifest is the verified source, and a consumer merges it with `events.jsonl` by time.
 
 ## 6. Operations
 
@@ -360,7 +363,25 @@ kind                  "events"|"transcript"|"tool_call"|"tool_result"|"model_out
 media_type            e.g. "application/x-ndjson", "application/json", "text/plain"
 size                  int, bytes
 sha256                lowercase hex
+at                    timestamp         optional, since 1.2: when the engine wrote the artifact
+call_id               string            optional, since 1.2: opaque, non-empty; the same on a
+                                        Tool Invocation's call and result
+tool                  string            optional, since 1.2: non-empty, the tool's name as the
+                                        engine calls it
+origin                string            optional, since 1.2: a Usage Origin name (§7.2)
+conversation          string            optional, since 1.2: opaque, non-empty label grouping the
+                                        artifacts of one model conversation (e.g. a Sub-agent's)
 ```
+
+The optional fields link the artifacts of a **Tool Invocation** and the model outputs around it:
+
+- `at`, `origin` and `conversation` MAY appear only on `tool_call`, `tool_result` and `model_output` entries; `call_id` and `tool` MAY appear only on `tool_call` and `tool_result` entries.
+- A `tool_call` and a `tool_result` with the same `call_id` are the call and the result of one Tool Invocation. At most one `tool_call` and at most one `tool_result` in an Attempt's manifest carry a given `call_id`.
+- In a Sealed archive, a `tool_result` with a `call_id` MUST have a `tool_call` with the same `call_id`. A Sealed archive MAY hold a call without a result (an interrupted call); an unsealed archive MAY also hold a call whose result is not written yet. The rule applies to the whole manifest: an export with `--path` (§11.3) lists only the named files and may name a result without its call.
+- `origin` names are the open set of §7.2: a consumer MUST render a name it does not know as unknown. `conversation` labels are opaque and compared only for equality within one Attempt; this version defines none.
+- A backend that records tool calls SHOULD archive each Tool Invocation as a `tool_call` and a `tool_result` entry carrying `at`, `call_id` and `tool`.
+
+JSON Schema cannot express the two rules across entries (one `call_id` per kind, and a Sealed result's call). The [schemas](../src/agent_operator_contract/schemas/) check each entry; `agent_operator_contract.documents` checks both.
 
 ## 8. Operator Command semantics
 
@@ -464,6 +485,7 @@ Native events MUST use the `native.` prefix; consumers MAY ignore them. `status.
 
 - `events.jsonl` (kind `events`) is required in every Attempt Archive.
 - Every other artifact is backend-defined and described by its `kind` and `media_type`. Consumers render by `kind` and `media_type`, never by backend-specific file names.
+- Consumers pair a `tool_call` with its `tool_result` only by `call_id`, and order artifacts by `at`, ties broken by `path` (§7.6). They MUST NOT pair by file name or by the text of an event. An entry without `call_id` is shown unpaired, and one without `at` is not placed on the time line; a 1.0 or 1.1 producer carries neither.
 - The manifest MUST NOT include private engine state: databases, credentials, checkpoints, configuration containing secrets, raw unredacted transcripts.
 - An Attempt is listed as soon as its Claim opens.
 
@@ -645,6 +667,7 @@ These notes record how each engine's native concepts map onto the contract. Each
 - Sealing happens only after the whole finalization commit, including the `pull_request` backfill into `attempt.json`, not when `outcome` is first written.
 - Token budget is cache-inclusive: `enforced_tokens: "raw"`. Telemetry v1's `sdk_assumed` basis becomes `assumed`.
 - Advertises `stop-after`, `next-issue`, `operator-handoff`, `recovery-retry`, `recovery-release`, `errors-reset` and, where configured, `pool`.
+- Attempt Archive: the manifest kind follows the file name suffix: `<n>_tool_call.json` is `tool_call`, `<n>_tool_result.json` is `tool_result` and `<n>_model_response.txt` is `model_output` (read at `6d93e92`); one tool call can be archived as a single `<n>_tool_result.json`. Under 1.1 the only link from the timeline to these files is the text of a `native.tool_call` event, capped at 300 characters, which a consumer MAY ignore (§10). Its 1.2 producer fills `at`, `call_id`, `tool`, `origin` and `conversation` on these entries, including those of Sub-agent conversations, and archives a `tool_call` for every `tool_result` that carries a `call_id`, as the Sealed rule of §7.6 requires.
 - Without `--contract`, `agentctl` keeps the legacy grammar until adoption step 5.
 
 ### coding-agent
@@ -664,5 +687,6 @@ These notes record how each engine's native concepts map onto the contract. Each
 - An Attempt that started before the engine produced 1.1 figures and is still the `current_attempt`: its `by_origin` cells read `unavailable` with the reason "not recorded", while the `budget` totals read as before. `context_peak` is computed only from requests recorded since the upgrade, never mixed with the 1.0 measure, and `context_peak` and `subagents_ended` carry the reason "covers only requests recorded since upgrade" while earlier requests lack records. Archived Attempts carry no figures in the contract (`AttemptSummary`), so they are unaffected.
 - coding-agent produces these figures from the release that closes its 1.1 producer issue; earlier releases report the 1.0 mapping described in §5.2.
 - Only `turns` is `not_applicable`.
+- Attempt Archive: under 1.1 it has no `tool_call`, `tool_result` or `model_output` artifacts; tool calls are inline in `transcript.jsonl`, whose record shape is backend-defined (read at `855dca3`). Its 1.2 producer archives each Tool Invocation from the transcript as a `tool_call` and a `tool_result` artifact with `at`, `call_id`, `tool`, `origin` and `conversation`, so a consumer needs no transcript parsing to show one call.
 - Advertises `stop-after` and `next-issue` only. `handoff now`, recovery commands, `errors reset` and `pool` answer `unsupported`.
 - There is no legacy grammar: without `--contract`, `agentctl` answers `usage`.

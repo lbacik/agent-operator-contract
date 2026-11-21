@@ -200,9 +200,17 @@ def test_identity_in_stdout_validates_against_identity_schema(name: str) -> None
 
 @pytest.mark.parametrize("name", NEGATIVE_NAMES)
 def test_negative_example_rejected_by_schema(name: str) -> None:
+    if name in documents.LIBRARY_ONLY_NEGATIVES:
+        pytest.skip("breaks a rule across manifest entries, which JSON Schema cannot express")
     doc = documents.load_negative(name)
 
     assert not _negative_schema(name).is_valid(doc), name
+
+
+def test_library_only_negatives_exist_and_are_valid_against_their_schema() -> None:
+    assert set(NEGATIVE_NAMES) >= documents.LIBRARY_ONLY_NEGATIVES
+    for name in documents.LIBRARY_ONLY_NEGATIVES:
+        assert _negative_schema(name).is_valid(documents.load_negative(name)), name
 
 
 @pytest.mark.parametrize("name", NEGATIVE_NAMES)
@@ -246,6 +254,8 @@ def test_envelope_schema_matches_generated_output() -> None:
 
 @pytest.mark.parametrize("name", NEGATIVE_NAMES)
 def test_library_agrees_with_schema_on_negatives(name: str) -> None:
+    if name in documents.LIBRARY_ONLY_NEGATIVES:
+        pytest.skip("only the library can check a rule across manifest entries")
     doc = documents.load_negative(name)
 
     assert (_negative_library_errors(name, doc) == []) == _negative_schema(name).is_valid(doc)
@@ -656,6 +666,53 @@ def test_manifest_entry_kind_enum_matches_library() -> None:
 def test_manifest_entry_schema_patterns_match_library() -> None:
     assert MANIFEST_ENTRY_SCHEMA["properties"]["path"]["pattern"] == documents.MANIFEST_PATH_PATTERN
     assert MANIFEST_ENTRY_SCHEMA["properties"]["sha256"]["pattern"] == documents.SHA256_PATTERN
+    assert MANIFEST_ENTRY_SCHEMA["properties"]["at"]["pattern"] == documents.TIMESTAMP_PATTERN
+
+
+def _manifest_entry_defs() -> list[tuple[str, dict[str, Any]]]:
+    export = documents.load_schema("export-manifest")["$defs"]["manifest_entry"]
+    return [
+        ("manifest-entry", MANIFEST_ENTRY_SCHEMA),
+        ("attempts-show", ATTEMPTS_SHOW_SCHEMA["$defs"]["manifest_entry"]),
+        ("export-manifest", export),
+    ]
+
+
+@pytest.mark.parametrize(("schema_name", "entry"), _manifest_entry_defs())
+def test_manifest_entry_link_rules_match_library(schema_name: str, entry: dict[str, Any]) -> None:
+    allowed: dict[str, tuple[str, ...]] = {}
+    for rule in entry["allOf"]:
+        kinds = tuple(rule["if"]["properties"]["kind"]["not"]["enum"])
+        for field, forbidden in rule["then"]["properties"].items():
+            assert forbidden is False, (schema_name, field)
+            allowed[field] = kinds
+    assert allowed == documents.MANIFEST_LINK_FIELDS, schema_name
+    for field in documents.MANIFEST_LINK_FIELDS:
+        assert field in entry["properties"], (schema_name, field)
+    assert entry["properties"]["kind"]["enum"] == list(documents.MANIFEST_KINDS), schema_name
+
+
+def test_manifest_entry_definitions_agree_across_schemas() -> None:
+    defs = _manifest_entry_defs()
+    _, reference = defs[0]
+    for schema_name, entry in defs[1:]:
+        for key in ("required", "allOf"):
+            assert entry[key] == reference[key], (schema_name, key)
+        for field, rule in reference["properties"].items():
+            assert {k: v for k, v in entry["properties"][field].items() if k != "description"} == {
+                k: v for k, v in rule.items() if k != "description"
+            }, (schema_name, field)
+
+
+@pytest.mark.parametrize("field", ["at", "call_id", "tool", "origin", "conversation"])
+def test_manifest_entry_schema_rejects_link_fields_on_an_events_entry(field: str) -> None:
+    show = json.loads(documents.load_fixture("attempts-show-tool-calls")["stdout"])["result"]
+    events = next(entry for entry in show["manifest"] if entry["kind"] == "events")
+    link = next(entry for entry in show["manifest"] if entry["kind"] == "tool_call")
+    entry = dict(events, **{field: link[field]})
+
+    assert not MANIFEST_ENTRY_VALIDATOR.is_valid(entry)
+    assert documents.validate_manifest_entry(entry) != []
 
 
 def test_attempt_summary_sealed_rule_matches_library() -> None:

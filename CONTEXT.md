@@ -98,6 +98,10 @@ _Avoid_: logs, run directory
 An Attempt Archive whose evidence set is complete and immutable. Only a Sealed archive may be cached. Distinct from an engine having recorded the Attempt's outcome.
 _Avoid_: final, complete, finished
 
+**Tool Invocation**:
+One call of a tool by a model conversation and the result the tool returned. An Attempt Archive records it as a `tool_call` artifact and a `tool_result` artifact that carry the same `call_id`; an interrupted invocation has a call and no result.
+_Avoid_: tool use (the provider's message block), action, step
+
 **Offline Read**:
 Serving the read-only part of the contract from a stopped Managed Instance's state volume, mounted read-only into a throwaway container of the same image.
 _Avoid_: cold read, docker cp

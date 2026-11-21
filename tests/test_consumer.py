@@ -1163,6 +1163,19 @@ def test_attempts_show_unsealed_human_output_states_not_sealed(
     assert "outcome: none" in out
 
 
+def test_attempts_show_reads_a_1_2_manifest_with_tool_invocation_links(
+    consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    env = _attempts_env(consumer_env, tmp_path, monkeypatch, "attempts-show-tool-calls")
+    completed = _run_agentfleet(["attempts", "show", "web-1", "#43/1"], env)
+
+    assert completed.returncode == 0
+    out = completed.stdout.decode("utf-8")
+    assert "archive: Sealed" in out
+    assert "manifest: 8 file(s)" in out
+    assert "artifacts/0002_tool_result.json tool_result 4810" in out
+
+
 def test_attempts_show_json_passthrough_is_byte_for_byte(
     consumer_env: dict[str, Any], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
