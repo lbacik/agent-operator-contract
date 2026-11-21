@@ -589,3 +589,139 @@ def test_validate_status_rejects_a_measured_null_figure() -> None:
     assert documents.validate_status(documents.load_negative("status-unknown-state")) != []
     assert documents.validate_figure(documents.load_negative("figure-measured-null")) != []
     assert documents.validate_figure(documents.load_negative("figure-unavailable-with-value")) != []
+
+
+def _tool_calls_show() -> dict[str, Any]:
+    doc: dict[str, Any] = json.loads(documents.load_fixture("attempts-show-tool-calls")["stdout"])
+    result: dict[str, Any] = doc["result"]
+    return result
+
+
+def _entry_of_kind(kind: str) -> dict[str, Any]:
+    for entry in _tool_calls_show()["manifest"]:
+        if entry["kind"] == kind:
+            assert isinstance(entry, dict)
+            return entry
+    raise AssertionError(kind)
+
+
+@pytest.mark.parametrize("kind", ["tool_call", "tool_result", "model_output"])
+def test_validate_manifest_entry_accepts_the_1_2_link_fields(kind: str) -> None:
+    entry = _entry_of_kind(kind)
+    assert "at" in entry
+    assert "origin" in entry
+
+    assert documents.validate_manifest_entry(entry) == []
+
+
+def test_validate_manifest_entry_accepts_an_unknown_origin() -> None:
+    entry = dict(_entry_of_kind("tool_call"), origin="compaction")
+
+    assert documents.validate_manifest_entry(entry) == []
+
+
+@pytest.mark.parametrize("field", ["call_id", "tool"])
+def test_validate_manifest_entry_rejects_call_fields_on_a_model_output(field: str) -> None:
+    entry = dict(_entry_of_kind("model_output"), **{field: "toolu_01"})
+
+    assert documents.validate_manifest_entry(entry) != []
+
+
+@pytest.mark.parametrize("field", ["call_id", "tool"])
+@pytest.mark.parametrize("kind", ["events", "transcript", "command_output", "record", "other"])
+def test_validate_manifest_entry_rejects_call_fields_on_other_kinds(field: str, kind: str) -> None:
+    entry = dict(_entry_of_kind("events"), kind=kind, **{field: "x"})
+
+    assert documents.validate_manifest_entry(entry) != []
+
+
+@pytest.mark.parametrize("field", ["at", "origin", "conversation"])
+def test_validate_manifest_entry_does_not_forbid_time_and_origin_on_other_kinds(
+    field: str,
+) -> None:
+    link = _entry_of_kind("tool_call")[field]
+    entry = dict(_entry_of_kind("events"), kind="transcript", **{field: link})
+
+    assert documents.validate_manifest_entry(entry) == []
+
+
+@pytest.mark.parametrize("field", ["call_id", "tool", "origin", "conversation"])
+@pytest.mark.parametrize("value", ["", 7, None])
+def test_validate_manifest_entry_requires_non_empty_string_links(field: str, value: object) -> None:
+    entry = dict(_entry_of_kind("tool_call"), **{field: value})
+
+    assert documents.validate_manifest_entry(entry) != []
+
+
+@pytest.mark.parametrize("value", ["2026-11-21 09:00:05", "2026-11-21T09:00:05+01:00", None])
+def test_validate_manifest_entry_requires_a_utc_timestamp_at(value: object) -> None:
+    entry = dict(_entry_of_kind("tool_result"), at=value)
+
+    assert documents.validate_manifest_entry(entry) != []
+
+
+def test_validate_attempts_show_accepts_paired_calls_and_an_interrupted_call() -> None:
+    show = _tool_calls_show()
+    calls = {e["call_id"] for e in show["manifest"] if e["kind"] == "tool_call"}
+    results = {e["call_id"] for e in show["manifest"] if e["kind"] == "tool_result"}
+    assert show["attempt"]["sealed"] is True
+    assert calls - results
+
+    assert documents.validate_attempts_show(show) == []
+
+
+@pytest.mark.parametrize("kind", ["tool_call", "tool_result"])
+def test_validate_attempts_show_rejects_a_call_id_twice_in_one_kind(kind: str) -> None:
+    show = _tool_calls_show()
+    show["manifest"].append(dict(_entry_of_kind(kind), path=f"artifacts/again_{kind}.json"))
+
+    errors = documents.validate_attempts_show(show)
+
+    assert any("call_id" in error for error in errors), errors
+
+
+def test_validate_attempts_show_rejects_a_sealed_result_without_its_call() -> None:
+    show = _tool_calls_show()
+    show["manifest"] = [e for e in show["manifest"] if e.get("call_id") != "toolu_02"]
+    show["manifest"].append(_entry_of_kind("tool_result") | {"call_id": "toolu_09"})
+
+    errors = documents.validate_attempts_show(show)
+
+    assert any("toolu_09" in error for error in errors), errors
+
+
+def test_validate_attempts_show_accepts_an_unsealed_result_without_its_call() -> None:
+    show = _tool_calls_show()
+    show["attempt"] = dict(show["attempt"], sealed=False, sealed_at=None, finished_at=None)
+    show["manifest"] = [
+        e for e in show["manifest"] if not (e["kind"] == "tool_call" and e.get("call_id"))
+    ]
+
+    assert documents.validate_attempts_show(show) == []
+
+
+def test_validate_attempts_show_accepts_a_result_without_a_call_id() -> None:
+    show = _tool_calls_show()
+    show["manifest"] = [
+        {k: v for k, v in e.items() if k not in ("call_id", "tool")}
+        for e in show["manifest"]
+        if e["kind"] != "tool_call"
+    ]
+
+    assert documents.validate_attempts_show(show) == []
+
+
+def test_validate_export_manifest_rejects_a_duplicate_call_id() -> None:
+    show = _tool_calls_show()
+    files = [*show["manifest"], dict(_entry_of_kind("tool_call"), path="artifacts/again.json")]
+    manifest = {"contract": "1.2", "attempt": show["attempt"], "files": files}
+
+    assert documents.validate_export_manifest(manifest) != []
+
+
+def test_validate_export_manifest_accepts_a_path_filtered_result_without_its_call() -> None:
+    show = _tool_calls_show()
+    files = [e for e in show["manifest"] if e["kind"] == "tool_result"]
+    manifest = {"contract": "1.2", "attempt": show["attempt"], "files": files}
+
+    assert documents.validate_export_manifest(manifest) == []

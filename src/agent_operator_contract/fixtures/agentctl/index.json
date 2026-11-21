@@ -219,6 +219,10 @@
       "classification": "success",
       "note": "Exit 0, ok:true with an unsealed attempt and its manifest."
     },
+    "attempts-show-tool-calls": {
+      "classification": "success",
+      "note": "Exit 0, ok:true with a contract 1.2 sealed manifest: tool calls paired with their results by call_id, model outputs, a Sub-agent conversation and an interrupted call without a result."
+    },
     "attempts-not-found": {
       "classification": "not_found",
       "note": "Exit 5, not_found: unknown Attempt ID."

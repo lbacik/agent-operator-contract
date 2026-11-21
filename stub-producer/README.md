@@ -18,12 +18,13 @@ them. It is built as a Docker image in CI and never published.
   `status` never waits on it and instead serves the last prepared snapshot
   while the lock is held. Snapshots are bounded to 256 KiB with oldest-first
   truncation (events, then figures, then commands).
-  It speaks the library's contract version (`shared.CONTRACT_VERSION`, 1.1)
+  It speaks the library's contract version (`shared.CONTRACT_VERSION`, 1.2)
   in replies, `identity` and export manifests. It has no telemetry, so its
   budget figures are `unavailable`, with one `main` cell in
   `budget.by_origin` and the 1.1 figures `context_threshold`,
   `subagents_running` and `subagents_ended`, so the suite validates the 1.1
-  shape.
+  shape. It records no tool calls, so its manifests carry none of the 1.2
+  link fields (`at`, `call_id`, `tool`, `origin`, `conversation`).
 - [`harness`](harness): the Conformance Harness executable. It implements the
   protocol verbs by steering a stub container over the Docker CLI: `setup`,
   `teardown`, `set-issue` (eligible/ineligible), `hold`/`release` at named
