@@ -45,7 +45,7 @@ A consumer passes the consumer suite when it classifies every fixture as `index.
 | `command` read | `command-found`, `command-not-found` |
 | Core mutations | `stop-accepted`, `stop-replayed`, `resume-accepted` |
 | Capability mutations | `stop-after-accepted`, `next-issue-accepted`, `handoff-accepted`, `handoff-completed`, `handoff-rejected`, `recovery-retry-completed`, `recovery-retry-not-found`, `recovery-retry-rejected`, `recovery-release-completed`, `recovery-release-not-found`, `recovery-release-rejected`, `errors-reset-completed`, `errors-reset-rejected` |
-| Attempt Archives | `attempts-list`, `attempts-list-paged`, `attempts-show-sealed`, `attempts-show-unsealed`, `attempts-not-found`, `attempts-export-not-found` |
+| Attempt Archives | `attempts-list`, `attempts-list-paged`, `attempts-show-sealed`, `attempts-show-unsealed`, `attempts-not-found`, `attempts-export-not-found`, plus `attempts-show-tool-calls` for a contract 1.2 manifest (tool calls paired with their results by `call_id`, model outputs, a Sub-agent conversation, an interrupted call) |
 | Offline Read | `offline-status-halted`, `offline-identity-running` (`rejected` / `instance_running`) |
 | Rejections | `rejected`, `repository-mismatch`, `payload-mismatch`, `invalid-argument`, `invalid-argument-after-0`, `usage`, `internal-not-stored` |
 | Unsupported and version | `unsupported`, `contract-mismatch` |
@@ -56,4 +56,4 @@ A consumer passes the consumer suite when it classifies every fixture as `index.
 
 `tests/test_coverage_gates.py` fails the build when the spec outgrows this set: every `error.code` and every exit code of spec section 4 (0 to 7, and Docker's 125 to 127) appears in at least one fixture, and every `instance.state` has a Status Snapshot fixture. Every fixture validates against `schemas/fixture.schema.json`, and every envelope in it against the JSON Schemas.
 
-Sibling directories hold the other example sets: [`../harness/`](../harness/) for Conformance Harness requests and replies, and [`../negative/`](../negative/) for documents that every schema and validator must reject.
+Sibling directories hold the other example sets: [`../harness/`](../harness/) for Conformance Harness requests and replies, and [`../negative/`](../negative/) for documents the validators must reject.

@@ -1,0 +1,11 @@
+{
+  "path": "artifacts/0003_model_output.json",
+  "kind": "model_output",
+  "media_type": "application/json",
+  "size": 1530,
+  "sha256": "b300000000000000000000000000000000000000000000000000000000000000",
+  "at": "2026-11-21T09:00:11Z",
+  "call_id": "toolu_01",
+  "origin": "main",
+  "conversation": "main"
+}

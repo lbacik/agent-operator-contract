@@ -1,0 +1,10 @@
+{
+  "path": "artifacts/0001_tool_call.json",
+  "kind": "tool_call",
+  "media_type": "application/json",
+  "size": 212,
+  "sha256": "b100000000000000000000000000000000000000000000000000000000000000",
+  "at": "2026-11-21T09:00:05Z",
+  "call_id": "",
+  "tool": "Read"
+}
